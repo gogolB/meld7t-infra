@@ -5,11 +5,14 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # --- config (override via env) ---
 repo       := justfile_directory()
-data_dir   := env_var_or_default("MELD_DATA", repo + "/data")
-fs_license := env_var_or_default("FS_LICENSE", repo + "/secrets/fs_license.txt")
 dev_box    := "meld-dev"
-# TODO: set to the image from the MELD install docs, then pin the digest with `just freeze`.
-meld_image := env_var_or_default("MELD_IMAGE", "ghcr.io/meldproject/meld_graph:latest")
+# MELD Graph v2.2.5 (Docker Hub). _gpu = GPU-accelerated FastSurfer + prediction (needs >=20GB VRAM;
+# your 3090 Ti's 24GB qualifies). NOTE: confirm this exact tag at pull time — if it 404s, check the
+# release page for the GPU tag or fall back to `meldproject/meld_graph:v2.2.5`.
+meld_image := env_var_or_default("MELD_IMAGE", "meldproject/meld_graph:v2.2.5_gpu")
+meld_data  := env_var_or_default("MELD_DATA", repo + "/meld-data")     # bind-mounted to /data
+fs_lic     := repo + "/secrets/license.txt"                            # FreeSurfer license
+meld_lic   := repo + "/secrets/meld_license.txt"                       # MELD license
 
 default:
     @just --list
@@ -58,23 +61,36 @@ dev:
 edit path=".":
     distrobox enter {{dev_box}} -- nvim {{path}}
 
-# 3) Pull pipeline image(s).
-pull:
+# --- MELD pipeline (containerized, rootless Podman + CDI; translated from the real v2.2.5 repo) ---
+# Private helper: the shared podman invocation. `:z` = shared SELinux relabel (Bazzite needs it, same
+# reason as the GPU device); no --user (rootless maps container-root -> your host UID, so output is
+# yours). GPU via the CDI device we validated. The image's entrypoint sources FreeSurfer, then runs ARGS.
+_meld *ARGS:
+    mkdir -p {{meld_data}}
+    podman run --rm \
+      --device nvidia.com/gpu=all \
+      -v {{meld_data}}:/data:z \
+      -v {{fs_lic}}:/run/secrets/license.txt:ro,z \
+      -v {{meld_lic}}:/run/secrets/meld_license.txt:ro,z \
+      -e FS_LICENSE=/run/secrets/license.txt \
+      -e MELD_LICENSE=/run/secrets/meld_license.txt \
+      {{meld_image}} {{ARGS}}
+
+# 1) Pull the image + download the pretrained model & bundled test data.
+#    (v2.2.5 moved data to Figshare; if auto-download fails, fetch meld_data manually per their FAQ.)
+meld-setup:
     podman pull {{meld_image}}
-    @echo ">> TODO: pull FreeSurfer/FastSurfer image per MELD install docs, add to containers/images.lock"
+    just _meld python scripts/new_patient_pipeline/prepare_classifier.py
 
-# Single-subject run — SKELETON. Internals finalized after the Phase 1/2 pilot decides
-# FreeSurfer-vs-FastSurfer and hires-vs-1mm. Shows the container-invocation pattern:
-recon subject:
-    @echo ">> TODO recon for '{{subject}}': skull-strip (SynthStrip) -> recon-all/FastSurfer -> MELD"
-    @echo "   podman run --rm --device nvidia.com/gpu=all \\"
-    @echo "     -v {{data_dir}}:/data:Z -v {{fs_license}}:/opt/freesurfer/license.txt:ro,Z \\"
-    @echo "     {{meld_image}} <pipeline-cmd> {{subject}}"
+# 2) Validate the full pipeline on MELD's bundled test subject (~15 min). Proves image+GPU+licenses.
+meld-test:
+    just _meld pytest
 
-# Resumable, concurrency-capped batch over all subjects — SKELETON.
-# Real version: enumerate subjects, skip those with a completion marker, run N in parallel.
-batch jobs="16":
-    @echo ">> TODO: fan 'just recon' across subjects at -P {{jobs}}, skipping completed (resumable)."
+# 3) Run the FCD pipeline on one subject. --fastsurfer = GPU-accelerated segmentation.
+#    Output -> {{meld_data}}/output/predictions_reports/<subject>.  Extra flags pass through
+#    (e.g. `just meld-run sub-001 --parallelise`, or `-harmo_code H1` once harmonised).
+meld-run subject *flags:
+    just _meld python scripts/new_patient_pipeline/new_pt_pipeline.py -id {{subject}} --fastsurfer {{flags}}
 
 # Record exact versions + digests for provenance (project plan §6/§8). Run after any env change.
 freeze:

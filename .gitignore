@@ -7,6 +7,7 @@ provenance/
 secrets/
 *.license
 fs_license.txt
+meld-data/
 
 # Python / scratch
 __pycache__/
