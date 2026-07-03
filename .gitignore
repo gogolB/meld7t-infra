@@ -1,0 +1,14 @@
+# PHI and working data never enter git
+data/
+derivatives/
+provenance/
+
+# Secrets (FreeSurfer license, tokens)
+secrets/
+*.license
+fs_license.txt
+
+# Python / scratch
+__pycache__/
+.venv/
+*.log

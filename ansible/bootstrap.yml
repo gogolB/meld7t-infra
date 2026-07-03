@@ -1,0 +1,586 @@
+---
+# One-time host bring-up for the MELD 7T pipeline on Bazzite / Fedora Atomic.
+#
+# ATOMIC-AWARE:
+# - Does NOT install host packages via dnf.
+# - Assumes Bazzite already provides podman, distrobox, NVIDIA driver stack, and nvidia-ctk.
+# - Sets up user-space directories, NVIDIA CDI, SELinux GPU access, and a rootless dev distrobox.
+#
+# Run normal:
+#   ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml -K
+#
+# Recreate meld-dev from scratch:
+#   ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml \
+#     -e recreate_dev_box=true \
+#     -K
+#
+# With optional convenience tooling:
+#   ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml \
+#     -e recreate_dev_box=true \
+#     -e install_brew_tools=true \
+#     -e install_ai_cli=true \
+#     -K
+#
+# Notes:
+# - The dev distrobox is intentionally ROOTLESS.
+# - Do not use `distrobox enter --root` for this workflow.
+# - Do not use `--headless`; Distrobox 1.8.2.4 uses `--no-tty`.
+# - Fedora Toolbox 44 currently provides a new enough Neovim for LazyVim.
+# - Lazygit is installed from the dejan/lazygit COPR inside the distrobox.
+# - LazyVim extras are inserted into lua/config/lazy.lua before { import = "plugins" }.
+# - LazyVim plugins are not synced headlessly; first interactive nvim launch finishes setup.
+# - Brew, LazyVim, Claude, and Codex are convenience tooling, not required pipeline runtime.
+
+- name: Bootstrap Bazzite host for MELD 7T pipeline
+  hosts: local
+  connection: local
+  gather_facts: false
+
+  vars:
+    repo_dir: "{{ (playbook_dir + '/..') | realpath }}"
+    home_dir: "{{ lookup('env', 'HOME') }}"
+    user_path: "{{ lookup('env', 'HOME') }}/.local/bin:{{ lookup('env', 'PATH') }}"
+
+    dev_box: "meld-dev"
+    dev_image: "registry.fedoraproject.org/fedora-toolbox:44"
+
+    recreate_dev_box: false
+    install_brew_tools: false
+    install_ai_cli: false
+
+    distrobox_init_timeout_seconds: 900
+    distrobox_check_timeout_seconds: 120
+    distrobox_install_timeout_seconds: 900
+
+    lazyvim_lazy_lua: "{{ home_dir }}/.config/nvim/lua/config/lazy.lua"
+
+    work_dirs:
+      - path: "{{ repo_dir }}/data"
+        mode: "0750"
+      - path: "{{ repo_dir }}/provenance"
+        mode: "0750"
+      - path: "{{ repo_dir }}/secrets"
+        mode: "0700"
+
+    required_host_commands:
+      - podman
+      - distrobox
+      - nvidia-smi
+      - nvidia-ctk
+      - getsebool
+      - setsebool
+      - git
+
+    dev_packages:
+      - neovim
+      - git
+      - gcc
+      - gcc-c++
+      - make
+      - nodejs
+      - python3
+      - python3-pip
+      - ripgrep
+      - fd-find
+      - wl-clipboard
+      - unzip
+      - tar
+      - gzip
+      - curl
+      - dnf-plugins-core
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Host preflight
+    # -------------------------------------------------------------------------
+
+    - name: Assert required host commands are available
+      ansible.builtin.shell: "command -v {{ item | quote }}"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      loop: "{{ required_host_commands }}"
+      tags: [host, gpu]
+
+    - name: Assert NVIDIA driver is present on the host
+      ansible.builtin.command: nvidia-smi -L
+      changed_when: false
+      register: nvsmi
+      failed_when: nvsmi.rc != 0
+      tags: [host, gpu]
+
+    - name: Assert nvidia-container-toolkit is available
+      ansible.builtin.command: nvidia-ctk --version
+      changed_when: false
+      tags: [host, gpu]
+
+    # -------------------------------------------------------------------------
+    # NVIDIA CDI + SELinux
+    # -------------------------------------------------------------------------
+
+    - name: Ensure CDI directory exists
+      ansible.builtin.file:
+        path: /etc/cdi
+        state: directory
+        mode: "0755"
+      become: true
+      tags: [host, gpu]
+
+    - name: Generate NVIDIA CDI spec to temporary path
+      ansible.builtin.command: nvidia-ctk cdi generate --output=/tmp/nvidia-cdi.yaml
+      become: true
+      changed_when: false
+      tags: [host, gpu]
+
+    - name: Check current NVIDIA CDI spec
+      ansible.builtin.stat:
+        path: /etc/cdi/nvidia.yaml
+        checksum_algorithm: sha256
+      register: current_cdi_spec
+      tags: [host, gpu]
+
+    - name: Check generated NVIDIA CDI spec
+      ansible.builtin.stat:
+        path: /tmp/nvidia-cdi.yaml
+        checksum_algorithm: sha256
+      register: generated_cdi_spec
+      tags: [host, gpu]
+
+    - name: Install NVIDIA CDI spec if new or changed
+      ansible.builtin.copy:
+        src: /tmp/nvidia-cdi.yaml
+        dest: /etc/cdi/nvidia.yaml
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when: >
+        not current_cdi_spec.stat.exists or
+        current_cdi_spec.stat.checksum != generated_cdi_spec.stat.checksum
+      tags: [host, gpu]
+
+    - name: Check SELinux boolean for container device access
+      ansible.builtin.command: getsebool container_use_devices
+      changed_when: false
+      register: sebool_dev
+      tags: [host, gpu]
+
+    - name: Allow confined rootless containers to access GPU devices
+      ansible.builtin.command: setsebool -P container_use_devices on
+      become: true
+      when: sebool_dev.stdout is not search('container_use_devices\\s+-->\\s+on')
+      tags: [host, gpu]
+
+    - name: Smoke-test GPU inside a rootless Podman container using CDI
+      ansible.builtin.command: >-
+        podman run --rm
+        --device nvidia.com/gpu=all
+        --security-opt=label=disable
+        docker.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+        nvidia-smi -L
+      changed_when: false
+      register: gpu_container
+      failed_when: gpu_container.rc != 0
+      tags: [host, gpu]
+
+    # -------------------------------------------------------------------------
+    # Project directories
+    # -------------------------------------------------------------------------
+
+    - name: Create working directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop: "{{ work_dirs }}"
+      tags: [host, dirs]
+
+    # -------------------------------------------------------------------------
+    # Rootless Distrobox lifecycle
+    # -------------------------------------------------------------------------
+
+    - name: Check whether the dev distrobox container exists
+      ansible.builtin.command: podman container exists {{ dev_box | quote }}
+      changed_when: false
+      failed_when: false
+      register: dev_box_exists
+      tags: [distrobox]
+
+    - name: Stop existing dev distrobox before recreation
+      ansible.builtin.command: distrobox stop {{ dev_box | quote }} --yes
+      changed_when: false
+      failed_when: false
+      when:
+        - recreate_dev_box | bool
+        - dev_box_exists.rc == 0
+      tags: [distrobox]
+
+    - name: Remove existing dev distrobox before recreation
+      ansible.builtin.command: distrobox rm {{ dev_box | quote }} --force --yes
+      changed_when: true
+      failed_when: false
+      when:
+        - recreate_dev_box | bool
+        - dev_box_exists.rc == 0
+      tags: [distrobox]
+
+    - name: Refresh dev distrobox existence after optional removal
+      ansible.builtin.command: podman container exists {{ dev_box | quote }}
+      changed_when: false
+      failed_when: false
+      register: dev_box_exists_after_removal
+      tags: [distrobox]
+
+    - name: Create the rootless NVIDIA-enabled dev distrobox
+      ansible.builtin.command: >-
+        distrobox create --yes
+        --name {{ dev_box | quote }}
+        --image {{ dev_image | quote }}
+        --nvidia
+      environment:
+        DBX_NON_INTERACTIVE: "1"
+      when: dev_box_exists_after_removal.rc != 0
+      tags: [distrobox]
+
+    - name: Initialize the dev distrobox without TTY
+      ansible.builtin.shell: >-
+        timeout {{ distrobox_init_timeout_seconds }}
+        distrobox enter
+        --name {{ dev_box | quote }}
+        --no-tty
+        -- true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: dev_box_init
+      failed_when: dev_box_init.rc != 0
+      tags: [distrobox]
+
+    - name: Install required dev packages inside the initialized distrobox
+      ansible.builtin.shell: >-
+        timeout {{ distrobox_install_timeout_seconds }}
+        distrobox enter
+        --name {{ dev_box | quote }}
+        --no-tty
+        -- sudo dnf install -y {{ dev_packages | join(' ') }}
+      args:
+        executable: /bin/bash
+      register: dev_package_install
+      changed_when: >
+        'Installed:' in dev_package_install.stdout or
+        'Upgraded:' in dev_package_install.stdout or
+        'Complete!' in dev_package_install.stderr or
+        'Complete!' in dev_package_install.stdout
+      failed_when: dev_package_install.rc != 0
+      tags: [distrobox]
+
+    - name: Enable lazygit COPR inside the distrobox
+      ansible.builtin.shell: >-
+        timeout {{ distrobox_check_timeout_seconds }}
+        distrobox enter
+        --name {{ dev_box | quote }}
+        --no-tty
+        -- sudo dnf copr enable dejan/lazygit -y
+      args:
+        executable: /bin/bash
+      register: lazygit_copr
+      changed_when: >
+        'Enabling a Copr repository' in lazygit_copr.stdout or
+        'enabled' in (lazygit_copr.stdout | lower)
+      failed_when: lazygit_copr.rc != 0
+      tags: [distrobox, editor]
+
+    - name: Install lazygit inside the distrobox
+      ansible.builtin.shell: >-
+        timeout {{ distrobox_install_timeout_seconds }}
+        distrobox enter
+        --name {{ dev_box | quote }}
+        --no-tty
+        -- sudo dnf install -y lazygit
+      args:
+        executable: /bin/bash
+      register: lazygit_install
+      changed_when: >
+        'Installed:' in lazygit_install.stdout or
+        'Upgraded:' in lazygit_install.stdout or
+        'Complete!' in lazygit_install.stderr or
+        'Complete!' in lazygit_install.stdout
+      failed_when: lazygit_install.rc != 0
+      tags: [distrobox, editor]
+
+    - name: Smoke-test GPU inside the dev distrobox
+      ansible.builtin.shell: >-
+        timeout {{ distrobox_check_timeout_seconds }}
+        distrobox enter
+        --name {{ dev_box | quote }}
+        --no-tty
+        -- nvidia-smi -L
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: gpu_distrobox
+      failed_when: gpu_distrobox.rc != 0
+      tags: [distrobox, gpu]
+
+    - name: Smoke-test core dev tools inside the dev distrobox
+      ansible.builtin.shell: >-
+        timeout {{ distrobox_check_timeout_seconds }}
+        distrobox enter
+        --name {{ dev_box | quote }}
+        --no-tty
+        -- bash -lc 'command -v nvim && command -v git && command -v python3 && command -v node && command -v lazygit'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: dev_tools_check
+      failed_when: dev_tools_check.rc != 0
+      tags: [distrobox]
+
+    - name: Assert Neovim is new enough for LazyVim
+      ansible.builtin.shell: |
+        timeout {{ distrobox_check_timeout_seconds }} \
+        distrobox enter --name {{ dev_box | quote }} --no-tty -- \
+        python3 -c 'import re, subprocess, sys; out=subprocess.check_output(["nvim","--version"], text=True).splitlines()[0]; print(out); m=re.search(r"v(\d+)\.(\d+)\.(\d+)", out); sys.exit(0 if m and tuple(map(int, m.groups())) >= (0,11,2) else 1)'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: nvim_version_check
+      failed_when: nvim_version_check.rc != 0
+      tags: [distrobox, editor]
+
+    # -------------------------------------------------------------------------
+    # Optional Homebrew convenience tools
+    # -------------------------------------------------------------------------
+
+    - name: Detect Homebrew
+      ansible.builtin.stat:
+        path: /home/linuxbrew/.linuxbrew/bin/brew
+      register: brew_bin
+      tags: [brew]
+
+    - name: Check whether Brewfile exists
+      ansible.builtin.stat:
+        path: "{{ repo_dir }}/Brewfile"
+      register: brewfile
+      tags: [brew]
+
+    - name: Install Homebrew CLI tools from Brewfile
+      ansible.builtin.shell: >-
+        eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)" &&
+        brew bundle --file={{ (repo_dir + '/Brewfile') | quote }}
+      args:
+        executable: /bin/bash
+      register: brew_bundle
+      changed_when: >
+        'Installing' in brew_bundle.stdout or
+        'Upgrading' in brew_bundle.stdout or
+        'Removing' in brew_bundle.stdout
+      when:
+        - install_brew_tools | bool
+        - brew_bin.stat.exists
+        - brewfile.stat.exists
+      tags: [brew]
+
+    # -------------------------------------------------------------------------
+    # Shell aliases
+    # -------------------------------------------------------------------------
+
+    - name: Ensure ~/.bashrc.d exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.bashrc.d"
+        state: directory
+        mode: "0755"
+      tags: [shell]
+
+    - name: Check modern CLI alias file exists in repo
+      ansible.builtin.stat:
+        path: "{{ repo_dir }}/shell/modern-cli.sh"
+      register: modern_cli_file
+      tags: [shell]
+
+    - name: Deploy modern-CLI aliases drop-in
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/shell/modern-cli.sh"
+        dest: "{{ home_dir }}/.bashrc.d/50-modern-cli.sh"
+        mode: "0644"
+      when: modern_cli_file.stat.exists
+      tags: [shell]
+
+    - name: Ensure ~/.bashrc sources ~/.bashrc.d/*.sh
+      ansible.builtin.blockinfile:
+        path: "{{ home_dir }}/.bashrc"
+        create: true
+        marker: "# {mark} meld7t-infra managed"
+        block: |
+          if [ -d "$HOME/.bashrc.d" ]; then
+            for rc in "$HOME"/.bashrc.d/*.sh; do
+              [ -f "$rc" ] && . "$rc"
+            done
+          fi
+      tags: [shell]
+
+    # -------------------------------------------------------------------------
+    # Editor config
+    # -------------------------------------------------------------------------
+
+    - name: Ensure ~/.config exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.config"
+        state: directory
+        mode: "0755"
+      tags: [editor]
+
+    - name: Check whether ~/.config/nvim already exists
+      ansible.builtin.stat:
+        path: "{{ home_dir }}/.config/nvim/init.lua"
+      register: nvim_config
+      tags: [editor]
+
+    - name: Clone LazyVim starter to ~/.config/nvim using host git
+      ansible.builtin.command: >-
+        git clone https://github.com/LazyVim/starter {{ (home_dir + '/.config/nvim') | quote }}
+      args:
+        creates: "{{ home_dir }}/.config/nvim/init.lua"
+      when: not nvim_config.stat.exists
+      tags: [editor]
+
+    - name: Detach LazyVim starter from upstream git
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.config/nvim/.git"
+        state: absent
+      tags: [editor]
+
+    - name: Remove old misplaced LazyVim extras file
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.config/nvim/lua/plugins/extras.lua"
+        state: absent
+      tags: [editor]
+
+    - name: Ensure LazyVim config directory exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.config/nvim/lua/config"
+        state: directory
+        mode: "0755"
+      tags: [editor]
+
+    - name: Check LazyVim lazy.lua exists
+      ansible.builtin.stat:
+        path: "{{ lazyvim_lazy_lua }}"
+      register: lazyvim_lazy_lua_stat
+      tags: [editor]
+
+    - name: Patch LazyVim extras into lazy.lua in correct import order
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+
+        path = Path("{{ lazyvim_lazy_lua }}")
+        text = path.read_text()
+
+        # Remove any previously misplaced managed block, wherever it landed.
+        text = re.sub(
+            r'(?ms)^-- BEGIN MELD 7T managed LazyVim extras\n.*?^-- END MELD 7T managed LazyVim extras\n?',
+            '',
+            text,
+        )
+
+        block = '''    -- BEGIN MELD 7T managed LazyVim extras
+            { import = "lazyvim.plugins.extras.lang.python" },
+            { import = "lazyvim.plugins.extras.lang.json" },
+            { import = "lazyvim.plugins.extras.lang.yaml" },
+            { import = "lazyvim.plugins.extras.lang.toml" },
+            { import = "lazyvim.plugins.extras.lang.docker" },
+            { import = "lazyvim.plugins.extras.util.project" },
+            { import = "lazyvim.plugins.extras.editor.mini-files" },
+            -- END MELD 7T managed LazyVim extras
+
+        '''
+
+        pattern = r'(?m)^(\s*\{ import = "plugins" \},)'
+        if not re.search(pattern, text):
+            raise SystemExit('Could not find `{ import = "plugins" },` in lazy.lua')
+
+        text = re.sub(pattern, block + r'\1', text, count=1)
+        path.write_text(text)
+        PY
+      args:
+        executable: /bin/bash
+      when: lazyvim_lazy_lua_stat.stat.exists
+      tags: [editor]
+
+    - name: Print LazyVim first-launch note
+      ansible.builtin.debug:
+        msg: >-
+          LazyVim config installed. Run
+          'distrobox enter {{ dev_box }} -- nvim'
+          once to finish plugin, Tree-sitter, and Mason setup interactively.
+      tags: [editor]
+
+    # -------------------------------------------------------------------------
+    # Optional AI coding CLIs
+    # -------------------------------------------------------------------------
+
+    - name: Detect Claude Code
+      ansible.builtin.shell: command -v claude
+      args:
+        executable: /bin/bash
+      environment:
+        PATH: "{{ user_path }}"
+      register: has_claude
+      changed_when: false
+      failed_when: false
+      when: install_ai_cli | bool
+      tags: [ai-cli]
+
+    - name: Download Claude Code installer
+      ansible.builtin.get_url:
+        url: https://claude.ai/install.sh
+        dest: /tmp/claude-install.sh
+        mode: "0700"
+      when:
+        - install_ai_cli | bool
+        - has_claude.rc != 0
+      tags: [ai-cli]
+
+    - name: Install Claude Code
+      ansible.builtin.command: /tmp/claude-install.sh
+      environment:
+        PATH: "{{ user_path }}"
+      when:
+        - install_ai_cli | bool
+        - has_claude.rc != 0
+      tags: [ai-cli]
+
+    - name: Detect Codex CLI
+      ansible.builtin.shell: command -v codex
+      args:
+        executable: /bin/bash
+      environment:
+        PATH: "{{ user_path }}"
+      register: has_codex
+      changed_when: false
+      failed_when: false
+      when: install_ai_cli | bool
+      tags: [ai-cli]
+
+    - name: Download Codex CLI installer
+      ansible.builtin.get_url:
+        url: https://chatgpt.com/codex/install.sh
+        dest: /tmp/codex-install.sh
+        mode: "0700"
+      when:
+        - install_ai_cli | bool
+        - has_codex.rc != 0
+      tags: [ai-cli]
+
+    - name: Install Codex CLI
+      ansible.builtin.command: /tmp/codex-install.sh
+      environment:
+        PATH: "{{ user_path }}"
+        CODEX_NON_INTERACTIVE: "1"
+      when:
+        - install_ai_cli | bool
+        - has_codex.rc != 0
+      tags: [ai-cli]

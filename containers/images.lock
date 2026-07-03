@@ -1,0 +1,8 @@
+# Pinned pipeline images — the source of truth for the software environment.
+# Populate after `just pull`, then keep updated via `just freeze`.
+#
+# Format:  <role>    <registry/repo@sha256:DIGEST>
+#
+# meld_graph   TODO@sha256:...        # from the MELD install docs
+# freesurfer   TODO@sha256:...        # OR fastsurfer — decided in Phase 1/2
+
