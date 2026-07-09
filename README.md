@@ -33,6 +33,7 @@ upgrades) and defeats reproducibility. We never do it.
 meld7t-infra/
 ├── README.md                 # this file
 ├── justfile                  # daily-driver task runner (gpu-check, dev, pull, recon, batch, freeze)
+├── mount.sh                  # manual fallback: mount the NFS durable data tier with §28 options
 ├── Brewfile                  # personal CLI tools (optional; not the pipeline)
 ├── .gitignore                # keeps PHI/data and secrets out of git
 ├── ansible/
@@ -43,7 +44,13 @@ meld7t-infra/
 ├── nvim/
 │   └── lua/plugins/extras.lua # tracked LazyVim language extras (python/yaml/ansible/docker/…); → ~/.config/nvim/
 └── containers/
-    └── images.lock           # pinned image digests (source of truth for the software env)
+    ├── images.lock           # pinned image digests (source of truth for the software env)
+    ├── systemd/              # Quadlet units: long-running services + network + volumes (§2)
+    │   ├── meld-net.network
+    │   ├── *.volume          # orthanc-storage / postgres-data / redis-data / caddy-data / registry-data
+    │   └── *.container       # postgres / redis / orthanc / registry / caddy
+    └── config/               # config the units mount (Caddyfile, orthanc.json, postgres init)
+        └── services.env.example  # secrets template → copy to secrets/services.env (gitignored)
 ```
 
 ## Shell / CLI
@@ -149,6 +156,77 @@ Re-`freeze` afterward so the pinned OS checksum and driver match the deployment 
 — the stable pointer the `gpu-check` drift guard compares against. Run it whenever the environment
 changes. On an atomic OS this captures the *entire* stack, OS included — satisfying the plan's
 reproducibility requirement.
+
+## Durable data tier (TrueNAS/ZFS over NFS)
+
+Pipeline intermediates are retained durably on the air-gapped TrueNAS NAS, mounted at `./data`
+(gitignored — it is PHI-bearing). The split is **hot scratch = local NVMe** (the live recon;
+small-file storms never touch NFS) and **durable tier = NFS** (bulk sequential rsync of completed
+runs). See the project plan §28.
+
+**Bring it up (persistent, version-controlled):**
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml --tags storage -K
+```
+This installs a systemd **`.automount`** for `./data` (mount-on-access, so a down NAS never hangs
+boot) with the full §28 option set, and unmounts any stale ad-hoc mount first. Override the NAS
+target with `-e nas_host=… -e nas_export=…`. Manual fallback: `just mount-data` / `just umount-data`
+(both call `mount.sh`); verify with `just data-check`.
+
+**The one option that must never be dropped — SELinux `context=`.** NFS presents every file as
+type `nfs_t`, which cannot hold the `security.selinux` xattr that a Podman `:z`/`:Z` bind-relabel
+writes. So bind-mounting an NFS path into a container with `:z` **silently no-ops** and the confined
+`container_t` domain is **denied** — the same failure *class* as the GPU/CDI SELinux issue, a
+different fix. The mount therefore carries a whole-export fixed label
+(`context="system_u:object_r:container_file_t:s0"`); compute containers get a **plain** bind-mount
+of the host path (**never `:z`**, never NFS-inside-the-container). `just data-check` asserts the
+label is `container_file_t`, not `nfs_t`.
+
+Full mount options: `vers=4.2,hard,noatime,nconnect=4,sec=sys,context="…container_file_t",_netdev`
+(`hard`, not `soft`, because durability requires writes to eventually succeed, not fail silently).
+
+## Long-running services (rootless Podman Quadlet)
+
+The platform's always-on services (spec §2) are declared as **Quadlet** systemd units in
+`containers/systemd/` and version-controlled here. The off-the-shelf tier is wired up now —
+**postgres, redis, orthanc, registry, caddy**; the `api` (built FastAPI image) and the host
+`worker` carry bespoke code and drop in behind the same pattern once built. Everything runs
+**rootless** as *user* systemd services; `linger` lets them boot-start without a login.
+
+**Bring it up:**
+```bash
+# 1. Provide secrets (never in git): copy the template, fill in real passwords.
+cp containers/config/services.env.example secrets/services.env && $EDITOR secrets/services.env
+
+# 2. Install the units + config into the user Quadlet path, enable linger, daemon-reload.
+ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml --tags services -K
+
+# 3. Once the images are present (internal registry, or `podman pull` on a connected box):
+just services-up          # start postgres, redis, orthanc, registry, caddy
+just services-status      # unit state + running containers
+just services-logs unit=orthanc   # follow one service
+```
+
+**How it fits together:**
+- All services share the `meld-net` podman network; only Caddy publishes to the host
+  (`8443`→443, `8080`→80 by default — rootless-safe high ports). Orthanc, Postgres, and Redis
+  are **not** published — reachable only on `meld-net` (§4). The registry publishes on
+  `127.0.0.1:5000` for dev-transfer pushes only.
+- Caddy proxies same-origin paths (§3): `/dicom-web/*`→Orthanc, `/api/*`→FastAPI (502 until
+  `api` exists), `/`→the static SPA (mount the built bundle at `/srv/spa` when staged).
+- Postgres hosts **two** databases created on first init: `orthanc` (DICOM index, §4) and
+  `meld` (results/metadata, §8). Orthanc keeps DICOM **files** on the `orthanc-storage`
+  volume and only its **index** in Postgres.
+- TLS is Caddy's **internal CA** (`tls internal`, §3) — no ACME. Distribute the CA root (in
+  the `caddy-data` volume) to intranet clients, or swap in institutional PKI in the Caddyfile.
+
+**Editing a unit:** change the file under `containers/systemd/`, re-run `--tags services` (or
+`just services-reload`), then `just services-up`. **Secrets** live only in `secrets/services.env`
+(gitignored); bootstrap installs them to `~/.config/meld7t/services.env` (mode 0600).
+
+**Serving on 443/80 instead of 8443/8080** (optional): lower the rootless port floor —
+`echo 'net.ipv4.ip_unprivileged_port_start=80' | sudo tee /etc/sysctl.d/50-unprivileged-ports.conf && sudo sysctl --system`
+— then change Caddy's `PublishPort=` lines to `443:443` / `80:80` and `just services-reload && just services-up`.
 
 ## Troubleshooting
 

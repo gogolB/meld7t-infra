@@ -1,0 +1,23 @@
+[Unit]
+Description=Orthanc — DICOM store + DICOMweb (spec §2.1, §4)
+After=network-online.target postgres.service
+Requires=postgres.service
+
+[Container]
+Image=docker.io/orthancteam/orthanc:24.7.3
+ContainerName=orthanc
+Network=meld-net.network
+# DICOM files on the storage volume; the index lives in PostgreSQL (see orthanc.json).
+Volume=orthanc-storage.volume:/var/lib/orthanc/db
+Volume=%h/.config/meld7t/orthanc/orthanc.json:/etc/orthanc/orthanc.json:ro,z
+# The orthancteam image merges ORTHANC__SECTION__KEY env into config — this injects the
+# PostgreSQL password (ORTHANC__POSTGRESQL__PASSWORD) so it never sits in the JSON.
+EnvironmentFile=%h/.config/meld7t/services.env
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

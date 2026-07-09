@@ -52,6 +52,57 @@ cdi-generate:
     sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
     nvidia-ctk cdi list
 
+# --- Durable data tier: TrueNAS/ZFS over NFS (spec §28) ---
+# The persistent path is the systemd automount installed by:
+#   ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml --tags storage -K
+# These are manual helpers that mount the SAME export with the SAME §28 options.
+
+# Manually mount the durable data tier at ./data (SELinux context= label, hard, nconnect).
+mount-data:
+    {{repo}}/mount.sh
+
+# Unmount the durable data tier.
+umount-data:
+    sudo umount {{repo}}/data
+
+# Verify the mount carries the container_file_t label (not nfs_t) — the §28 SELinux check.
+data-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! mountpoint -q {{repo}}/data; then echo "not mounted: {{repo}}/data (run: just mount-data)"; exit 1; fi
+    echo "== mount options =="; findmnt -no SOURCE,FSTYPE,OPTIONS {{repo}}/data
+    echo "== SELinux label (must be container_file_t) =="; ls -Zd {{repo}}/data
+    findmnt -no OPTIONS {{repo}}/data | grep -q 'context=' \
+      && echo "OK: context= label present" \
+      || { echo ">> FAIL: no context= — container_t will be denied. Remount: just umount-data && just mount-data"; exit 1; }
+
+# --- Long-running services: rootless Podman Quadlet (spec §2) ---
+# Units + config are installed by `ansible-playbook bootstrap.yml --tags services`.
+# These helpers drive the user systemd units (quadlet strips the .container suffix).
+svc_units := "postgres redis orthanc registry caddy"
+
+# Reload user systemd so Quadlet regenerates units after editing containers/systemd/*.
+services-reload:
+    systemctl --user daemon-reload
+
+# Start the long-running services (postgres, redis, orthanc, registry, caddy).
+# Needs the images present (internal registry / `podman pull`) and services.env installed.
+services-up: services-reload
+    systemctl --user start {{svc_units}}
+
+# Stop the long-running services.
+services-down:
+    systemctl --user stop {{svc_units}} || true
+
+# Show unit state + the running service containers.
+services-status:
+    systemctl --user --no-pager status {{svc_units}} || true
+    podman ps --filter label=PODMAN_SYSTEMD_UNIT
+
+# Follow one service's logs (default caddy):  just services-logs unit=orthanc
+services-logs unit="caddy":
+    journalctl --user -u {{unit}} -f
+
 # 2) Enter the mutable dev box (created by ansible/bootstrap.yml).
 dev:
     distrobox enter {{dev_box}}
@@ -65,6 +116,10 @@ edit path=".":
 # Private helper: the shared podman invocation. `:z` = shared SELinux relabel (Bazzite needs it, same
 # reason as the GPU device); no --user (rootless maps container-root -> your host UID, so output is
 # yours). GPU via the CDI device we validated. The image's entrypoint sources FreeSurfer, then runs ARGS.
+# NB (spec §28): meld-data is LOCAL NVMe (container_file_t), so `:z` is correct here. Any bind mount
+# whose source is under ./data (the NFS durable tier) must be mounted WITHOUT `:z` — NFS is nfs_t and
+# cannot hold the relabel xattr, so `:z` no-ops and container_t is denied. The NFS mount's own
+# context= label handles it instead. Keep hot scratch local; rsync outputs to ./data (host-side).
 _meld *ARGS:
     mkdir -p {{meld_data}}
     podman run --rm \

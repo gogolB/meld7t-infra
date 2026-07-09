@@ -1,0 +1,20 @@
+[Unit]
+Description=Registry — internal image cache for air-gap distribution (spec §2.4, §11)
+After=network-online.target
+
+[Container]
+Image=docker.io/library/registry:2
+ContainerName=registry
+Network=meld-net.network
+Volume=registry-data.volume:/var/lib/registry
+# Loopback-only publish: dev-machine transfers push here (via an SSH tunnel or on-host
+# `podman push`), and prod pulls only from the internal registry. Other services reach it
+# on meld-net as `registry:5000`; it is never exposed on the intranet interface.
+PublishPort=127.0.0.1:5000:5000
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

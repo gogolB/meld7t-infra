@@ -1,0 +1,26 @@
+[Unit]
+Description=PostgreSQL — results/metadata DB + Orthanc index (spec §2.1, §8)
+After=network-online.target
+
+[Container]
+Image=docker.io/library/postgres:16
+ContainerName=postgres
+Network=meld-net.network
+Volume=postgres-data.volume:/var/lib/postgresql/data
+# Non-secret bootstrap: creates the `orthanc` and `meld` databases + roles on first
+# init (runs only when the data volume is empty). Passwords come from the environment.
+Volume=%h/.config/meld7t/postgres/init-databases.sh:/docker-entrypoint-initdb.d/10-init-databases.sh:ro,z
+# POSTGRES_PASSWORD (+ the role passwords the init script reads) live here, not in git.
+EnvironmentFile=%h/.config/meld7t/services.env
+HealthCmd=pg_isready -U postgres
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=5
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

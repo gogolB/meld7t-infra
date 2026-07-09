@@ -48,6 +48,23 @@
     install_brew_tools: false
     install_ai_cli: false
 
+    # --- Durable data tier: TrueNAS/ZFS over NFS (spec §28) ---
+    # Override NAS host/export per deployment (air-gap: this is a host<->NAS intranet flow).
+    nas_host: "192.168.5.10"
+    nas_export: "/mnt/tank/data/Projects/meld7t/data"
+    nfs_mount_point: "{{ repo_dir }}/data"
+    nfs_nconnect: 4
+    nfs_sec: "sys"                                        # krb5 if a KDC is reachable
+    # Whole-export fixed SELinux label. NFS files are nfs_t and cannot hold the xattr that
+    # a :z bind-relabel writes, so container_t is denied unless the mount carries this label.
+    nfs_selinux_context: "system_u:object_r:container_file_t:s0"
+
+    # --- Long-running services: rootless Podman Quadlet (spec §2) ---
+    svc_user: "{{ lookup('env', 'USER') }}"
+    quadlet_user_dir: "{{ home_dir }}/.config/containers/systemd"
+    svc_config_dir: "{{ home_dir }}/.config/meld7t"
+    svc_env_src: "{{ repo_dir }}/secrets/services.env"
+
     distrobox_init_timeout_seconds: 900
     distrobox_check_timeout_seconds: 120
     distrobox_install_timeout_seconds: 900
@@ -55,8 +72,8 @@
     lazyvim_lazy_lua: "{{ home_dir }}/.config/nvim/lua/config/lazy.lua"
 
     work_dirs:
-      - path: "{{ repo_dir }}/data"
-        mode: "0750"
+      # NOTE: {{ repo_dir }}/data is the NFS mount point, managed by the storage tasks
+      # below — deliberately NOT listed here so the file module never chmods the NFS root.
       - path: "{{ repo_dir }}/provenance"
         mode: "0750"
       - path: "{{ repo_dir }}/secrets"
@@ -183,6 +200,226 @@
       register: gpu_container
       failed_when: gpu_container.rc != 0
       tags: [host, gpu]
+
+    # -------------------------------------------------------------------------
+    # Durable data tier — TrueNAS/ZFS over NFS (spec §28)
+    #
+    # Host mounts NFS with a fixed SELinux label; compute containers get a PLAIN
+    # bind-mount of the host path (never :z, never NFS-in-container). Installed as a
+    # systemd .automount so a down NAS never hangs boot — the mount is established on
+    # first access (e.g. the worker's rsync of a completed run).
+    # -------------------------------------------------------------------------
+
+    - name: Ensure the NFS mount point exists
+      ansible.builtin.file:
+        path: "{{ nfs_mount_point }}"
+        state: directory
+        mode: "0750"
+      tags: [storage]
+
+    - name: Compute systemd unit name for the NFS mount
+      ansible.builtin.command: "systemd-escape -p --suffix=mount {{ nfs_mount_point }}"
+      changed_when: false
+      register: nfs_mount_unit
+      tags: [storage]
+
+    - name: Compute systemd unit name for the NFS automount
+      ansible.builtin.command: "systemd-escape -p --suffix=automount {{ nfs_mount_point }}"
+      changed_when: false
+      register: nfs_automount_unit
+      tags: [storage]
+
+    - name: Read current mount options at the mount point (if mounted)
+      ansible.builtin.command: "findmnt -no OPTIONS {{ nfs_mount_point }}"
+      changed_when: false
+      failed_when: false
+      register: nfs_current_opts
+      tags: [storage]
+
+    - name: Unmount a stale ad-hoc NFS mount lacking the SELinux context label
+      ansible.builtin.command: "umount {{ nfs_mount_point }}"
+      become: true
+      when:
+        - nfs_current_opts.rc == 0
+        - "'context=' not in nfs_current_opts.stdout"
+      register: nfs_stale_unmount
+      changed_when: nfs_stale_unmount.rc == 0
+      tags: [storage]
+
+    - name: Install the NFS .mount unit
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ nfs_mount_unit.stdout }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=MELD 7T durable data tier (TrueNAS/ZFS over NFS) — {{ nas_host }}:{{ nas_export }}
+          Documentation=meld7t-infra spec §28
+          After=network-online.target
+          Wants=network-online.target
+
+          [Mount]
+          What={{ nas_host }}:{{ nas_export }}
+          Where={{ nfs_mount_point }}
+          Type=nfs4
+          Options=vers=4.2,hard,noatime,nconnect={{ nfs_nconnect }},sec={{ nfs_sec }},context="{{ nfs_selinux_context }}",_netdev
+          TimeoutSec=30
+
+          [Install]
+          WantedBy=remote-fs.target
+      become: true
+      register: nfs_mount_unit_file
+      tags: [storage]
+
+    - name: Install the NFS .automount unit
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ nfs_automount_unit.stdout }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Automount for MELD 7T durable data tier ({{ nfs_mount_point }})
+          Documentation=meld7t-infra spec §28
+
+          [Automount]
+          Where={{ nfs_mount_point }}
+          TimeoutIdleSec=600
+
+          [Install]
+          WantedBy=multi-user.target
+      become: true
+      register: nfs_automount_unit_file
+      tags: [storage]
+
+    - name: Re-check whether the path is mounted after any stale unmount
+      ansible.builtin.command: "mountpoint -q {{ nfs_mount_point }}"
+      changed_when: false
+      failed_when: false
+      register: nfs_mounted_now
+      tags: [storage]
+
+    - name: Enable the NFS automount (reload units first)
+      ansible.builtin.systemd:
+        name: "{{ nfs_automount_unit.stdout }}"
+        enabled: true
+        daemon_reload: true
+      become: true
+      tags: [storage]
+
+    - name: Start the NFS automount if the path is not already mounted
+      ansible.builtin.systemd:
+        name: "{{ nfs_automount_unit.stdout }}"
+        state: started
+      become: true
+      when: nfs_mounted_now.rc != 0
+      tags: [storage]
+
+    # -------------------------------------------------------------------------
+    # Long-running services — rootless Podman Quadlet units (spec §2)
+    #
+    # Off-the-shelf tier: postgres, redis, orthanc, registry, caddy. (api + worker carry
+    # bespoke code and are wired in when built.) Units + config are version-controlled in
+    # containers/ and installed into the user Quadlet path; linger lets the user manager
+    # boot-start them without an interactive login. Images are NOT pulled/started here —
+    # in the air-gap they arrive via the internal registry; start with `just services-up`.
+    # -------------------------------------------------------------------------
+
+    - name: Check the services secrets file exists
+      ansible.builtin.stat:
+        path: "{{ svc_env_src }}"
+      register: svc_env_stat
+      tags: [services]
+
+    # No secrets yet → skip (don't fail) so the base host bring-up still completes. The note
+    # below tells the operator how to enable services. Everything past here is gated on it.
+    - name: Note that services are skipped until services.env exists
+      ansible.builtin.debug:
+        msg: >-
+          Skipping long-running services: {{ svc_env_src }} not found. To enable them,
+          `cp containers/config/services.env.example secrets/services.env`, fill in real
+          secrets, and re-run with `--tags services`.
+      when: not svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Ensure the user Quadlet + service-config directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ quadlet_user_dir }}"
+        - "{{ svc_config_dir }}"
+        - "{{ svc_config_dir }}/caddy"
+        - "{{ svc_config_dir }}/orthanc"
+        - "{{ svc_config_dir }}/postgres"
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Install the services secrets file (0600)
+      ansible.builtin.copy:
+        src: "{{ svc_env_src }}"
+        dest: "{{ svc_config_dir }}/services.env"
+        mode: "0600"
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Install service config files
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - src: "{{ repo_dir }}/containers/config/caddy/Caddyfile"
+          dest: "{{ svc_config_dir }}/caddy/Caddyfile"
+          mode: "0644"
+        - src: "{{ repo_dir }}/containers/config/orthanc/orthanc.json"
+          dest: "{{ svc_config_dir }}/orthanc/orthanc.json"
+          mode: "0644"
+        - src: "{{ repo_dir }}/containers/config/postgres/init-databases.sh"
+          dest: "{{ svc_config_dir }}/postgres/init-databases.sh"
+          mode: "0755"
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Install Quadlet unit files into the user generator path
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/containers/systemd/"
+        dest: "{{ quadlet_user_dir }}/"
+        mode: "0644"
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Enable linger so user services boot-start without a login
+      ansible.builtin.command: "loginctl enable-linger {{ svc_user }}"
+      become: true
+      changed_when: false
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Determine current user id (for the user systemd runtime dir)
+      ansible.builtin.command: id -u
+      changed_when: false
+      register: svc_uid
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Reload the user systemd manager so Quadlet regenerates service units
+      ansible.builtin.command: systemctl --user daemon-reload
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ svc_uid.stdout }}"
+      changed_when: false
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Print services next-step note
+      ansible.builtin.debug:
+        msg: >-
+          Quadlet units installed. Once the service images are present (internal registry or
+          `podman pull`), bring the stack up with `just services-up` and check `just services-status`.
+      when: svc_env_stat.stat.exists
+      tags: [services]
 
     # -------------------------------------------------------------------------
     # Project directories

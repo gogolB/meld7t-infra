@@ -1,0 +1,5 @@
+[Unit]
+Description=Registry storage — internal image cache for air-gap distribution (spec §2.4, §2.5)
+
+[Volume]
+VolumeName=registry-data

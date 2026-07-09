@@ -1,0 +1,23 @@
+[Unit]
+Description=Redis — job broker + hot cache (spec §2.1, §2.4)
+After=network-online.target
+
+[Container]
+Image=docker.io/library/redis:7-alpine
+ContainerName=redis
+Network=meld-net.network
+Volume=redis-data.volume:/data
+# appendonly so queue/session state survives a restart (§2.4 hot cache is rebuildable,
+# but AOF avoids losing in-flight job status across a service bounce).
+Exec=redis-server --appendonly yes
+HealthCmd=redis-cli ping
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=5
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

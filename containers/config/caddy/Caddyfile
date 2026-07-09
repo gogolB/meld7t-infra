@@ -1,0 +1,37 @@
+# meld7t reverse proxy (spec §3). Served by the caddy.container Quadlet unit.
+# Same-origin paths so Cornerstone/OHIF hit DICOMweb without CORS.
+
+{
+	# Air-gapped: no ACME. TLS is issued/renewed by Caddy's built-in local CA (see the
+	# site's `tls internal` below). The CA root is stored in the caddy-data volume —
+	# distribute it to intranet clients, or swap `tls internal` for institutional PKI.
+	admin off
+}
+
+# SITE_ADDRESS is injected from services.env (default: localhost). Use the intranet
+# hostname clients actually resolve, so the internal cert's SAN matches.
+{$SITE_ADDRESS:localhost} {
+	tls internal
+
+	encode zstd gzip
+
+	# DICOMweb (QIDO/WADO/STOW) → Orthanc. Path is preserved (Orthanc's DicomWeb Root is
+	# /dicom-web/), so this is a same-origin passthrough for the viewer. (§3, §4)
+	handle /dicom-web/* {
+		reverse_proxy orthanc:8042
+	}
+
+	# Application API → FastAPI. The api container is not built yet (§5, §23) — this
+	# returns 502 until it exists; the route is here so the SPA path is stable.
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	# Static SPA bundle, built on the dev machine and staged as a mounted volume (§9.4).
+	# 404s until the bundle is mounted at /srv/spa.
+	handle {
+		root * /srv/spa
+		try_files {path} /index.html
+		file_server
+	}
+}

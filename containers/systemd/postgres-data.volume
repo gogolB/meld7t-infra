@@ -1,0 +1,5 @@
+[Unit]
+Description=PostgreSQL data — results/metadata DB + Orthanc index (spec §2.5)
+
+[Volume]
+VolumeName=postgres-data

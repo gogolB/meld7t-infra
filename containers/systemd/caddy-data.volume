@@ -1,0 +1,5 @@
+[Unit]
+Description=Caddy data — internal CA + issued TLS certs (spec §2.5, §3)
+
+[Volume]
+VolumeName=caddy-data

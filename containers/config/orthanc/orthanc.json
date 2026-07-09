@@ -1,0 +1,34 @@
+{
+  "Name": "meld7t-orthanc",
+
+  "// storage": "DICOM files on the orthanc-storage volume; index in PostgreSQL (spec §4).",
+  "StorageDirectory": "/var/lib/orthanc/db",
+  "IndexDirectory": "/var/lib/orthanc/db",
+
+  "HttpPort": 8042,
+  "HttpTimeout": 60,
+
+  "// access": "Not published; reachable only by Caddy + the worker on meld-net. Auth is",
+  "// access2": "enforced at the API/proxy tier (§4), so Orthanc's own auth is disabled here.",
+  "RemoteAccessAllowed": true,
+  "AuthenticationEnabled": false,
+
+  "// dicom-scp": "C-STORE listener is out of MVP scope (§23); enable + publish 4242 later.",
+  "DicomServerEnabled": false,
+
+  "PostgreSQL": {
+    "EnableIndex": true,
+    "EnableStorage": false,
+    "Host": "postgres",
+    "Port": 5432,
+    "Database": "orthanc",
+    "Username": "orthanc"
+  },
+
+  "DicomWeb": {
+    "Enable": true,
+    "Root": "/dicom-web/",
+    "EnableWado": true,
+    "WadoRoot": "/wado"
+  }
+}
