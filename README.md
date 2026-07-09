@@ -49,8 +49,12 @@ meld7t-infra/
     │   ├── meld-net.network
     │   ├── *.volume          # orthanc-storage / postgres-data / redis-data / caddy-data / registry-data
     │   └── *.container       # postgres / redis / orthanc / registry / caddy
-    └── config/               # config the units mount (Caddyfile, orthanc.json, postgres init)
-        └── services.env.example  # secrets template → copy to secrets/services.env (gitignored)
+    ├── config/               # config the units mount (Caddyfile, orthanc.json, postgres init)
+    │   └── services.env.example  # secrets template → copy to secrets/services.env (gitignored)
+    └── pkg/                  # §2.2 pkg image: dcm2niix + O'Brien MP2RAGE clean (recon input)
+        ├── Containerfile
+        ├── recon_prepare.py  # DICOM → BIDS T1w (series-match, convert, clean, provenance)
+        └── clean_uni.py      # O'Brien INV1×INV2 robust background removal
 ```
 
 ## Shell / CLI
@@ -124,9 +128,9 @@ just freeze
 # 4. Interactive dev when you need it.
 just dev             # enter the meld-dev distrobox
 
-# 5. Run the pipeline (skeletons until Phase 1/2 decisions land).
-just recon SUBJECT
-just batch 16
+# 5. Recon a subject: raw DICOM → BIDS T1w (convert + clean) → MELD FCD pipeline.
+just pkg-build                                              # once, on the dev machine
+just recon sub-s01uni "data/raw/subject 1 clean/DICOM"      # UNI source (default)
 ```
 
 ## Updating the host
@@ -149,6 +153,36 @@ just cdi-generate   &&   just freeze
 
 Re-`freeze` afterward so the pinned OS checksum and driver match the deployment you actually run.
 **Rule of thumb: regenerate CDI after any `ujust update` that bumps the driver.**
+
+## Recon pipeline (DICOM → MELD)
+
+`just recon SUBJECT DICOM_ROOT [source]` runs the full FCD recon: the **pkg** container
+(`containers/pkg/`, spec §2.2) converts DICOM→NIfTI (`dcm2niix`), background-cleans the source,
+and writes a BIDS `sub-<id>/anat/sub-<id>_T1w.nii.gz` (+ a series-provenance sidecar, §16); then
+`just meld-run` runs MELD Graph with `--fastsurfer`. The pkg step runs `--network=none` (§27) — it
+only touches mounted volumes.
+
+**Source series — provisional default: `uni`.** This site's protocol offers two viable T1 sources
+(§16). A first real-subject A/B (see `provenance/` and the pilot notes) measured them head-to-head:
+
+| Source | prep | surface defects (FreeSurfer holes) | note |
+|---|---|---|---|
+| **`uni`** (cleaned MP2RAGE UNI) | O'Brien INV1×INV2 background clean | **32** (lh20/rh12) | B1-robust; 0.7 mm isotropic conforms cleanly |
+| `mprage` (AX conventional) | none | 45 (lh27/rh18) | zero-prep; anisotropic 0.375×0.375×0.7, residual 7T B1⁺ |
+
+The cleaned UNI recons a **topologically cleaner surface** (the §16 decision criterion), so it is the
+default. This is **n=1** — ratify across more pilot cases before hard-committing; both sources stay
+runnable (`just recon SUBJECT DICOM_ROOT mprage`). **Both sources also produced *different, likely
+false-positive* clusters** on this single unharmonized subject — a live reminder that outputs are
+research/hypothesis-generating and need the §25.2 control cohort (harmonization) + human adjudication.
+
+The **UNI clean is O'Brien (2014) regularization, not a mask** (`clean_uni.py`): a spatial mask
+clips the brain; O'Brien recovers the signed numerator from the scanner UNI and suppresses the
+salt-and-pepper background via a β term, preserving tissue (esp. the inferior temporal lobes). No
+skull-strip — MELD does its own brain extraction (§7).
+
+**VRAM (measured, §14):** prediction peaks at **~21.2 GB** (fixed icosphere, source-invariant),
+segmentation ~9 GB; total ≈ prediction, fits the 24 GB card with ~3.4 GB headroom.
 
 ## Provenance
 `just freeze` writes a timestamped record of the **OS image checksum** (`rpm-ostree status`),
@@ -243,7 +277,15 @@ Confirm with `getsebool container_use_devices` (should read `--> on`); see the d
 fresh box won't hit it — this note is for manual runs. If it persists after the boolean, compare
 rootless vs. `sudo podman` to isolate confined-domain access from a stale CDI spec / driver issue.
 
-## Open decisions (resolved during Phase 1/2, then wired in here)
-- **MELD image path + digest** — set `meld_image` in the `justfile` from the MELD install docs, then pin via `just freeze`.
-- **FreeSurfer vs FastSurfer** container, and **0.8 mm `-hires` vs conform-to-1 mm** — decided by the 40-case pilot A/B; the winning recipe becomes the `recon` implementation.
-- **PHI boundary** — `data/` is gitignored and never leaves the host; if features are offloaded for GPU training later, export only de-identified surface features (plan §6).
+## Open decisions
+Resolved:
+- **MELD image + digest** — pinned in `containers/images.lock`; validated end-to-end on real 7T data.
+- **Recon recipe** — FastSurfer (`--fastsurfer`), **conform-to-1 mm** (MVP default), source **`uni`**
+  (cleaned) — wired into `just recon`. See the Recon section above.
+
+Still open:
+- **Source series is n=1** — ratify `uni` vs `mprage` across more pilot cases (spec's 40-case A/B).
+- **0.8 mm `-hires` variant** — not run; its segmentation VRAM is still unmeasured (§14). The default
+  conforms to 1 mm; hires is a configurable variant, a distinct choice.
+- **PHI boundary** — `data/` is gitignored and never leaves the host; if features are offloaded for
+  GPU training later, export only de-identified surface features (plan §6).

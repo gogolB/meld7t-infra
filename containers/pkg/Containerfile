@@ -1,0 +1,21 @@
+# meld7t pkg image (spec §2.2): DICOM↔NIfTI conversion + MP2RAGE O'Brien background clean.
+#
+# Built on the internet dev machine; pinned by digest in containers/images.lock and carried
+# across the air-gap (never pulled in prod). Compute jobs run it with --network=none (§27) —
+# it only reads/writes mounted volumes. dcmqi (NIfTI→DICOM-SEG/param-map out, §17) is added
+# here when the output-packaging step is built; for now it covers the recon INPUT path.
+FROM docker.io/library/python:3.13-slim
+
+# dcm2niix: DICOM → NIfTI. Baked in at build (air-gap: no runtime download).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends dcm2niix \
+ && rm -rf /var/lib/apt/lists/*
+
+# O'Brien MP2RAGE clean deps — exact versions validated in the meld-dev box.
+RUN pip install --no-cache-dir \
+      nibabel==5.4.2 \
+      numpy==2.5.1 \
+      scipy==1.18.0
+
+COPY clean_uni.py recon_prepare.py /opt/pkg/
+WORKDIR /work

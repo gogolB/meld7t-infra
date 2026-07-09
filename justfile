@@ -10,6 +10,7 @@ dev_box    := "meld-dev"
 # your 3090 Ti's 24GB qualifies). NOTE: confirm this exact tag at pull time — if it 404s, check the
 # release page for the GPU tag or fall back to `meldproject/meld_graph:v2.2.5`.
 meld_image := env_var_or_default("MELD_IMAGE", "meldproject/meld_graph:v2.2.5_gpu")
+pkg_image  := env_var_or_default("PKG_IMAGE", "localhost/meld7t/pkg:0.1.0")  # §2.2 convert+clean
 meld_data  := env_var_or_default("MELD_DATA", repo + "/meld-data")     # bind-mounted to /data
 fs_lic     := repo + "/secrets/license.txt"                            # FreeSurfer license
 meld_lic   := repo + "/secrets/meld_license.txt"                       # MELD license
@@ -146,6 +147,36 @@ meld-test:
 #    (e.g. `just meld-run sub-001 --parallelise`, or `-harmo_code H1` once harmonised).
 meld-run subject *flags:
     just _meld python scripts/new_patient_pipeline/new_pt_pipeline.py -id {{subject}} --fastsurfer {{flags}}
+
+# --- Recon: raw DICOM -> BIDS T1w -> MELD FCD (spec §2.2, §6, §16) ---
+# Build the pkg image (dcm2niix + O'Brien MP2RAGE clean). Run on the dev machine; push to the
+# internal registry for air-gap, then re-pin the digest in containers/images.lock.
+pkg-build:
+    podman build -t {{pkg_image}} -f containers/pkg/Containerfile containers/pkg/
+
+# Prepare a MELD BIDS T1w input from raw DICOM using the pkg container (--network=none, §27).
+#   source = uni (default: O'Brien-cleaned MP2RAGE UNI — the surface-QC winner) | mprage
+# Writes meld-data/input/<subject>/anat/<subject>_T1w.nii.gz + a series-provenance sidecar (§16).
+# NB: dicom_root must be a LOCAL path. If it is on the NFS durable tier (§28), drop `:z` from the
+# /dicom mount (nfs_t can't hold the relabel) — but stage DICOM locally, don't recon off NFS.
+recon-prepare subject dicom_root source="uni":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{meld_data}}/input
+    dicom_abs="$(realpath "{{dicom_root}}")"   # podman -v needs an absolute host path
+    podman run --rm --network=none \
+      -v "$dicom_abs":/dicom:ro,z \
+      -v {{meld_data}}/input:/out:z \
+      {{pkg_image}} \
+      python3 /opt/pkg/recon_prepare.py \
+        --dicom-root /dicom --subject {{subject}} --source {{source}} --out /out
+
+# Full recon: DICOM -> BIDS (convert + clean) -> MELD FCD pipeline. source defaults to uni (§16).
+#   just recon sub-s01uni "data/raw/subject 1 clean/DICOM"             # UNI (default)
+#   just recon sub-s01mp "data/raw/subject 1 clean/DICOM" mprage       # MPRAGE A/B
+recon subject dicom_root source="uni":
+    just recon-prepare {{subject}} "{{dicom_root}}" {{source}}
+    just meld-run {{subject}}
 
 # Record exact versions + digests for provenance (project plan §6/§8). Run after any env change.
 freeze:

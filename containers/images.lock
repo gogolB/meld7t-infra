@@ -1,8 +1,14 @@
 # Pinned pipeline images — the source of truth for the software environment.
-# Populate after `just pull`, then keep updated via `just freeze`.
+# Update after a build/pull, then keep in sync via `just freeze`.
 #
-# Format:  <role>    <registry/repo@sha256:DIGEST>
-#
-# meld_graph   TODO@sha256:...        # from the MELD install docs
-# freesurfer   TODO@sha256:...        # OR fastsurfer — decided in Phase 1/2
+# Format:  <role>    <registry/repo@sha256:DIGEST | local image id>
 
+# MELD Graph v2.2.5 GPU — validated end-to-end on real 7T data (FCD pipeline, --fastsurfer).
+meld_graph   docker.io/meldproject/meld_graph@sha256:e2333882ecf984ffac63970aebf7702deea8b979a3a1e508231d06c07cefd664
+
+# pkg (spec §2.2) — DICOM->NIfTI (dcm2niix) + MP2RAGE O'Brien clean. Built from containers/pkg/
+# on the dev machine; base = python:3.13-slim. Locally built (no repo digest until pushed to the
+# internal registry) — record the image id; re-pin after `podman push` to registry:5000.
+pkg          localhost/meld7t/pkg:0.1.0   sha256:cb35d787ad2496d885ecb3f2cf85a6a70a48c10bb16e36235fd563cbaec3253a
+#   base:      docker.io/library/python@sha256:af5bd286051a06b38587d30a8638958f4a2f38381aa80fe859c740af3411bd4d
+#   pins:      dcm2niix 1.0.20241211 (debian) · nibabel 5.4.2 · numpy 2.5.1 · scipy 1.18.0
