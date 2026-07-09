@@ -12,3 +12,10 @@ meld_graph   docker.io/meldproject/meld_graph@sha256:e2333882ecf984ffac63970aebf
 pkg          localhost/meld7t/pkg:0.1.0   sha256:cb35d787ad2496d885ecb3f2cf85a6a70a48c10bb16e36235fd563cbaec3253a
 #   base:      docker.io/library/python@sha256:af5bd286051a06b38587d30a8638958f4a2f38381aa80fe859c740af3411bd4d
 #   pins:      dcm2niix 1.0.20241211 (debian) · nibabel 5.4.2 · numpy 2.5.1 · scipy 1.18.0
+
+# api (spec §5) — FastAPI orchestration. Built from platform/api/ on the dev machine.
+api          localhost/meld7t/api:0.1.0   sha256:e9bc69246ffd31fd33a5c68fa3c77e42522236853f06c402ae499cfb27f1c6c1
+
+# --- Long-running service images (off-the-shelf; §2.1) ---
+immudb       docker.io/codenotary/immudb@sha256:ca64fd851b3e60a43115e79f71c4830935f5652e0692628fc80a475c417743a7
+# postgres:16 · redis:7-alpine · orthancteam/orthanc:24.7.3 · registry:2 · caddy:2 — re-pin via `just freeze`.

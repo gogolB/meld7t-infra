@@ -1,0 +1,20 @@
+[Unit]
+Description=meld7t api — FastAPI orchestration + recipe builder (spec §5)
+After=network-online.target postgres.service immudb.service
+Requires=postgres.service
+
+[Container]
+Image=localhost/meld7t/api:0.1.0
+ContainerName=api
+Network=meld-net.network
+# MELD7T_DB_URL / _REDIS_URL / _ORTHANC_DICOMWEB / _IMMUDB_* live here.
+EnvironmentFile=%h/.config/meld7t/services.env
+# Not published — Caddy proxies /api/* to api:8000 on meld-net (§3).
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

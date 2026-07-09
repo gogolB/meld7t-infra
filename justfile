@@ -11,6 +11,7 @@ dev_box    := "meld-dev"
 # release page for the GPU tag or fall back to `meldproject/meld_graph:v2.2.5`.
 meld_image := env_var_or_default("MELD_IMAGE", "meldproject/meld_graph:v2.2.5_gpu")
 pkg_image  := env_var_or_default("PKG_IMAGE", "localhost/meld7t/pkg:0.1.0")  # §2.2 convert+clean
+api_image  := env_var_or_default("API_IMAGE", "localhost/meld7t/api:0.1.0")  # §5 FastAPI
 meld_data  := env_var_or_default("MELD_DATA", repo + "/meld-data")     # bind-mounted to /data
 fs_lic     := repo + "/secrets/license.txt"                            # FreeSurfer license
 meld_lic   := repo + "/secrets/meld_license.txt"                       # MELD license
@@ -80,11 +81,15 @@ data-check:
 # --- Long-running services: rootless Podman Quadlet (spec §2) ---
 # Units + config are installed by `ansible-playbook bootstrap.yml --tags services`.
 # These helpers drive the user systemd units (quadlet strips the .container suffix).
-svc_units := "postgres redis orthanc registry caddy"
+svc_units := "postgres redis immudb orthanc registry api caddy"
 
 # Reload user systemd so Quadlet regenerates units after editing containers/systemd/*.
 services-reload:
     systemctl --user daemon-reload
+
+# Build the platform api image (FastAPI). Run on the dev machine; push to the internal registry.
+api-build:
+    podman build -t {{api_image}} -f platform/api/Containerfile platform/api/
 
 # Start the long-running services (postgres, redis, orthanc, registry, caddy).
 # Needs the images present (internal registry / `podman pull`) and services.env installed.

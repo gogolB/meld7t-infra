@@ -154,6 +154,33 @@ just cdi-generate   &&   just freeze
 Re-`freeze` afterward so the pinned OS checksum and driver match the deployment you actually run.
 **Rule of thumb: regenerate CDI after any `ujust update` that bumps the driver.**
 
+## Platform API (spec §5) — Phase 1 of the buildout
+
+`platform/api/` is the FastAPI orchestration brain: it owns the case → recipe → run → result
+workflow and the **detector-plural** data model (§8/§15/§25.1 — MELD is one detector among many).
+Backed by the `meld` Postgres DB (Alembic migrations) and the **immudb** audit ledger (§26).
+
+**Workflow the API drives:**
+1. `POST /api/cases` — create a case (optionally referencing an Orthanc study).
+2. `POST /api/cases/{id}/series/sync` — QIDO Orthanc, **propose** a role per series (§16).
+3. `POST /api/cases/{id}/series/confirm` — submitter **confirms/overrides** roles (never silent-auto).
+4. `POST /api/cases/{id}/recipe` (`workup=fcd|hs|both`) — build the job plan: one run per
+   detector × source. **Tandem** = MELD on every viable T1 present (UNI *and* MPRAGE); MAP/HS appear
+   as `pending` slots (§25.7). `POST …/recipe/confirm` materializes the runs.
+5. `POST /api/runs/{id}/adjudication` — append-only reviewer read (also to immudb).
+6. `GET /api/system`, `GET /api/audit/verify` — status + hash-chain verification.
+
+**Audit ledger:** every consequential event is appended to **immudb** (Merkle-backed, tamper-proof)
+with a mirror row in Postgres carrying an application hash chain (`H(payload ‖ prev_hash)`) and the
+immudb tx id — verifiable with `GET /api/audit/verify` (§26). Corrections are new appended entries.
+
+**Build + run:** `just api-build` (dev machine) → the `api` Quadlet unit runs it on `meld-net`;
+Caddy proxies `/api/*` to it. The entrypoint runs `alembic upgrade head` before serving (§22).
+Tests: `python -m pytest platform/api/tests` (schema, tandem recipe, workflow, audit chain).
+
+> **Buildout status:** Phase 1 (this API + immudb) done. Next: Phase 2 worker + GPU-serialized
+> queue, Phase 3 DICOM-SEG packaging → Orthanc, Phase 4 OHIF viewer, Phase 5 concordance/MDT.
+
 ## Recon pipeline (DICOM → MELD)
 
 `just recon SUBJECT DICOM_ROOT [source]` runs the full FCD recon: the **pkg** container

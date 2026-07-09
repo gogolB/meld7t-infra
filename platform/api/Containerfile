@@ -1,0 +1,12 @@
+# meld7t api (spec §5) — FastAPI orchestration. Built on the dev machine, pinned in images.lock.
+FROM docker.io/library/python:3.13-slim
+
+WORKDIR /app
+COPY pyproject.toml ./
+COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini entrypoint.sh ./
+RUN pip install --no-cache-dir . && chmod +x entrypoint.sh
+
+EXPOSE 8000
+ENTRYPOINT ["./entrypoint.sh"]
