@@ -6,6 +6,8 @@ After=network-online.target
 Image=docker.io/library/postgres:16
 ContainerName=postgres
 Network=meld-net.network
+# Loopback-only publish so the host worker service (§2.3) can reach the DB; not on the intranet.
+PublishPort=127.0.0.1:5432:5432
 Volume=postgres-data.volume:/var/lib/postgresql/data
 # Non-secret bootstrap: creates the `orthanc` and `meld` databases + roles on first
 # init (runs only when the data volume is empty). Passwords come from the environment.

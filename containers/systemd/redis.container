@@ -6,6 +6,8 @@ After=network-online.target
 Image=docker.io/library/redis:7-alpine
 ContainerName=redis
 Network=meld-net.network
+# Loopback-only publish for the host worker service (§2.3, arq queue); not on the intranet.
+PublishPort=127.0.0.1:6379:6379
 Volume=redis-data.volume:/data
 # appendonly so queue/session state survives a restart (§2.4 hot cache is rebuildable,
 # but AOF avoids losing in-flight job status across a service bounce).

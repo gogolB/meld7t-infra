@@ -100,6 +100,7 @@ class Case(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
     pseudonym: str
     orthanc_study_uid: Optional[str] = Field(default=None, index=True)
+    dicom_path: Optional[str] = None            # local DICOM staging (worker input; §2.3)
     status: CaseStatus = Field(default=CaseStatus.created)
     workup: Optional[Workup] = None
     contraindications: Optional[dict] = Field(default=None, sa_column=_json_col())

@@ -91,6 +91,25 @@ services-reload:
 api-build:
     podman build -t {{api_image}} -f platform/api/Containerfile platform/api/
 
+# --- Worker (host service, §2.3): Arq queue consumer, GPU-serialized ---
+# Create the worker's Python 3.13 venv (uv) + deps. Needs secrets/worker.env (loopback URLs).
+worker-setup:
+    cd {{repo}}/platform/worker && uv venv --python 3.13 \
+      && uv pip install --python .venv arq redis 'sqlmodel==0.0.22' 'psycopg[binary]' \
+         pydantic-settings dicomweb-client immudb-py
+
+# Run the worker in the foreground (dev). Prod uses the meld7t-worker.service user unit.
+worker-run:
+    {{repo}}/platform/worker/run-dev.sh
+
+# Install + enable the worker as a systemd user service (boot-start needs linger).
+worker-install:
+    install -Dm644 {{repo}}/platform/worker/meld7t-worker.service \
+      ~/.config/systemd/user/meld7t-worker.service
+    systemctl --user daemon-reload
+    systemctl --user enable --now meld7t-worker
+    systemctl --user --no-pager status meld7t-worker || true
+
 # Start the long-running services (postgres, redis, orthanc, registry, caddy).
 # Needs the images present (internal registry / `podman pull`) and services.env installed.
 services-up: services-reload

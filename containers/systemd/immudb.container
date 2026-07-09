@@ -9,7 +9,8 @@ Network=meld-net.network
 Volume=immudb-data.volume:/var/lib/immudb
 # IMMUDB_ADMIN_PASSWORD (first-boot admin password) is read from here.
 EnvironmentFile=%h/.config/meld7t/services.env
-# Not published — reachable only by the api on meld-net (audit writes are server-side).
+# Loopback-only publish so the host worker can append audit events; not on the intranet.
+PublishPort=127.0.0.1:3322:3322
 NoNewPrivileges=true
 
 [Service]

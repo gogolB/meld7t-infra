@@ -9,11 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
-from . import audit, orthanc
+from . import audit, orthanc, queue
 from .db import get_session
 from .detectors import REGISTRY
 from .models import (
-    Adjudication, Case, CaseStatus, Cluster, Recipe, Result, Run, RunStatus,
+    Adjudication, Case, CaseStatus, Cluster, Job, Recipe, Result, Run, RunStatus,
     Series, SeriesRole, Workup,
 )
 from .recipe import build_recipe, recipe_summary
@@ -25,6 +25,7 @@ router = APIRouter(prefix="/api")
 class CaseCreate(BaseModel):
     pseudonym: str
     orthanc_study_uid: Optional[str] = None
+    dicom_path: Optional[str] = None
     contraindications: Optional[dict] = None
 
 
@@ -56,7 +57,7 @@ def _get_case(session: Session, case_id: str) -> Case:
 @router.post("/cases")
 def create_case(body: CaseCreate, session: Session = Depends(get_session)) -> Case:
     case = Case(pseudonym=body.pseudonym, orthanc_study_uid=body.orthanc_study_uid,
-                contraindications=body.contraindications,
+                dicom_path=body.dicom_path, contraindications=body.contraindications,
                 status=CaseStatus.series_pending if body.orthanc_study_uid else CaseStatus.created)
     session.add(case)
     audit.record(session, actor="system", action="case.create",
@@ -155,28 +156,34 @@ def get_recipe(case_id: str, session: Session = Depends(get_session)) -> dict:
 
 
 @router.post("/cases/{case_id}/recipe/confirm")
-def confirm_recipe(case_id: str, session: Session = Depends(get_session)) -> list[Run]:
+async def confirm_recipe(case_id: str, session: Session = Depends(get_session)) -> list[Run]:
     case = _get_case(session, case_id)
     recipe = session.exec(select(Recipe).where(Recipe.case_id == case_id)
                           .order_by(Recipe.created_at.desc())).first()
     if not recipe:
         raise HTTPException(404, "no recipe")
-    runs = []
+    runs, to_enqueue = [], []
     for e in recipe.spec:
         if e["status"] not in (RunStatus.created.value, RunStatus.pending.value):
             continue
+        built = e["status"] == RunStatus.created.value
         run = Run(case_id=case_id, recipe_id=recipe.id, detector_id=e["detector_id"],
                   source_role=e.get("source_role"), source_series_uid=e.get("source_series_uid"),
-                  params=e.get("params") or {}, status=RunStatus(e["status"]))
+                  params=e.get("params") or {},
+                  status=RunStatus.queued if built else RunStatus.pending)
         session.add(run)
         runs.append(run)
+        if built:
+            to_enqueue.append(run)
     recipe.confirmed_at = datetime.now(timezone.utc)
-    case.status = CaseStatus.recipe_confirmed          # enqueue happens in Phase 2
+    case.status = CaseStatus.running if to_enqueue else CaseStatus.recipe_confirmed
     audit.record(session, actor="system", action="recipe.confirm", entity_type="recipe",
-                 entity_id=recipe.id, payload={"runs": len(runs)})
+                 entity_id=recipe.id, payload={"runs": len(runs), "enqueued": len(to_enqueue)})
     session.commit()
     for r in runs:
         session.refresh(r)
+    for r in to_enqueue:                               # GPU-serialized queue (§18)
+        await queue.enqueue_run(r.id)
     return runs
 
 
@@ -195,7 +202,8 @@ def get_run(run_id: str, session: Session = Depends(get_session)) -> dict:
     result = session.exec(select(Result).where(Result.run_id == run_id)).first()
     clusters = (session.exec(select(Cluster).where(Cluster.result_id == result.id)).all()
                 if result else [])
-    return {"run": run, "result": result, "clusters": clusters}
+    jobs = session.exec(select(Job).where(Job.run_id == run_id)).all()
+    return {"run": run, "result": result, "clusters": clusters, "jobs": jobs}
 
 
 @router.post("/runs/{run_id}/adjudication")
@@ -217,13 +225,48 @@ def adjudicate(run_id: str, body: AdjudicationCreate,
     return adj
 
 
-# ---- system / audit
+# ---- system / queue / admin / audit
 @router.get("/system")
-def system(session: Session = Depends(get_session)) -> dict:
-    n_cases = len(session.exec(select(Case)).all())
-    n_runs = len(session.exec(select(Run)).all())
-    return {"cases": n_cases, "runs": n_runs,
-            "detectors": {d.id.value: d.status for d in REGISTRY.values()}}
+async def system(session: Session = Depends(get_session)) -> dict:
+    runs = session.exec(select(Run)).all()
+    r = queue.get_redis()
+    by_status: dict[str, int] = {}
+    for run in runs:
+        by_status[run.status.value] = by_status.get(run.status.value, 0) + 1
+    return {
+        "cases": len(session.exec(select(Case)).all()),
+        "runs": {"total": len(runs), "by_status": by_status},
+        "gpu": {"in_use_run": await r.get(queue.GPU_INUSE_KEY),
+                "queue_paused": bool(await r.get(queue.QUEUE_PAUSED_KEY))},
+        "detectors": {d.id.value: d.status for d in REGISTRY.values()},
+    }
+
+
+@router.get("/queue")
+async def queue_view(session: Session = Depends(get_session)) -> dict:
+    """Live run board for the dashboard (§9.1) — GPU-ordered."""
+    r = queue.get_redis()
+    active = session.exec(select(Run).where(
+        Run.status.in_([RunStatus.queued, RunStatus.preprocessing, RunStatus.inference,
+                        RunStatus.packaging]))).all()
+    return {
+        "in_use_run": await r.get(queue.GPU_INUSE_KEY),
+        "paused": bool(await r.get(queue.QUEUE_PAUSED_KEY)),
+        "active": [{"run_id": x.id, "case_id": x.case_id, "detector": x.detector_id.value,
+                    "source_role": x.source_role, "status": x.status.value} for x in active],
+    }
+
+
+@router.post("/admin/pause")
+async def pause_queue() -> dict:
+    await queue.get_redis().set(queue.QUEUE_PAUSED_KEY, "1")
+    return {"paused": True}
+
+
+@router.post("/admin/resume")
+async def resume_queue() -> dict:
+    await queue.get_redis().delete(queue.QUEUE_PAUSED_KEY)
+    return {"paused": False}
 
 
 @router.get("/audit/verify")

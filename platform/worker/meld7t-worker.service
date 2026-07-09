@@ -1,0 +1,19 @@
+# meld7t worker — host systemd USER service (spec §2.3). NOT a container: it runs on the host so
+# it can launch podman sibling jobs (pkg, meld_graph) with direct rootless GPU access — avoiding
+# podman-in-podman + GPU nesting. Install:
+#   cp platform/worker/meld7t-worker.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now meld7t-worker
+# (loginctl enable-linger $USER lets it boot-start without a login — bootstrap --tags services does this.)
+[Unit]
+Description=meld7t worker — Arq queue consumer, GPU-serialized (spec §2.3, §18)
+After=network-online.target
+
+[Service]
+Type=simple
+# run-dev.sh resolves the repo path, loads secrets/worker.env, sets PYTHONPATH, and starts arq.
+ExecStart=%h/meld7t/platform/worker/run-dev.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

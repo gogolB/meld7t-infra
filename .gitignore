@@ -17,3 +17,6 @@ __pycache__/
 # platform test artifacts
 test_meld.db
 *.sqlite
+
+# worker venv
+platform/worker/.venv/

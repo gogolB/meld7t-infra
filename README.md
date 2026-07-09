@@ -178,8 +178,23 @@ immudb tx id — verifiable with `GET /api/audit/verify` (§26). Corrections are
 Caddy proxies `/api/*` to it. The entrypoint runs `alembic upgrade head` before serving (§22).
 Tests: `python -m pytest platform/api/tests` (schema, tandem recipe, workflow, audit chain).
 
-> **Buildout status:** Phase 1 (this API + immudb) done. Next: Phase 2 worker + GPU-serialized
-> queue, Phase 3 DICOM-SEG packaging → Orthanc, Phase 4 OHIF viewer, Phase 5 concordance/MDT.
+### Worker + GPU-serialized queue (§2.3, §18)
+
+`platform/worker/` is a **host** systemd user service (not a container — so it launches podman
+sibling jobs with direct rootless GPU access, avoiding podman-in-podman nesting). It's an **Arq**
+Redis-queue consumer with **`max_jobs=1` — a single global GPU semaphore**, so runs pipeline one
+after another on the one GPU. Per run: `recon_prepare` (pkg, `--network=none`) → MELD
+(`--fastsurfer`, GPU) → ingest clusters/report into Postgres. Live status streams to Redis; the
+dashboard reads `GET /api/queue` and `GET /api/system` (in-use run, GPU, per-status counts). Admin
+`POST /api/admin/pause|resume` halts the queue between jobs (§18). OOM is classified explicitly
+(`failed_oom`), never a silent CPU retry (§6).
+
+Setup: `just worker-setup` (uv venv + deps) → `just worker-install` (systemd user unit), or
+`just worker-run` foreground for dev. Reaches Postgres/Redis/immudb/Orthanc over loopback.
+
+> **Buildout status:** Phases 1 (API + immudb) and 2 (worker + GPU queue) done — MELD runs
+> end-to-end *through the platform*, GPU-serialized. Next: Phase 3 DICOM-SEG packaging → Orthanc,
+> Phase 4 OHIF viewer, Phase 5 concordance/MDT.
 
 ## Recon pipeline (DICOM → MELD)
 
