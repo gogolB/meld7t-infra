@@ -62,6 +62,33 @@ async def run_meld(subject: str, workdir: str) -> int:
     return await _run(cmd, os.path.join(workdir, "meld.log"))
 
 
+async def run_package(subject: str, pseudonym: str, workdir: str) -> tuple[int, dict]:
+    """Package MELD outputs → T1 DICOM series + DICOM-SEG, STOW to Orthanc (§17). Runs on
+    meld-net (needs Orthanc); parses the printed UIDs from stdout."""
+    cmd = [
+        "podman", "run", "--rm", "--network", "meld-net",
+        "-v", f"{wsettings.meld_data}:/data:ro,z",
+        wsettings.pkg_image,
+        "python3", "/opt/pkg/package_dicom.py",
+        "--t1", f"/data/input/{subject}/anat/{subject}_T1w.nii.gz",
+        "--pred", f"/data/output/predictions_reports/{subject}/predictions/prediction.nii.gz",
+        "--pseudonym", pseudonym or subject,
+        "--stow", wsettings.orthanc_innet,
+    ]
+    log_path = os.path.join(workdir, "package.log")
+    with open(log_path, "ab") as log:
+        log.write(("$ " + " ".join(cmd) + "\n").encode())
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=log)
+        out, _ = await proc.communicate()
+    uids = {}
+    for line in out.decode(errors="ignore").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            uids[k.strip()] = v.strip()
+    return proc.returncode, uids
+
+
 def is_oom(log_path: str) -> bool:
     """Classify a MELD failure as OOM vs terminal (§6, §18)."""
     try:

@@ -56,6 +56,7 @@ async def run_detector(ctx, run_id: str) -> dict:
     try:
         with Session(engine) as session:
             case = session.get(Case, case_id)
+            pseudonym = case.pseudonym
             dicom_root = dicom.dicom_root_for(case)
 
         async with gpu_lease(redis, run_id):
@@ -75,27 +76,37 @@ async def run_detector(ctx, run_id: str) -> dict:
                           else RunStatus.failed)
                 return await _fail(redis, run_id, status, workdir, f"meld rc={rc}")
 
-        # ingest (packaging → Orthanc lands in Phase 3)
+        # packaging: T1 DICOM series + DICOM-SEG → Orthanc (§17)
         with Session(engine) as session:
-            r = session.get(Run, run_id)
-            _set(session, r, RunStatus.packaging)
+            _set(session, session.get(Run, run_id), RunStatus.packaging)
+        await _push_status(redis, run_id, RunStatus.packaging.value)
+        rc_pkg, uids = await pipeline.run_package(subject, pseudonym, workdir)
+
+        with Session(engine) as session:
             rf = ingest.result_fields(wsettings.meld_data, subject)
-            result = Result(run_id=run_id, **rf, harmo_code=None)
+            result = Result(run_id=run_id, harmo_code=None,
+                            orthanc_study_uid=uids.get("study_uid"),
+                            orthanc_t1_uid=uids.get("t1_series_uid"),
+                            orthanc_seg_uid=uids.get("seg_series_uid"), **rf)
             session.add(result)
             session.commit()
             session.refresh(result)
             for c in ingest.parse_clusters(wsettings.meld_data, subject):
                 session.add(Cluster(result_id=result.id, **c))
+            r = session.get(Run, run_id)
             r.detector_version = "meld_graph:v2.2.5_gpu"
             _set(session, r, RunStatus.review_ready)
             audit.record(session, actor="worker", action="run.complete", entity_type="run",
                          entity_id=run_id, payload={"n_clusters": rf["n_clusters"],
-                                                    "subject": subject})
+                                                    "subject": subject,
+                                                    "orthanc_study": uids.get("study_uid"),
+                                                    "packaged": rc_pkg == 0})
             session.commit()
             _maybe_finish_case(session, case_id)
 
         await _push_status(redis, run_id, RunStatus.review_ready.value)
-        return {"run_id": run_id, "status": "review_ready", "n_clusters": rf["n_clusters"]}
+        return {"run_id": run_id, "status": "review_ready", "n_clusters": rf["n_clusters"],
+                "orthanc_study": uids.get("study_uid")}
 
     except Exception as e:  # noqa: BLE001 — any failure is retained for the support bundle
         return await _fail(redis, run_id, RunStatus.failed, workdir, repr(e))

@@ -192,9 +192,18 @@ dashboard reads `GET /api/queue` and `GET /api/system` (in-use run, GPU, per-sta
 Setup: `just worker-setup` (uv venv + deps) → `just worker-install` (systemd user unit), or
 `just worker-run` foreground for dev. Reaches Postgres/Redis/immudb/Orthanc over loopback.
 
-> **Buildout status:** Phases 1 (API + immudb) and 2 (worker + GPU queue) done — MELD runs
-> end-to-end *through the platform*, GPU-serialized. Next: Phase 3 DICOM-SEG packaging → Orthanc,
-> Phase 4 OHIF viewer, Phase 5 concordance/MDT.
+### Packaging → Orthanc (§10, §17)
+
+After MELD, the worker runs the pkg container (`package_dicom.py`, `highdicom`) to build — in the
+input-T1 frame of reference — a **base T1 MR series** and a **DICOM-SEG** of the discrete clusters,
+and STOW-RS them to Orthanc as one derived study. The study/series UIDs are written to `results`, so
+OHIF (Phase 4) opens the study over `/dicom-web/*` and overlays the SEG on the T1. The **continuous
+parametric probability series** (§17, the threshold-slider source) needs surface→volume reprojection
+of MELD's per-vertex hdf5 probability (not emitted as a volume by default) — the tracked follow-up.
+
+> **Buildout status:** Phases 1 (API + immudb), 2 (worker + GPU queue), 3 (DICOM-SEG → Orthanc)
+> done — a run goes submit → recipe → GPU queue → MELD → DICOM-SEG in Orthanc, verified live.
+> Next: Phase 4 OHIF viewer, Phase 5 concordance/MDT. (Continuous parametric map: follow-up.)
 
 ## Recon pipeline (DICOM → MELD)
 

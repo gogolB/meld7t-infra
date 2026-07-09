@@ -166,6 +166,7 @@ class Result(SQLModel, table=True):
     __tablename__ = "results"
     id: str = Field(default_factory=_uuid, primary_key=True)
     run_id: str = Field(foreign_key="runs.id", index=True)
+    orthanc_study_uid: Optional[str] = None     # the packaged (derived) study OHIF opens
     orthanc_t1_uid: Optional[str] = None
     orthanc_seg_uid: Optional[str] = None
     orthanc_probmap_uid: Optional[str] = None

@@ -11,11 +11,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends dcm2niix \
  && rm -rf /var/lib/apt/lists/*
 
-# O'Brien MP2RAGE clean deps — exact versions validated in the meld-dev box.
+# O'Brien MP2RAGE clean deps + DICOM packaging (§17): highdicom (DICOM-SEG), dicomweb-client (STOW).
 RUN pip install --no-cache-dir \
       nibabel==5.4.2 \
       numpy==2.5.1 \
-      scipy==1.18.0
+      scipy==1.18.0 \
+      highdicom==0.24.0 \
+      dicomweb-client==0.59.3
 
-COPY clean_uni.py recon_prepare.py /opt/pkg/
+COPY clean_uni.py recon_prepare.py package_dicom.py /opt/pkg/
 WORKDIR /work
