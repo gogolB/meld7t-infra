@@ -207,7 +207,9 @@ def get_run(run_id: str, session: Session = Depends(get_session)) -> dict:
     clusters = (session.exec(select(Cluster).where(Cluster.result_id == result.id)).all()
                 if result else [])
     jobs = session.exec(select(Job).where(Job.run_id == run_id)).all()
-    return {"run": run, "result": result, "clusters": clusters, "jobs": jobs}
+    d = _report_dir(result)
+    frames = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(d, "*.png")))] if d else []
+    return {"run": run, "result": result, "clusters": clusters, "jobs": jobs, "frames": frames}
 
 
 @router.post("/runs/{run_id}/adjudication")

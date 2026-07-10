@@ -1,22 +1,26 @@
 # meld7t reverse proxy (spec §3). Served by the caddy.container Quadlet unit.
 # Same-origin paths so Cornerstone/OHIF hit DICOMweb without CORS.
+#
+# DEFAULT: plain HTTP, catch-all (any host) on the LAN — so a demo is reachable from any device
+# (laptop, phone) at http://<host-ip>:9443 with zero cert friction. Self-signed TLS on a bare IP
+# fails the SNI handshake and nags every device, so HTTP is the pragmatic default for a trusted
+# intranet demo with non-clinical pilot data.
+#
+# PRODUCTION HARDENING → switch to HTTPS: give the host a resolvable name, set SITE_ADDRESS to it
+# in services.env, and replace each `http://:PORT` site header below with `{$SITE_ADDRESS}` (adding
+# `tls internal` for Caddy's local CA, or `tls <cert> <key>` for institutional PKI). A hostname
+# sends SNI, so the internal cert resolves correctly (an IP does not).
 
 {
-	# Air-gapped: no ACME. TLS is issued/renewed by Caddy's built-in local CA (see the
-	# site's `tls internal` below). The CA root is stored in the caddy-data volume —
-	# distribute it to intranet clients, or swap `tls internal` for institutional PKI.
 	admin off
+	auto_https off
 }
 
-# SITE_ADDRESS is injected from services.env (default: localhost). Use the intranet
-# hostname clients actually resolve, so the internal cert's SAN matches.
-{$SITE_ADDRESS:localhost} {
-	tls internal
-
+# --- Shell + API (port 9443) ---
+http://:9443 {
 	encode zstd gzip
 
-	# DICOMweb (QIDO/WADO/STOW) → Orthanc. Path is preserved (Orthanc's DicomWeb Root is
-	# /dicom-web/), so this is a same-origin passthrough for the viewer. (§3, §4)
+	# DICOMweb (QIDO/WADO/STOW) → Orthanc. Path preserved (Orthanc DicomWeb Root is /dicom-web/).
 	handle /dicom-web/* {
 		reverse_proxy orthanc:8042
 	}
@@ -26,7 +30,7 @@
 		reverse_proxy api:8000
 	}
 
-	# Static SPA shell, built on the dev machine and staged as a mounted volume (§9.4).
+	# Static SPA shell (built by `just web-build` → platform/web/dist, mounted at /srv/spa; §9.4).
 	handle {
 		root * /srv/spa
 		try_files {path} /index.html
@@ -34,10 +38,9 @@
 	}
 }
 
-# OHIF viewer on its own origin (dedicated port) so its root-absolute assets don't collide
-# with the shell. DICOMweb is same-origin here → no CORS (§9.4). The shell iframes it.
-{$SITE_ADDRESS:localhost}:8444 {
-	tls internal
+# --- OHIF viewer on its own origin (port 9444) so its root-absolute assets don't collide with the
+# shell. DICOMweb is same-origin here → no CORS (§9). The Review screen iframes it. ---
+http://:9444 {
 	encode zstd gzip
 
 	handle /dicom-web/* {

@@ -4,7 +4,7 @@ import { api } from "../api.js";
 import { Badge, useAsync, ErrorBox } from "../components.jsx";
 
 // OHIF runs on its own origin (dedicated viewer port); deep-link the packaged study.
-const VIEWER_PORT = import.meta.env.VITE_VIEWER_PORT || "8444";
+const VIEWER_PORT = import.meta.env.VITE_VIEWER_PORT || "9444";
 const viewerUrl = (studyUid) =>
   `${window.location.protocol}//${window.location.hostname}:${VIEWER_PORT}/viewer?StudyInstanceUIDs=${studyUid}`;
 
@@ -16,6 +16,10 @@ export default function Review() {
   const [err, setErr] = useState(null);
 
   const run = r.data?.run, result = r.data?.result, clusters = r.data?.clusters || [];
+  const frames = r.data?.frames || [];
+  // MELD's own MRI overlay (cluster drawn on the T1) + the inflated-surface view — the clearest look.
+  const overlayFrame = frames.find((f) => f.startsWith("mri_"));
+  const surfaceFrame = frames.find((f) => f.startsWith("inflatbrain"));
 
   async function save(e) {
     e.preventDefault(); setErr(null);
@@ -25,33 +29,59 @@ export default function Review() {
 
   return (
     <div>
-      <h1>Review — {run?.detector_id} <Badge status={run?.status || "review_ready"} /></h1>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+        <h1>Review — {run?.detector_id} <Badge status={run?.status || "review_ready"} /></h1>
+        {run && <Link to={`/cases/${run.case_id}/mdt`} className="muted" style={{ marginLeft: "auto" }}>MDT summary →</Link>}
+      </div>
       <p className="muted">
         {run && <>source: {run.source_role || "–"} · {run.detector_version} · </>}
         <Link to={run ? `/cases/${run.case_id}` : "#"}>back to case</Link>
       </p>
       <ErrorBox error={r.error} />
 
-      <div className="split">
-        <div>
-          {result?.orthanc_study_uid ? (
-            <iframe className="viewer" title="OHIF" src={viewerUrl(result.orthanc_study_uid)} />
-          ) : (
-            <div className="panel muted">No packaged study yet (Orthanc UID missing).</div>
-          )}
-        </div>
+      {/* Interactive DICOM viewer — full width */}
+      <h2>DICOM viewer <span className="muted">(OHIF · T1 + segmentation)</span></h2>
+      {result?.orthanc_study_uid ? (
+        <>
+          <div className="muted" style={{ marginBottom: 6, fontSize: 13 }}>
+            To overlay MELD's flagged cluster: in the left <b>Studies</b> panel click the <b>SEG</b>
+            &nbsp;series to load it, then scroll to the cluster level (or use the segmentation panel's
+            jump-to-segment). The T1 loads immediately below.
+          </div>
+          <iframe className="viewer" style={{ height: "76vh" }} title="OHIF"
+                  src={viewerUrl(result.orthanc_study_uid)} />
+        </>
+      ) : (
+        <div className="panel muted">No packaged study yet (Orthanc UID missing).</div>
+      )}
 
-        <div>
-          <h2>Clusters (operating point)</h2>
+      {/* MELD's own results + clusters + adjudication */}
+      <div className="row" style={{ marginTop: 16, alignItems: "flex-start" }}>
+        <div className="grow">
+          <h2>What MELD found</h2>
           <div className="panel">
             {clusters.length ? clusters.map((c) => (
               <div key={c.id} style={{ borderBottom: "1px solid var(--line)", padding: "6px 0" }}>
-                <b>#{c.index}</b> {c.hemi} {c.location}<br />
+                <b>Cluster #{c.index}</b> — {c.hemi} {c.location}<br />
                 <span className="muted">size {c.size} · confidence {c.confidence}</span>
               </div>
-            )) : <span className="muted">No clusters above operating point (first-class result, §21).</span>}
+            )) : <span className="muted">No clusters above operating point (a first-class result, §21).</span>}
+            {overlayFrame && (
+              <img src={api.frameUrl(runId, overlayFrame)} alt="MELD cluster on T1"
+                   style={{ width: "100%", borderRadius: 6, marginTop: 10, border: "1px solid var(--line)" }} />
+            )}
+            {surfaceFrame && (
+              <img src={api.frameUrl(runId, surfaceFrame)} alt="MELD inflated surface"
+                   style={{ width: "100%", borderRadius: 6, marginTop: 8, border: "1px solid var(--line)" }} />
+            )}
+            {result?.report_path && (
+              <a className="btn ghost" href={`/api/runs/${runId}/report`} target="_blank" rel="noreferrer"
+                 style={{ marginTop: 10, display: "inline-block" }}>MELD PDF report ↗</a>
+            )}
           </div>
+        </div>
 
+        <div style={{ width: 340 }}>
           <h2>Adjudication <span className="muted">(append-only, §24)</span></h2>
           <form className="panel" onSubmit={save}>
             <ErrorBox error={err} />

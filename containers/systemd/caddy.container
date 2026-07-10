@@ -1,5 +1,5 @@
 [Unit]
-Description=Caddy — TLS (internal CA), reverse proxy, static SPA host (spec §2.1, §3)
+Description=Caddy — reverse proxy, static SPA host, OHIF viewer origin (spec §2.1, §3, §9)
 After=network-online.target
 
 [Container]
@@ -8,16 +8,13 @@ ContainerName=caddy
 Network=meld-net.network
 Volume=caddy-data.volume:/data
 Volume=%h/.config/meld7t/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
-# Built SPA shell bundle (dev machine → staged); Caddy serves it at / (§9.4).
+# Built SPA shell bundle (`just web-build` → platform/web/dist); Caddy serves it at / (§9.4).
 Volume=%h/meld7t/platform/web/dist:/srv/spa:ro,z
-# SITE_ADDRESS (the intranet hostname Caddy serves + issues an internal cert for) is read here.
-EnvironmentFile=%h/.config/meld7t/services.env
-# Rootless-safe high ports by default. To serve on 443/80, lower the unprivileged-port
-# floor (see README) and change these to 443:443 / 80:80.
-# HTTPS (shell/api) + the OHIF viewer origin. No :80 publish — tls internal is HTTPS-only, and
-# :8080 collides with other host software on some boxes; hit https://<host>:8443 directly.
-PublishPort=8443:443
-PublishPort=8444:8444
+# Bound to all interfaces (0.0.0.0) so the demo is reachable across the intranet/home LAN.
+# 9443 = shell + API; 9444 = OHIF viewer origin. HTTP catch-all (see Caddyfile; HTTPS is the
+# documented production hardening). Open these ports in the host firewall for remote devices.
+PublishPort=9443:9443
+PublishPort=9444:9444
 NoNewPrivileges=true
 
 [Service]
