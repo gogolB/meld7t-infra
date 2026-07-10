@@ -102,11 +102,23 @@ web-build:
 worker-setup:
     cd {{repo}}/platform/worker && uv venv --python 3.13 \
       && uv pip install --python .venv arq redis 'sqlmodel==0.0.22' 'psycopg[binary]' \
-         pydantic-settings dicomweb-client immudb-py
+         pydantic-settings dicomweb-client immudb-py pytest
 
 # Run the worker in the foreground (dev). Prod uses the meld7t-worker.service user unit.
 worker-run:
     {{repo}}/platform/worker/run-dev.sh
+
+# Local end-to-end test: submit a brain, spawn a real worker, assert a detector result.
+# NOT for CI — needs the running services (just services-up), a detector image, and the DICOM tier
+# mounted (just mount-data). Default detector is MAP (~3 min); override for the slower ones:
+#   just e2e                          # MAP
+#   just e2e hippunfold               # ~15 min
+#   just e2e meld_fcd                 # ~50 min (GPU)
+e2e detector="map":
+    cd {{repo}}/platform/worker && set -a && source {{repo}}/secrets/worker.env && set +a \
+      && MELD7T_E2E=1 MELD7T_E2E_DETECTOR={{detector}} \
+         PYTHONPATH={{repo}}/platform/api:{{repo}}/platform/worker \
+         .venv/bin/python -m pytest tests/test_e2e_local.py -v -s
 
 # Install + enable the worker as a systemd user service (boot-start needs linger).
 worker-install:

@@ -33,9 +33,13 @@ def test_recipe_tandem():
     entries = build_recipe(Workup.fcd, {"u1": "t1_uni", "m1": "t1_mprage"})
     meld = [e for e in entries if e["detector_id"] == "meld_fcd" and e["status"] == "created"]
     assert len(meld) == 2                      # tandem: MELD on both UNI and MPRAGE
+    mapd = [e for e in entries if e["detector_id"] == "map" and e["status"] == "created"]
+    assert len(mapd) == 2                      # MAP is built too → also tandem on both T1 sources
     s = recipe_summary(entries)
-    assert s["will_run"] == 2 and s["tandem"] is True
-    assert any(e["detector_id"] == "map" and e["status"] == "pending" for e in entries)
+    assert s["will_run"] == 4 and s["tandem"] is True
+    # the un-built HS detectors still surface as declared-pending slots in a full 'both' workup
+    both = build_recipe(Workup.both, {"u1": "t1_uni"})
+    assert any(e["detector_id"] in ("qt2", "aid_hs") and e["status"] == "pending" for e in both)
 
 
 def test_full_workflow():
@@ -54,11 +58,11 @@ def test_full_workflow():
 
     r = c.post(f"/api/cases/{cid}/recipe", json={"workup": "fcd"})
     assert r.status_code == 200, r.text
-    assert r.json()["summary"]["will_run"] == 2
+    assert r.json()["summary"]["will_run"] == 4     # MELD ×2 + MAP ×2 (both built, tandem)
 
     runs = c.post(f"/api/cases/{cid}/recipe/confirm").json()
-    built = [x for x in runs if x["status"] == "created"]
-    assert len(built) == 2
+    built = [x for x in runs if x["status"] == "queued"]   # confirm enqueues built runs as 'queued'
+    assert len(built) == 4
 
     r = c.post(f"/api/runs/{built[0]['id']}/adjudication",
                json={"reviewer": "dr_x", "agree": True, "confidence": 4})
