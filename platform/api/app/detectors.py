@@ -39,8 +39,9 @@ REGISTRY: dict[DetectorId, Detector] = {
     DetectorId.hippunfold: Detector(
         id=DetectorId.hippunfold, label="HippUnfold", target="HS (hippocampus)",
         workups=(Workup.hs, Workup.both),
-        source_roles=(SeriesRole.t1_mprage, SeriesRole.t1_uni),
-        status="pending", method="unfold + nnU-Net subfield volumetry"),
+        # segments on the T2 SPACE (worker sets needs_t2); the T1 companion source is picked here
+        source_roles=(SeriesRole.t1_uni, SeriesRole.t1_mprage),
+        status="built", method="unfold + nnU-Net subfield volumetry"),
     DetectorId.qt2: Detector(
         id=DetectorId.qt2, label="qT2", target="HS (hippocampus)",
         workups=(Workup.hs, Workup.both),

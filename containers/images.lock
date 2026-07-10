@@ -18,7 +18,8 @@ pkg          localhost/meld7t/pkg:0.3.1   sha256:6981ac89f2e70a2bc8ccc3ba4c37ad0
 #              vs tissue label schemes handled; validated on real subject → AI −4.69%, symmetric)
 
 # api (spec §5) — FastAPI orchestration. Built from platform/api/ on the dev machine.
-api          localhost/meld7t/api:0.1.0   sha256:b5b0fb2493fe4be54f635819d47cd43500697c2dc43e576fdf198f58403a54c5
+api          localhost/meld7t/api:0.1.1   sha256:870073fb034f8bda50384d6b749af752e30729d3b786d99344ad7a36221f5953
+#   0.1.1:     HippUnfold detector flipped to "built" (recipe auto-includes HS; §25.5)
 
 # --- Long-running service images (off-the-shelf; §2.1, §9) ---
 immudb       docker.io/codenotary/immudb@sha256:ca64fd851b3e60a43115e79f71c4830935f5652e0692628fc80a475c417743a7
