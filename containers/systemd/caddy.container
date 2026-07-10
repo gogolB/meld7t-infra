@@ -14,8 +14,9 @@ Volume=%h/meld7t/platform/web/dist:/srv/spa:ro,z
 EnvironmentFile=%h/.config/meld7t/services.env
 # Rootless-safe high ports by default. To serve on 443/80, lower the unprivileged-port
 # floor (see README) and change these to 443:443 / 80:80.
+# HTTPS (shell/api) + the OHIF viewer origin. No :80 publish — tls internal is HTTPS-only, and
+# :8080 collides with other host software on some boxes; hit https://<host>:8443 directly.
 PublishPort=8443:443
-PublishPort=8080:80
 PublishPort=8444:8444
 NoNewPrivileges=true
 
