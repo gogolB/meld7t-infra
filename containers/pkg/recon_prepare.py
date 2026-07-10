@@ -38,7 +38,12 @@ def read_series_tags(series_dir: str) -> dict:
     """Representative DICOM tags for a series + echo count (for multi-echo/qT2 detection)."""
     import pydicom
 
-    files = sorted(glob.glob(os.path.join(series_dir, "*.dcm")))
+    # glob.escape the dir: anonymized exports often bracket IDs/descriptions (e.g.
+    # "Series 008 [MR - AX T1 mprage Pre]"), and unescaped [ ] are glob character classes → no match.
+    files = sorted(glob.glob(os.path.join(glob.escape(series_dir), "*.dcm")))
+    if not files:      # defensive: discover() already gates on .dcm presence
+        return {"scanning_sequence": [], "image_type": [], "tr": 0.0, "te": 0.0,
+                "ti": None, "n_echoes": 1, "description": ""}
     ds = pydicom.dcmread(files[0], stop_before_pixels=True)
     echoes = set()
     for f in files[:40]:

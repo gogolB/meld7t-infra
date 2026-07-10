@@ -9,7 +9,7 @@ meld_graph   docker.io/meldproject/meld_graph@sha256:e2333882ecf984ffac63970aebf
 # pkg (spec §2.2) — DICOM->NIfTI (dcm2niix) + MP2RAGE O'Brien clean. Built from containers/pkg/
 # on the dev machine; base = python:3.13-slim. Locally built (no repo digest until pushed to the
 # internal registry) — record the image id; re-pin after `podman push` to registry:5000.
-pkg          localhost/meld7t/pkg:0.3.2   sha256:7aafb23e7f2f1e36e949bddf5cfc0641af61456ecf81eba06899508e36dd2b2e
+pkg          localhost/meld7t/pkg:0.3.3   sha256:9c2710c31353162f4104c777fb73988d3f9116cb795eb1dc6e599a89e190173f
 #   base:      docker.io/library/python@sha256:af5bd286051a06b38587d30a8638958f4a2f38381aa80fe859c740af3411bd4d
 #   pins:      dcm2niix 1.0.20241211 (debian) · nibabel 5.4.2 · numpy 2.5.1 · scipy 1.18.0
 #   0.2.0:     + highdicom 0.24.0 + dicomweb-client 0.59.3 (DICOM-SEG packaging + STOW, §17)
@@ -18,6 +18,7 @@ pkg          localhost/meld7t/pkg:0.3.2   sha256:7aafb23e7f2f1e36e949bddf5cfc064
 #              vs tissue label schemes handled; validated on real subject → AI −4.69%, symmetric)
 #   0.3.2:     + map_morphometry.py (MAP07 junction/extension + asymmetry z, §25.4; validated on
 #              real subject → 3 single-subject candidates. Normative z-score seam ready.)
+#   0.3.3:     recon_prepare glob.escape fix — series dirs with [brackets] (anonymized exports)
 
 # SPM12 Standalone r7771 + MATLAB MCR v97 (R2019b) — MAP detector engine (§25.4). Stock image
 # (like meld_graph/hippunfold); the worker mounts containers/map/segment.m and runs `spm12 script`.

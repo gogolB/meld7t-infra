@@ -12,7 +12,7 @@ class WorkerSettings(BaseSettings):
     fs_license: str = "/var/home/bazzite/meld7t/secrets/license.txt"
     meld_license: str = "/var/home/bazzite/meld7t/secrets/meld_license.txt"
 
-    pkg_image: str = "localhost/meld7t/pkg:0.3.2"
+    pkg_image: str = "localhost/meld7t/pkg:0.3.3"
     meld_image: str = "meldproject/meld_graph:v2.2.5_gpu"
     hippunfold_image: str = "docker.io/khanlab/hippunfold:latest"  # HS (§25.5)
     map_image: str = "docker.io/spmcentral/spm:latest"             # SPM12 Standalone, MAP (§25.4)
