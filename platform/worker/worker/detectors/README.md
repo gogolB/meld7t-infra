@@ -8,6 +8,38 @@ triple that the worker dispatches by `detector_id`. The DICOM→BIDS `prepare` s
 |--------------|-------------------|----------------|---------|
 | `meld_fcd`   | `MeldRunner`      | T1 (UNI/MPRAGE) | FCD clusters (GNN), DICOM-SEG overlay |
 | `hippunfold` | `HippUnfoldRunner`| T1 + T2 SPACE  | hippocampal subfield volumes + L/R asymmetry |
+| `map`        | `MapRunner`       | T1 (MPRAGE/UNI) | FCD candidates — SPM junction/extension morphometry |
+
+## MAP (FCD) — SPM voxel morphometry + the normative gap
+
+MAP is the Huppertz "Morphometric Analysis Program" (MAP07) method: an SPM-based voxel morphometry
+detector, methodologically independent of MELD's surface GNN. Engine = stock **SPM12 Standalone
+r7771 + MATLAB MCR** (`spmcentral/spm`, pinned in `images.lock`); no MATLAB licence, air-gappable.
+
+Pipeline (`map.py` + `containers/map/segment.m` + `containers/pkg/map_morphometry.py`):
+1. **compute** — gunzip the T1 → `/work/T1.nii`, run `spm12 script segment.m` (unified
+   segmentation). Produces native `c1/c2/c3`, MNI `wc1/wc2` (unmodulated GM/WM) + `mwc1/mwc2`, and
+   the `y_/iy_` deformations. ~90 s on a clean 7T UNI. CPU-only (`uses_gpu=False`).
+2. **ingest** — `map_morphometry.py` builds two FCD feature maps from the MNI GM/WM probabilities:
+   *junction* (`4·GM·WM`, GM/WM boundary blurring) and *extension* (GM deep inside WM), then
+   converts them to candidate clusters.
+
+**The normative gap (§25.2) — read before trusting any MAP output.** MAP07's feature maps are only
+clinically meaningful as z-scores against a control cohort. That cohort is **not staged**, so:
+- **NORMATIVE mode** (preferred): if `meld-data/normative/map/<feature>_{mean,std}.nii.gz` exists
+  (built from 7T controls on the SPM MNI grid), z is voxelwise `(feat−mean)/std` → `harmo_code`
+  set. This is real MAP07. *Not active yet.*
+- **ASYMMETRY mode** (current fallback): with no cohort, a raw single-subject z is ill-posed — the
+  junction band is high along *every normal* boundary and the extension map is zero-inflated (its
+  MAD→0 makes robust-z explode). So we z-score inter-hemispheric **asymmetry** (`feat − mirror`
+  across the MNI mid-sagittal plane): a feature elevated on one side vs its mirror is the candidate.
+  Control-free and robust, but blind to symmetric/bilateral disease. `harmo_code="none"`,
+  `saliency.single_subject=true`. **Hypothesis-generating, for adjudication only — not detections.**
+
+No viewer overlay yet: the feature maps are in MNI space; warping thresholded clusters back through
+`iy_T1.nii` to the T1 frame for a DICOM-SEG is a follow-up (findings already render in MDT/
+concordance). When the control cohort lands, drop the templates in `normative/map/` and MAP becomes
+a real z-scored detector with no code change.
 
 ## HippUnfold (HS) — air-gap prerequisites
 

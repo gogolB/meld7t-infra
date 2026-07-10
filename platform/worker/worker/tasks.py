@@ -22,7 +22,8 @@ from .config import wsettings
 from .detectors import get_runner
 from .gpu import gpu_lease, wait_if_paused
 
-_DETECTOR_VERSION = {"meld_fcd": "meld_graph:v2.2.5_gpu", "hippunfold": "hippunfold:latest"}
+_DETECTOR_VERSION = {"meld_fcd": "meld_graph:v2.2.5_gpu", "hippunfold": "hippunfold:latest",
+                     "map": "spm12:r7771 (MAP07 morphometry)"}
 
 
 def _set(session: Session, run: Run, status: RunStatus) -> None:
@@ -99,7 +100,7 @@ async def run_detector(ctx, run_id: str) -> dict:
         rf, clusters = ing.get("result", {}), ing.get("clusters", [])
 
         with Session(engine) as session:
-            result = Result(run_id=run_id, harmo_code=None,
+            result = Result(run_id=run_id, harmo_code=rf.get("harmo_code"),
                             orthanc_study_uid=uids.get("study_uid"),
                             orthanc_t1_uid=uids.get("t1_series_uid"),
                             orthanc_seg_uid=uids.get("seg_series_uid"),

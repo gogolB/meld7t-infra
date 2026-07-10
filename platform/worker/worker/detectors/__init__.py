@@ -1,10 +1,11 @@
 """Detector runner registry (worker-side execution, spec §18/§25.1)."""
 from .base import DetectorRunner
 from .hippunfold import HippUnfoldRunner
+from .map import MapRunner
 from .meld import MeldRunner
 
 RUNNERS: dict[str, DetectorRunner] = {
-    r.detector_id: r for r in (MeldRunner(), HippUnfoldRunner())
+    r.detector_id: r for r in (MeldRunner(), HippUnfoldRunner(), MapRunner())
 }
 
 

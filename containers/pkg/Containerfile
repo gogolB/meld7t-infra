@@ -19,5 +19,6 @@ RUN pip install --no-cache-dir \
       highdicom==0.24.0 \
       dicomweb-client==0.59.3
 
-COPY clean_uni.py recon_prepare.py package_dicom.py series_classify.py hippunfold_summarize.py /opt/pkg/
+COPY clean_uni.py recon_prepare.py package_dicom.py series_classify.py \
+     hippunfold_summarize.py map_morphometry.py /opt/pkg/
 WORKDIR /work
