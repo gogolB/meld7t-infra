@@ -20,3 +20,7 @@ test_meld.db
 
 # worker venv
 platform/worker/.venv/
+
+# web build artifacts
+platform/web/node_modules/
+platform/web/dist/

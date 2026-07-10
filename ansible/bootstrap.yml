@@ -354,6 +354,7 @@
         - "{{ svc_config_dir }}/caddy"
         - "{{ svc_config_dir }}/orthanc"
         - "{{ svc_config_dir }}/postgres"
+        - "{{ svc_config_dir }}/ohif"
       when: svc_env_stat.stat.exists
       tags: [services]
 
@@ -380,6 +381,9 @@
         - src: "{{ repo_dir }}/containers/config/postgres/init-databases.sh"
           dest: "{{ svc_config_dir }}/postgres/init-databases.sh"
           mode: "0755"
+        - src: "{{ repo_dir }}/containers/config/ohif/app-config.js"
+          dest: "{{ svc_config_dir }}/ohif/app-config.js"
+          mode: "0644"
       when: svc_env_stat.stat.exists
       tags: [services]
 

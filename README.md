@@ -201,9 +201,24 @@ OHIF (Phase 4) opens the study over `/dicom-web/*` and overlays the SEG on the T
 parametric probability series** (§17, the threshold-slider source) needs surface→volume reprojection
 of MELD's per-vertex hdf5 probability (not emitted as a volume by default) — the tracked follow-up.
 
-> **Buildout status:** Phases 1 (API + immudb), 2 (worker + GPU queue), 3 (DICOM-SEG → Orthanc)
-> done — a run goes submit → recipe → GPU queue → MELD → DICOM-SEG in Orthanc, verified live.
-> Next: Phase 4 OHIF viewer, Phase 5 concordance/MDT. (Continuous parametric map: follow-up.)
+### Frontend + OHIF (§9)
+
+`platform/web/` is a React/Vite SPA shell (air-gap: everything bundled, no CDN, §9.4) served static
+by Caddy at `/`: **Dashboard** (live cases, GPU queue, audit-chain status), **Submit**, **CaseView**
+(series-role confirm §16 → recipe builder §25.1 → runs), **Review** (OHIF iframe + clusters +
+append-only adjudication), **Admin** (pause queue, detector registry, audit verify). Talks to the API
+same-origin via `/api`. Build: `just web-build` → `platform/web/dist`.
+
+The **OHIF viewer** runs as a pinned container on its own same-origin port (`:8444`, so its
+root-absolute assets don't collide with the shell); it reads Orthanc over same-origin `/dicom-web`
+(no CORS) and the Review screen iframes it with the packaged study UID. Verified end-to-end with
+headless screenshots: the shell renders live data and OHIF loads the packaged **MR + DICOM-SEG**
+studies from Orthanc.
+
+> **Buildout status:** Phases 1–4 done — submit → series-confirm → recipe (tandem) → GPU queue →
+> MELD → DICOM-SEG in Orthanc → OHIF review + adjudication, all in the browser, verified live.
+> Next: Phase 5 (MDT summary, concordance view). Follow-ups: continuous parametric map (§17),
+> OHIF deep-link straight into the study, real MAP/HS detectors.
 
 ## Recon pipeline (DICOM → MELD)
 

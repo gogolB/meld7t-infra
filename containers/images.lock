@@ -17,6 +17,8 @@ pkg          localhost/meld7t/pkg:0.2.0   sha256:f8cffd33d6f2713d6a3272c52c9f738
 # api (spec §5) — FastAPI orchestration. Built from platform/api/ on the dev machine.
 api          localhost/meld7t/api:0.1.0   sha256:e9bc69246ffd31fd33a5c68fa3c77e42522236853f06c402ae499cfb27f1c6c1
 
-# --- Long-running service images (off-the-shelf; §2.1) ---
+# --- Long-running service images (off-the-shelf; §2.1, §9) ---
 immudb       docker.io/codenotary/immudb@sha256:ca64fd851b3e60a43115e79f71c4830935f5652e0692628fc80a475c417743a7
-# postgres:16 · redis:7-alpine · orthancteam/orthanc:24.7.3 · registry:2 · caddy:2 — re-pin via `just freeze`.
+ohif         docker.io/ohif/app@sha256:f130db413d37d829e0c98fa49505884343e53e8d6ec72940d44327e917304913
+caddy        docker.io/library/caddy@sha256:98eb57d882ccd5213d1688764db10c1ca2c58a1ca3a6717a3411ad798f7a423a
+# postgres:16 · redis:7-alpine · orthancteam/orthanc:24.7.3 · registry:2 — re-pin via `just freeze`.

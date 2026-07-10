@@ -81,7 +81,7 @@ data-check:
 # --- Long-running services: rootless Podman Quadlet (spec §2) ---
 # Units + config are installed by `ansible-playbook bootstrap.yml --tags services`.
 # These helpers drive the user systemd units (quadlet strips the .container suffix).
-svc_units := "postgres redis immudb orthanc registry api caddy"
+svc_units := "postgres redis immudb orthanc registry api ohif caddy"
 
 # Reload user systemd so Quadlet regenerates units after editing containers/systemd/*.
 services-reload:
@@ -90,6 +90,12 @@ services-reload:
 # Build the platform api image (FastAPI). Run on the dev machine; push to the internal registry.
 api-build:
     podman build -t {{api_image}} -f platform/api/Containerfile platform/api/
+
+# Build the SPA shell → platform/web/dist (Caddy serves it at /). Air-gap: bundled, no CDN (§9.4).
+#   Override the viewer origin port with VITE_VIEWER_PORT (default 8444).
+web-build:
+    podman run --rm -v {{repo}}/platform/web:/app:z -w /app docker.io/library/node:22-slim \
+      bash -c "npm install --no-audit --no-fund && npm run build"
 
 # --- Worker (host service, §2.3): Arq queue consumer, GPU-serialized ---
 # Create the worker's Python 3.13 venv (uv) + deps. Needs secrets/worker.env (loopback URLs).

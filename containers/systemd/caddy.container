@@ -8,13 +8,15 @@ ContainerName=caddy
 Network=meld-net.network
 Volume=caddy-data.volume:/data
 Volume=%h/.config/meld7t/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
-# SITE_ADDRESS (the intranet hostname Caddy serves + issues an internal cert for) is read
-# from here; add the SPA bundle mount (→ /srv/spa) once it is staged (§9.4).
+# Built SPA shell bundle (dev machine → staged); Caddy serves it at / (§9.4).
+Volume=%h/meld7t/platform/web/dist:/srv/spa:ro,z
+# SITE_ADDRESS (the intranet hostname Caddy serves + issues an internal cert for) is read here.
 EnvironmentFile=%h/.config/meld7t/services.env
 # Rootless-safe high ports by default. To serve on 443/80, lower the unprivileged-port
 # floor (see README) and change these to 443:443 / 80:80.
 PublishPort=8443:443
 PublishPort=8080:80
+PublishPort=8444:8444
 NoNewPrivileges=true
 
 [Service]
