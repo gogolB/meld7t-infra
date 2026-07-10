@@ -14,6 +14,7 @@ class WorkerSettings(BaseSettings):
 
     pkg_image: str = "localhost/meld7t/pkg:0.3.0"
     meld_image: str = "meldproject/meld_graph:v2.2.5_gpu"
+    hippunfold_image: str = "docker.io/khanlab/hippunfold:latest"  # HS (§25.5)
     # Orthanc DICOMweb as seen from INSIDE meld-net (the pkg STOW container joins meld-net).
     orthanc_innet: str = "http://orthanc:8042/dicom-web"
 

@@ -29,8 +29,8 @@ async def _run(cmd: list[str], log_path: str) -> int:
 
 
 async def run_prepare(run_id: str, source_role: str | None, dicom_root: str,
-                      workdir: str) -> tuple[int, str]:
-    """recon_prepare in the pkg container → BIDS T1w under meld_data/input/<subject>."""
+                      workdir: str, also_t2: bool = False) -> tuple[int, str]:
+    """recon_prepare in the pkg container → BIDS T1w (+ T2w if also_t2) under meld_data/input."""
     subject = subject_id(run_id)
     source = _ROLE_TO_SOURCE.get(source_role or "", "mprage")
     os.makedirs(os.path.join(wsettings.meld_data, "input"), exist_ok=True)
@@ -42,6 +42,8 @@ async def run_prepare(run_id: str, source_role: str | None, dicom_root: str,
         "python3", "/opt/pkg/recon_prepare.py",
         "--dicom-root", "/dicom", "--subject", subject, "--source", source, "--out", "/out",
     ]
+    if also_t2:
+        cmd.append("--also-t2")
     rc = await _run(cmd, os.path.join(workdir, "prepare.log"))
     return rc, subject
 

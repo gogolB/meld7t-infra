@@ -9,7 +9,7 @@ meld_graph   docker.io/meldproject/meld_graph@sha256:e2333882ecf984ffac63970aebf
 # pkg (spec §2.2) — DICOM->NIfTI (dcm2niix) + MP2RAGE O'Brien clean. Built from containers/pkg/
 # on the dev machine; base = python:3.13-slim. Locally built (no repo digest until pushed to the
 # internal registry) — record the image id; re-pin after `podman push` to registry:5000.
-pkg          localhost/meld7t/pkg:0.3.0   sha256:e571d49bc0948e6f29c06f67cf26e2585f39f64370b75d8ffb20c64478e56cf8
+pkg          localhost/meld7t/pkg:0.3.0   sha256:714756594c58ceb1787d75b6355db5f71a0e8f1b31129636b9c4ea37c467f8dd
 #   base:      docker.io/library/python@sha256:af5bd286051a06b38587d30a8638958f4a2f38381aa80fe859c740af3411bd4d
 #   pins:      dcm2niix 1.0.20241211 (debian) · nibabel 5.4.2 · numpy 2.5.1 · scipy 1.18.0
 #   0.2.0:     + highdicom 0.24.0 + dicomweb-client 0.59.3 (DICOM-SEG packaging + STOW, §17)
