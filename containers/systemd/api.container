@@ -4,7 +4,7 @@ After=network-online.target postgres.service immudb.service
 Requires=postgres.service
 
 [Container]
-Image=localhost/meld7t/api:0.1.2
+Image=localhost/meld7t/api:0.1.3
 ContainerName=api
 Network=meld-net.network
 # meld-data (read-only) so the API can serve MELD report PDFs + key-frame PNGs (§9.1).

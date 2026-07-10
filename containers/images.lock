@@ -24,9 +24,10 @@ pkg          localhost/meld7t/pkg:0.3.2   sha256:7aafb23e7f2f1e36e949bddf5cfc064
 spm          docker.io/spmcentral/spm@sha256:46e4df84f8b5bd7698fda250e96504719db27f0c117c702e62817f8558327522
 
 # api (spec §5) — FastAPI orchestration. Built from platform/api/ on the dev machine.
-api          localhost/meld7t/api:0.1.2   sha256:f6ae458189d2b3310ca75a09f9b456df34ee8c354f449e17e85905b14c5ba208
+api          localhost/meld7t/api:0.1.3   sha256:a8616e8525bd3ef30add6410009f90f2eda9c41ab10fa421302767736ab56470
 #   0.1.1:     HippUnfold detector flipped to "built" (recipe auto-includes HS; §25.5)
 #   0.1.2:     MAP detector flipped to "built" (recipe auto-includes MAP; §25.4)
+#   0.1.3:     audit append serialization (advisory lock) — fixes concurrent-write chain fork
 
 # --- Long-running service images (off-the-shelf; §2.1, §9) ---
 immudb       docker.io/codenotary/immudb@sha256:ca64fd851b3e60a43115e79f71c4830935f5652e0692628fc80a475c417743a7

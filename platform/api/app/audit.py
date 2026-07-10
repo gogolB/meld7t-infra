@@ -12,12 +12,26 @@ import hashlib
 import json
 from typing import Optional
 
+from sqlalchemy import text
 from sqlmodel import Session, select
 
 from .config import settings
 from .models import AuditRecord
 
 GENESIS = "0" * 64
+# Constant key for the append serialization lock. The hash chain is a read-modify-write
+# (read last hash → insert linked record); without serialization two concurrent writers — e.g.
+# MELD and HippUnfold both emitting run.start at once now that detectors run concurrently (§18) —
+# read the same prev_hash and fork the chain. A transaction-scoped advisory lock serializes ALL
+# appends across every connection (API + worker) until each writer commits.
+_AUDIT_LOCK_KEY = 0x6D656C6461      # "melda"
+
+
+def _serialize_appends(session: Session) -> None:
+    """Block until this transaction owns the audit append lock (Postgres only; sqlite serializes
+    writes itself, so it's a harmless no-op there / in tests)."""
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_LOCK_KEY})
 
 
 def _canonical(payload: Optional[dict]) -> str:
@@ -69,6 +83,7 @@ _immu = _Immudb()
 
 def record(session: Session, *, actor: str, action: str, entity_type: str,
            entity_id: str, payload: Optional[dict] = None) -> AuditRecord:
+    _serialize_appends(session)                       # serialize concurrent appends (§18/§24)
     prev = session.exec(
         select(AuditRecord).order_by(AuditRecord.ts.desc()).limit(1)
     ).first()
@@ -100,3 +115,26 @@ def verify_chain(session: Session) -> dict:
             return {"ok": False, "broken_at": i, "record_id": r.id, "count": len(rows)}
         prev_hash = r.payload_hash
     return {"ok": True, "count": len(rows)}
+
+
+def rebuild_chain(session: Session) -> dict:
+    """Re-link the Postgres mirror's hash chain over the current records, in ts order.
+
+    Maintenance only — for after legitimate dev-data cleanup or to heal a pre-fix concurrency fork.
+    It re-derives prev_hash/payload_hash from each record's UNCHANGED content (actor/action/
+    entity/payload), so no event is altered or invented; immudb retains the original immutable log.
+    Returns how many links were repaired."""
+    _serialize_appends(session)
+    rows = session.exec(select(AuditRecord).order_by(AuditRecord.ts)).all()
+    prev_hash, repaired = GENESIS, 0
+    for r in rows:
+        body = {"actor": r.actor, "action": r.action, "entity_type": r.entity_type,
+                "entity_id": r.entity_id, "payload": r.payload}
+        new_hash = _hash(body, prev_hash)
+        if r.prev_hash != prev_hash or r.payload_hash != new_hash:
+            r.prev_hash, r.payload_hash = prev_hash, new_hash
+            session.add(r)
+            repaired += 1
+        prev_hash = r.payload_hash
+    session.commit()
+    return {"ok": True, "count": len(rows), "repaired": repaired}
