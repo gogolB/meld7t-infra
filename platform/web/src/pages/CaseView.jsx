@@ -26,7 +26,10 @@ export default function CaseView() {
 
   return (
     <div>
-      <h1>{c.data?.pseudonym || "Case"} <Badge status={c.data?.status || "created"} /></h1>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+        <h1>{c.data?.pseudonym || "Case"} <Badge status={c.data?.status || "created"} /></h1>
+        <Link to={`/cases/${id}/mdt`} className="btn ghost" style={{ marginLeft: "auto" }}>MDT summary →</Link>
+      </div>
       <p className="muted">{id}</p>
       <ErrorBox error={err} />
 

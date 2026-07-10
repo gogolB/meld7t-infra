@@ -2,14 +2,18 @@
 recipe (§25.1) → runs created (enqueue lands in Phase 2) → adjudication (append-only, audited)."""
 from __future__ import annotations
 
+import glob
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from . import audit, orthanc, queue
+from .config import settings
 from .db import get_session
 from .detectors import REGISTRY
 from .models import (
@@ -223,6 +227,89 @@ def adjudicate(run_id: str, body: AdjudicationCreate,
     session.commit()
     session.refresh(adj)
     return adj
+
+
+# ---- MDT: reports, key frames, concordance, summary (§9.1, §25.6)
+def _report_abs(result: Optional[Result]) -> Optional[str]:
+    """Resolve the stored (relative) report path against the mounted meld-data root."""
+    if not result or not result.report_path:
+        return None
+    return os.path.join(settings.meld_data, result.report_path)
+
+
+def _report_dir(result: Optional[Result]) -> Optional[str]:
+    p = _report_abs(result)
+    return os.path.dirname(p) if p and os.path.isdir(os.path.dirname(p)) else None
+
+
+@router.get("/runs/{run_id}/report")
+def run_report(run_id: str, session: Session = Depends(get_session)):
+    result = session.exec(select(Result).where(Result.run_id == run_id)).first()
+    p = _report_abs(result)
+    if not p or not os.path.isfile(p):
+        raise HTTPException(404, "no report")
+    return FileResponse(p, media_type="application/pdf")
+
+
+@router.get("/runs/{run_id}/frames")
+def run_frames(run_id: str, session: Session = Depends(get_session)) -> list[str]:
+    d = _report_dir(session.exec(select(Result).where(Result.run_id == run_id)).first())
+    return [os.path.basename(p) for p in sorted(glob.glob(os.path.join(d, "*.png")))] if d else []
+
+
+@router.get("/runs/{run_id}/frames/{name}")
+def run_frame(run_id: str, name: str, session: Session = Depends(get_session)):
+    d = _report_dir(session.exec(select(Result).where(Result.run_id == run_id)).first())
+    path = os.path.join(d or "", os.path.basename(name))   # basename → no path traversal
+    if not d or not os.path.isfile(path):
+        raise HTTPException(404, "no frame")
+    return FileResponse(path, media_type="image/png")
+
+
+def _concordance(session: Session, case_id: str) -> dict:
+    runs = session.exec(select(Run).where(Run.case_id == case_id)).all()
+    run_info, regions = [], {}
+    for run in runs:
+        result = session.exec(select(Result).where(Result.run_id == run.id)).first()
+        clusters = (session.exec(select(Cluster).where(Cluster.result_id == result.id)).all()
+                    if result else [])
+        run_info.append({"run_id": run.id, "detector": run.detector_id.value,
+                         "source_role": run.source_role, "status": run.status.value,
+                         "n_clusters": len(clusters)})
+        for c in clusters:
+            regions.setdefault((c.hemi, c.location), {})[run.id] = c.confidence
+    region_list = [{"hemi": h, "location": loc, "by_run": by, "concordant": len(by) >= 2}
+                   for (h, loc), by in regions.items()]
+    region_list.sort(key=lambda r: (-len(r["by_run"]), r["location"] or ""))
+    with_findings = [r for r in run_info if r["n_clusters"] > 0]
+    return {"runs": run_info, "regions": region_list,
+            "detectors_with_findings": len(with_findings),
+            "concordant_regions": sum(1 for r in region_list if r["concordant"])}
+
+
+@router.get("/cases/{case_id}/concordance")
+def concordance(case_id: str, session: Session = Depends(get_session)) -> dict:
+    _get_case(session, case_id)
+    return _concordance(session, case_id)
+
+
+@router.get("/cases/{case_id}/summary")
+def case_summary(case_id: str, session: Session = Depends(get_session)) -> dict:
+    """One aggregate for the MDT screen: runs + results + clusters + adjudications + concordance."""
+    case = _get_case(session, case_id)
+    runs = session.exec(select(Run).where(Run.case_id == case_id)).all()
+    out_runs, adjudications = [], []
+    for run in runs:
+        result = session.exec(select(Result).where(Result.run_id == run.id)).first()
+        clusters = (session.exec(select(Cluster).where(Cluster.result_id == result.id)).all()
+                    if result else [])
+        frames = [os.path.basename(p) for p in sorted(glob.glob(
+            os.path.join(_report_dir(result) or "_", "*.png")))]
+        out_runs.append({"run": run, "result": result, "clusters": clusters, "frames": frames})
+        for a in session.exec(select(Adjudication).where(Adjudication.run_id == run.id)).all():
+            adjudications.append(a)
+    return {"case": case, "runs": out_runs, "adjudications": adjudications,
+            "concordance": _concordance(session, case_id)}
 
 
 # ---- system / queue / admin / audit

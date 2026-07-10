@@ -211,14 +211,19 @@ same-origin via `/api`. Build: `just web-build` → `platform/web/dist`.
 
 The **OHIF viewer** runs as a pinned container on its own same-origin port (`:8444`, so its
 root-absolute assets don't collide with the shell); it reads Orthanc over same-origin `/dicom-web`
-(no CORS) and the Review screen iframes it with the packaged study UID. Verified end-to-end with
-headless screenshots: the shell renders live data and OHIF loads the packaged **MR + DICOM-SEG**
-studies from Orthanc.
+(no CORS) and the Review screen iframes it with the packaged study UID.
 
-> **Buildout status:** Phases 1–4 done — submit → series-confirm → recipe (tandem) → GPU queue →
-> MELD → DICOM-SEG in Orthanc → OHIF review + adjudication, all in the browser, verified live.
-> Next: Phase 5 (MDT summary, concordance view). Follow-ups: continuous parametric map (§17),
-> OHIF deep-link straight into the study, real MAP/HS detectors.
+The **MDT summary** (`/cases/:id/mdt`) is the conference view (§9.1, §25.6): a **detector-concordance
+matrix** (which regions >1 detector/source flag — concordance is the strong surgical signal;
+discordance is flagged for careful adjudication), per-detector cards with the MELD key frames (served
+from `meld-data`) + report PDF + viewer link, and the append-only adjudication log. The API computes
+concordance from the stored clusters and serves reports/frames from a read-only `meld-data` mount.
+
+> **Buildout status:** Phases 1–5 done — submit → series-confirm → recipe (tandem) → GPU queue →
+> MELD → DICOM-SEG in Orthanc → OHIF review + adjudication → MDT concordance summary, all in the
+> browser, verified live (incl. a real tandem case where the UNI and MPRAGE sources disagree).
+> Follow-ups: continuous parametric probability map (§17), OHIF deep-link straight into the study,
+> real MAP/HS detector integrations (the registry + recipe + concordance already accommodate them).
 
 ## Recon pipeline (DICOM → MELD)
 

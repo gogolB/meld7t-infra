@@ -7,6 +7,8 @@ Requires=postgres.service
 Image=localhost/meld7t/api:0.1.0
 ContainerName=api
 Network=meld-net.network
+# meld-data (read-only) so the API can serve MELD report PDFs + key-frame PNGs (§9.1).
+Volume=%h/meld7t/meld-data:/data:ro,z
 # MELD7T_DB_URL / _REDIS_URL / _ORTHANC_DICOMWEB / _IMMUDB_* live here.
 EnvironmentFile=%h/.config/meld7t/services.env
 # Not published — Caddy proxies /api/* to api:8000 on meld-net (§3).

@@ -30,6 +30,8 @@ export const api = {
   listRuns: (id) => req("GET", `/cases/${id}/runs`),
   getRun: (id) => req("GET", `/runs/${id}`),
   adjudicate: (runId, body) => req("POST", `/runs/${runId}/adjudication`, body),
+  summary: (id) => req("GET", `/cases/${id}/summary`),
+  concordance: (id) => req("GET", `/cases/${id}/concordance`),
 };
 
 export const SERIES_ROLES = [

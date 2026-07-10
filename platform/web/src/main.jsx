@@ -6,6 +6,7 @@ import Dashboard from "./pages/Dashboard.jsx";
 import Submit from "./pages/Submit.jsx";
 import CaseView from "./pages/CaseView.jsx";
 import Review from "./pages/Review.jsx";
+import MDT from "./pages/MDT.jsx";
 import Admin from "./pages/Admin.jsx";
 
 function Shell() {
@@ -26,6 +27,7 @@ function Shell() {
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/submit" element={<Submit />} />
           <Route path="/cases/:id" element={<CaseView />} />
+          <Route path="/cases/:id/mdt" element={<MDT />} />
           <Route path="/runs/:runId/review" element={<Review />} />
           <Route path="/admin" element={<Admin />} />
         </Routes>

@@ -24,5 +24,8 @@ class Settings(BaseSettings):
     # Fallback audit mode when immudb is unreachable: still hash-chain into Postgres.
     audit_require_immudb: bool = False
 
+    # meld-data root (mounted read-only) — where report PDFs + key-frame PNGs live (§9.1).
+    meld_data: str = "/data"
+
 
 settings = Settings()

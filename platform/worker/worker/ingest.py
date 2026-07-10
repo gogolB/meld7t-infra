@@ -38,12 +38,13 @@ def parse_clusters(meld_data: str, subject: str) -> list[dict]:
 
 
 def result_fields(meld_data: str, subject: str) -> dict:
-    """Non-DICOM result fields (Orthanc UIDs are filled by the Phase-3 packaging step)."""
-    rep = os.path.join(meld_output_dir(meld_data, subject), "reports",
+    """Non-DICOM result fields. report_path is stored RELATIVE to the meld-data root so the api
+    (which mounts meld-data at its own path) can resolve it regardless of absolute layout."""
+    rel = os.path.join("output", "predictions_reports", subject, "reports",
                        f"MELD_report_{subject}.pdf")
-    clusters = parse_clusters(meld_data, subject)
-    return {"report_path": rep if os.path.exists(rep) else None,
-            "n_clusters": len(clusters)}
+    exists = os.path.exists(os.path.join(meld_data, rel))
+    return {"report_path": rel if exists else None,
+            "n_clusters": len(parse_clusters(meld_data, subject))}
 
 
 def _f(v):
