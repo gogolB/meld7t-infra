@@ -12,7 +12,7 @@ class WorkerSettings(BaseSettings):
     fs_license: str = "/var/home/bazzite/meld7t/secrets/license.txt"
     meld_license: str = "/var/home/bazzite/meld7t/secrets/meld_license.txt"
 
-    pkg_image: str = "localhost/meld7t/pkg:0.2.0"
+    pkg_image: str = "localhost/meld7t/pkg:0.3.0"
     meld_image: str = "meldproject/meld_graph:v2.2.5_gpu"
     # Orthanc DICOMweb as seen from INSIDE meld-net (the pkg STOW container joins meld-net).
     orthanc_innet: str = "http://orthanc:8042/dicom-web"

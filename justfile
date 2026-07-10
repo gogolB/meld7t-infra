@@ -10,7 +10,7 @@ dev_box    := "meld-dev"
 # your 3090 Ti's 24GB qualifies). NOTE: confirm this exact tag at pull time — if it 404s, check the
 # release page for the GPU tag or fall back to `meldproject/meld_graph:v2.2.5`.
 meld_image := env_var_or_default("MELD_IMAGE", "meldproject/meld_graph:v2.2.5_gpu")
-pkg_image  := env_var_or_default("PKG_IMAGE", "localhost/meld7t/pkg:0.2.0")  # §2.2 convert+clean+package
+pkg_image  := env_var_or_default("PKG_IMAGE", "localhost/meld7t/pkg:0.3.0")  # §2.2 convert+clean+package
 api_image  := env_var_or_default("API_IMAGE", "localhost/meld7t/api:0.1.0")  # §5 FastAPI
 meld_data  := env_var_or_default("MELD_DATA", repo + "/meld-data")     # bind-mounted to /data
 fs_lic     := repo + "/secrets/license.txt"                            # FreeSurfer license
