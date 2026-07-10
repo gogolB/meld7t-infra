@@ -23,6 +23,7 @@ async def run_cmd(cmd: list[str], log_path: str) -> int:
 class DetectorRunner:
     detector_id: str = ""
     needs_t2: bool = False          # prepare also emits sub-<id>_T2w (HS detectors)
+    uses_gpu: bool = True           # False → skip the GPU mutex, run alongside a GPU job (§18)
 
     async def compute(self, subject: str, workdir: str) -> tuple[int, Optional[RunStatus]]:
         """Run the detector container. Return (exit_code, special_fail_status or None)."""

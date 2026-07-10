@@ -1,7 +1,9 @@
-"""Arq task: run one detector run end-to-end (spec §5.2, §18). max_jobs=1 → GPU-serialized.
+"""Arq task: run one detector run end-to-end (spec §5.2, §18).
 
 Generic dispatch: the shared prepare (DICOM→BIDS) runs, then the per-detector runner does
-compute → package → ingest. MELD is one runner among many (see worker/detectors)."""
+compute → package → ingest. MELD is one runner among many (see worker/detectors). Arq runs up to
+`max_jobs` runs at once; GPU exclusivity is enforced by the `gpu_lease` mutex (GPU detectors only),
+so a CPU-only detector (HippUnfold) runs alongside a GPU job (MELD) rather than behind it."""
 from __future__ import annotations
 
 import os
@@ -46,7 +48,8 @@ async def run_detector(ctx, run_id: str) -> dict:
         case_id = run.case_id
         source_role = run.source_role.value if run.source_role else None
         detector = run.detector_id.value
-        run.device = Device.gpu
+        runner = get_runner(detector)
+        run.device = Device.gpu if (runner is None or runner.uses_gpu) else Device.cpu
         _set(session, run, RunStatus.preprocessing)
         audit.record(session, actor="worker", action="run.start", entity_type="run",
                      entity_id=run_id, payload={"detector": detector, "source_role": source_role})
@@ -55,7 +58,6 @@ async def run_detector(ctx, run_id: str) -> dict:
     workdir = os.path.join(wsettings.meld_data, "work", run_id)
     os.makedirs(workdir, exist_ok=True)
 
-    runner = get_runner(detector)
     if runner is None:
         return await _fail(redis, run_id, RunStatus.failed, workdir,
                            f"no worker runner for detector '{detector}'")
@@ -67,20 +69,26 @@ async def run_detector(ctx, run_id: str) -> dict:
             pseudonym = case.pseudonym
             dicom_root = dicom.dicom_root_for(case)
 
-        async with gpu_lease(redis, run_id):
-            rc, subject = await pipeline.run_prepare(
-                run_id, source_role, dicom_root, workdir, also_t2=runner.needs_t2)
-            if rc != 0:
-                return await _fail(redis, run_id, RunStatus.failed, workdir, "prepare failed")
+        # prepare (DICOM→BIDS via dcm2niix) is CPU-only — run it outside the GPU mutex.
+        rc, subject = await pipeline.run_prepare(
+            run_id, source_role, dicom_root, workdir, also_t2=runner.needs_t2)
+        if rc != 0:
+            return await _fail(redis, run_id, RunStatus.failed, workdir, "prepare failed")
 
-            with Session(engine) as session:
-                _set(session, session.get(Run, run_id), RunStatus.inference)
-            await _push_status(redis, run_id, RunStatus.inference.value)
+        with Session(engine) as session:
+            _set(session, session.get(Run, run_id), RunStatus.inference)
+        await _push_status(redis, run_id, RunStatus.inference.value)
 
+        # compute: GPU detectors serialize on the GPU mutex; CPU-only detectors (uses_gpu=False)
+        # run concurrently alongside a GPU job instead of queuing behind it (§18).
+        if runner.uses_gpu:
+            async with gpu_lease(redis, run_id):
+                rc, fail_status = await runner.compute(subject, workdir)
+        else:
             rc, fail_status = await runner.compute(subject, workdir)
-            if rc != 0:
-                return await _fail(redis, run_id, fail_status or RunStatus.failed,
-                                   workdir, f"{detector} rc={rc}")
+        if rc != 0:
+            return await _fail(redis, run_id, fail_status or RunStatus.failed,
+                               workdir, f"{detector} rc={rc}")
 
         # package overlays → Orthanc, then ingest findings
         with Session(engine) as session:
@@ -151,6 +159,7 @@ def _maybe_finish_case(session: Session, case_id: str) -> None:
 class WorkerSettings:
     functions = [run_detector]
     redis_settings = RedisSettings.from_dsn(app_settings.redis_url)
-    max_jobs = 1                       # single global GPU semaphore (§18)
+    max_jobs = 2                       # 1 GPU + 1 CPU detector concurrently; GPU exclusivity is
+                                       # enforced by the gpu_lease mutex, not the queue (§18)
     job_timeout = 4 * 60 * 60          # MELD ~1 hr, HippUnfold up to ~1 hr; generous ceiling
     keep_result = 3600

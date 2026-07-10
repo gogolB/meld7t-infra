@@ -1,7 +1,10 @@
-"""GPU serialization + status (spec §18). Single global semaphore — one GPU job at a time.
+"""GPU serialization + status (spec §18). Single global GPU semaphore — one GPU job at a time.
 
-With Arq max_jobs=1 the whole run is already serialized; this Redis flag makes GPU-in-use visible
-to the dashboard, enforces the admin pause-queue control, and is the seam for finer scheduling later.
+Arq runs up to `max_jobs` runs concurrently (§18), so GPU exclusivity is NOT provided by the queue;
+it is enforced here by `gpu_lease`, a real blocking Redis mutex. Only GPU detectors take the lease
+(`runner.uses_gpu`), so a CPU-only detector (e.g. HippUnfold) runs alongside a GPU job instead of
+queuing behind it. The lock's value is the holding run_id, which the dashboard reads to show what is
+on the GPU; a TTL frees it if a worker dies mid-job.
 """
 from __future__ import annotations
 
@@ -9,6 +12,11 @@ import asyncio
 import subprocess
 
 from .config import wsettings
+
+# TTL > Arq job_timeout (4 h): a crashed holder's lock self-heals, but a live job is killed by the
+# timeout long before its lock could expire — so two GPU jobs can never overlap in normal operation.
+_LOCK_TTL_S = 5 * 60 * 60
+_POLL_S = 2.0
 
 
 async def wait_if_paused(redis) -> None:
@@ -18,18 +26,26 @@ async def wait_if_paused(redis) -> None:
 
 
 class gpu_lease:
-    """Async context manager: marks the GPU in-use for the duration of a job."""
+    """Async context manager: a blocking single-holder GPU mutex (spec §18).
+
+    Acquire waits (polling `SET NX`) until the one GPU slot is free, then holds it — keyed to
+    run_id so the dashboard shows the current GPU holder. Release only clears the lock if we still
+    own it, so a successor that acquired after a TTL expiry is never clobbered."""
 
     def __init__(self, redis, run_id: str) -> None:
         self.redis = redis
         self.run_id = run_id
 
     async def __aenter__(self):
-        await self.redis.set(wsettings.gpu_lock_key, self.run_id)
+        while not await self.redis.set(
+                wsettings.gpu_lock_key, self.run_id, nx=True, ex=_LOCK_TTL_S):
+            await asyncio.sleep(_POLL_S)
         return self
 
     async def __aexit__(self, *exc):
-        await self.redis.delete(wsettings.gpu_lock_key)
+        cur = await self.redis.get(wsettings.gpu_lock_key)
+        if cur is not None and (cur.decode() if isinstance(cur, bytes) else cur) == self.run_id:
+            await self.redis.delete(wsettings.gpu_lock_key)
 
 
 def gpu_status() -> dict:

@@ -21,6 +21,7 @@ from .base import DetectorRunner, run_cmd
 class HippUnfoldRunner(DetectorRunner):
     detector_id = "hippunfold"
     needs_t2 = True                 # segment on the high-res T2 SPACE
+    uses_gpu = False                # CPU-only nnU-Net (bundled torch lacks sm_86) — no GPU mutex
 
     async def compute(self, subject: str, workdir: str) -> tuple[int, Optional[RunStatus]]:
         label = subject.replace("sub-", "")
