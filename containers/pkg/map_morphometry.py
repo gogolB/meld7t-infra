@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MAP-style voxel morphometry from SPM tissue segments (Huppertz MAP07 method, spec §25.4).
+"""Experimental MAP-inspired voxel morphometry from SPM tissue segments.
 
 Runs in the pkg container (nibabel/scipy). Consumes the MNI-space tissue probabilities SPM's
 unified segmentation wrote (wc1 = GM, wc2 = WM) and computes two FCD feature maps, then converts
@@ -15,7 +15,8 @@ proprietary MAP toolbox):
 DETECTION regime — how a feature map becomes clusters:
   * NORMATIVE (preferred, §25.2): if /data/normative/map/<feature>_{mean,std}.nii.gz is staged
     (built from a 7T control cohort on this exact MNI grid), z is voxelwise (feat-mean)/std. This
-    is real MAP07. harmo_code="normative-v1".
+    is cohort-normalized MAP-inspired research output; equivalence to the reference MAP toolbox
+    has not been established. harmo_code="normative-v1".
   * ASYMMETRY (control-free fallback): with no cohort, a raw single-subject z of these features is
     ill-posed — the junction band is high along every *normal* boundary and the extension map is
     zero-inflated. Instead we use inter-hemispheric ASYMMETRY: mirror the feature across the MNI
@@ -46,15 +47,31 @@ MAX_CLUSTERS = 12             # cap the candidate list (single-subject is high-F
 
 def _load(path):
     img = nib.load(path)
-    return img, np.asanyarray(img.dataobj, dtype=np.float32)
+    data = np.asanyarray(img.dataobj, dtype=np.float32)
+    if data.ndim != 3 or 0 in data.shape or not np.all(np.isfinite(data)):
+        raise ValueError(f"invalid/non-finite 3D NIfTI: {path}")
+    if not np.all(np.isfinite(img.affine)) or abs(np.linalg.det(img.affine[:3, :3])) < 1e-8:
+        raise ValueError(f"invalid/singular NIfTI affine: {path}")
+    return img, data
 
 
 def _find(root, subject, stem):
-    for p in (f"{root}/{subject}/{stem}T1.nii", f"{root}/{subject}/{stem}T1.nii.gz",
-              f"{root}/{subject}/{stem}*.nii*"):
-        hits = sorted(glob.glob(p))
-        if hits:
+    # Exact compressed/uncompressed names form one preferred tier.  Treating ``.nii`` as an
+    # implicit winner over ``.nii.gz`` can accept a stale derivative left by a previous tool run.
+    # A broader wildcard is only a fallback, and it must also resolve exactly once.
+    tiers = (
+        (f"{root}/{subject}/{stem}T1.nii", f"{root}/{subject}/{stem}T1.nii.gz"),
+        (f"{root}/{subject}/{stem}*.nii*",),
+    )
+    for patterns in tiers:
+        hits = sorted({hit for pattern in patterns for hit in glob.glob(pattern)
+                       if os.path.isfile(hit)})
+        if len(hits) == 1:
             return hits[0]
+        if len(hits) > 1:
+            raise ValueError(
+                f"ambiguous MAP {stem} output for {subject}: {hits}"
+            )
     return None
 
 
@@ -71,13 +88,24 @@ def _x_axis(affine):
     return int(np.argmax(np.abs(affine[0, :3])))
 
 
-def z_normative(feat, name, data_root):
+def _normative_paths(name, data_root):
+    return (f"{data_root}/normative/map/{name}_mean.nii.gz",
+            f"{data_root}/normative/map/{name}_std.nii.gz")
+
+
+def z_normative(feat, name, data_root, reference_img):
     mean_p = f"{data_root}/normative/map/{name}_mean.nii.gz"
     std_p = f"{data_root}/normative/map/{name}_std.nii.gz"
-    if not (os.path.exists(mean_p) and os.path.exists(std_p)):
-        return None
-    mean = np.asanyarray(nib.load(mean_p).dataobj, dtype=np.float32)
-    std = np.asanyarray(nib.load(std_p).dataobj, dtype=np.float32)
+    mean_img, mean = _load(mean_p)
+    std_img, std = _load(std_p)
+    for label, image, data in (("mean", mean_img, mean), ("std", std_img, std)):
+        if data.shape != feat.shape:
+            raise ValueError(
+                f"normative {name} {label} shape {data.shape} != subject {feat.shape}")
+        if not np.allclose(image.affine, reference_img.affine, atol=1e-4, rtol=1e-6):
+            raise ValueError(f"normative {name} {label} affine does not match subject MNI grid")
+    if np.any(std < 0):
+        raise ValueError(f"normative {name} std contains negative values")
     std = np.where(std > 1e-6, std, np.nan)
     return np.nan_to_num((feat - mean) / std, nan=0.0)
 
@@ -140,30 +168,55 @@ def main():
     ap.add_argument("--root", required=True)      # /data/output/map
     ap.add_argument("--subject", required=True)
     ap.add_argument("--data-root", default=None)  # normative template lookup (default: root/..)
+    ap.add_argument("--require-normative", action="store_true",
+                    help="fail unless a complete, grid-matched normative cohort is present")
+    ap.add_argument("--harmo-code", default=None,
+                    help="immutable profile code to emit when normative mode is required")
     a = ap.parse_args()
 
     gm_p, wm_p = _find(a.root, a.subject, "wc1"), _find(a.root, a.subject, "wc2")
     if not gm_p or not wm_p:
-        print(json.dumps({"subject": a.subject, "error": "missing SPM wc1/wc2 segments",
-                          "clusters": []}))
-        return 0
+        raise FileNotFoundError("missing required SPM wc1/wc2 segments")
 
     gm_img, gm = _load(gm_p)
-    _, wm = _load(wm_p)
+    wm_img, wm = _load(wm_p)
+    if gm.shape != wm.shape or not np.allclose(
+            gm_img.affine, wm_img.affine, atol=1e-4, rtol=1e-6):
+        raise ValueError("SPM wc1/wc2 shape or affine mismatch")
     affine = gm_img.affine
     voxvol = float(abs(np.linalg.det(affine[:3, :3])))
     tissue = ((gm + wm) > 0.5).astype(np.float32)
-    data_root = a.data_root or os.path.dirname(a.root.rstrip("/"))
+    # /data/output/map -> /data (not /data/output).  Worker callers pass this explicitly too.
+    data_root = a.data_root or os.path.dirname(os.path.dirname(a.root.rstrip("/")))
 
     feats = compute_features(gm, wm)
-    clusters, harmo = [], None
+    all_normative = [p for name in FEATURES for p in _normative_paths(name, data_root)]
+    present = [os.path.isfile(path) for path in all_normative]
+    if any(present) and not all(present):
+        missing = [path for path, exists in zip(all_normative, present) if not exists]
+        raise FileNotFoundError(f"partial normative cohort is forbidden; missing {missing}")
+    normative = all(present)
+    if a.require_normative and not normative:
+        raise FileNotFoundError("requested normative harmonization artifacts are not complete")
+    if a.require_normative and not a.harmo_code:
+        raise ValueError("--require-normative requires --harmo-code")
+
+    clusters = []
+    artifacts = []
+    harmo = (a.harmo_code or "normative-v1") if normative else "none"
     for name, feat in feats.items():
-        zn = z_normative(feat, name, data_root)
-        if zn is not None:
-            z, mode = zn, "normative-v1"
-        else:
-            z, mode = z_asymmetry(feat, name, affine, tissue), "none"
-        harmo = mode if harmo in (None, mode) else "mixed"
+        z = (z_normative(feat, name, data_root, gm_img) if normative
+             else z_asymmetry(feat, name, affine, tissue))
+        feature_path = os.path.join(a.root, a.subject, f"{name}_feature.nii.gz")
+        z_path = os.path.join(a.root, a.subject, f"{name}_z.nii.gz")
+        threshold_path = os.path.join(a.root, a.subject, f"{name}_threshold.nii.gz")
+        nib.save(nib.Nifti1Image(feat.astype(np.float32), affine, gm_img.header), feature_path)
+        nib.save(nib.Nifti1Image(z.astype(np.float32), affine, gm_img.header), z_path)
+        nib.save(nib.Nifti1Image(
+            (z >= FEATURES[name]["z_thresh"]).astype(np.uint8), affine, gm_img.header
+        ), threshold_path)
+        artifacts.extend(os.path.basename(path) for path in (
+            feature_path, z_path, threshold_path))
         clusters.extend(clusters_from_z(z, name, affine, voxvol))
 
     clusters.sort(key=lambda c: c["confidence"], reverse=True)
@@ -176,7 +229,8 @@ def main():
                          "harmonisation": harmo, "single_subject": harmo == "none"}
 
     print(json.dumps({"subject": a.subject, "harmo_code": harmo, "space": "MNI152",
-                      "n_clusters": len(clusters), "clusters": clusters}))
+                      "n_clusters": len(clusters), "clusters": clusters,
+                      "artifacts": artifacts}))
     return 0
 
 

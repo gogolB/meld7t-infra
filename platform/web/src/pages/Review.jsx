@@ -11,19 +11,27 @@ const viewerUrl = (studyUid) =>
 export default function Review() {
   const { runId } = useParams();
   const r = useAsync(() => api.getRun(runId), [runId]);
-  const [adj, setAdj] = useState({ reviewer: "", agree: true, confidence: 3, ground_truth: "", notes: "" });
+  const me = useAsync(() => api.me(), []);
+  const [adj, setAdj] = useState({ agree: true, confidence: 3, ground_truth: "", notes: "" });
   const [saved, setSaved] = useState(false);
+  const [correcting, setCorrecting] = useState(null);
   const [err, setErr] = useState(null);
 
   const run = r.data?.run, result = r.data?.result, clusters = r.data?.clusters || [];
+  const metrics = result?.metric_schema || {};
   const frames = r.data?.frames || [];
+  const adjudications = r.data?.adjudications || [];
+  const latestAdjudication = adjudications.length ? adjudications[adjudications.length - 1] : null;
   // MELD's own MRI overlay (cluster drawn on the T1) + the inflated-surface view — the clearest look.
   const overlayFrame = frames.find((f) => f.startsWith("mri_"));
   const surfaceFrame = frames.find((f) => f.startsWith("inflatbrain"));
 
   async function save(e) {
     e.preventDefault(); setErr(null);
-    try { await api.adjudicate(runId, adj); setSaved(true); }
+    try {
+      await api.adjudicate(runId, { ...adj, ...(correcting ? { supersedes: correcting } : {}) });
+      setSaved(true); setCorrecting(null); r.reload();
+    }
     catch (e) { setErr(e.message); }
   }
 
@@ -58,14 +66,21 @@ export default function Review() {
       {/* MELD's own results + clusters + adjudication */}
       <div className="row" style={{ marginTop: 16, alignItems: "flex-start" }}>
         <div className="grow">
-          <h2>What MELD found</h2>
+          <h2>Detector findings</h2>
           <div className="panel">
             {clusters.length ? clusters.map((c) => (
               <div key={c.id} style={{ borderBottom: "1px solid var(--line)", padding: "6px 0" }}>
                 <b>Cluster #{c.index}</b> — {c.hemi} {c.location}<br />
-                <span className="muted">size {c.size} · confidence {c.confidence}</span>
+                <span className="muted">
+                  {metrics.size?.label || "detector-specific size"}: {c.size}{metrics.size?.unit ? ` ${metrics.size.unit}` : ""}
+                  {" · "}{metrics.confidence?.label || "detector-specific score"}: {c.confidence}
+                  {metrics.confidence?.unit ? ` ${metrics.confidence.unit}` : ""}
+                </span>
               </div>
             )) : <span className="muted">No clusters above operating point (a first-class result, §21).</span>}
+            {clusters.length > 0 && <p className="muted">
+              Metrics are detector-specific and must not be compared numerically across detectors.
+            </p>}
             {overlayFrame && (
               <img src={api.frameUrl(runId, overlayFrame)} alt="MELD cluster on T1"
                    style={{ width: "100%", borderRadius: 6, marginTop: 10, border: "1px solid var(--line)" }} />
@@ -74,7 +89,7 @@ export default function Review() {
               <img src={api.frameUrl(runId, surfaceFrame)} alt="MELD inflated surface"
                    style={{ width: "100%", borderRadius: 6, marginTop: 8, border: "1px solid var(--line)" }} />
             )}
-            {result?.report_path && (
+            {result?.has_report && (
               <a className="btn ghost" href={`/api/runs/${runId}/report`} target="_blank" rel="noreferrer"
                  style={{ marginTop: 10, display: "inline-block" }}>MELD PDF report ↗</a>
             )}
@@ -85,10 +100,15 @@ export default function Review() {
           <h2>Adjudication <span className="muted">(append-only, §24)</span></h2>
           <form className="panel" onSubmit={save}>
             <ErrorBox error={err} />
-            {saved && <div className="ok-chip">Saved — recorded to the immudb ledger.</div>}
-            <label>Reviewer *</label>
-            <input value={adj.reviewer} required
-              onChange={(e) => setAdj({ ...adj, reviewer: e.target.value })} />
+            {saved && <div className="ok-chip">Saved — the auditor can verify its ledger record.</div>}
+            {adjudications.length > 0 && (
+              <div className="muted" style={{ marginBottom: 10 }}>
+                {adjudications.length} immutable review record(s). Corrections append and link to
+                the prior record; they never overwrite it.
+              </div>
+            )}
+            <label>Reviewer</label>
+            <div className="pill">{me.data?.subject || "authenticated identity"}</div>
             <label>Assessment</label>
             <select value={String(adj.agree)}
               onChange={(e) => setAdj({ ...adj, agree: e.target.value === "true" })}>
@@ -104,7 +124,15 @@ export default function Review() {
             <label>Notes</label>
             <input value={adj.notes} onChange={(e) => setAdj({ ...adj, notes: e.target.value })} />
             <div style={{ marginTop: 12 }}>
-              <button className="btn" disabled={!adj.reviewer || saved}>Sign &amp; record</button>
+              <button className="btn" disabled={saved || (latestAdjudication && !correcting)}>
+                {correcting ? "Record correction" : "Record research review"}
+              </button>
+              {latestAdjudication && !correcting && (
+                <button type="button" className="btn ghost" style={{ marginLeft: 8 }}
+                  onClick={() => { setCorrecting(latestAdjudication.id); setSaved(false); }}>
+                  Correct latest review
+                </button>
+              )}
             </div>
           </form>
         </div>

@@ -11,7 +11,7 @@ dev_box    := "meld-dev"
 # release page for the GPU tag or fall back to `meldproject/meld_graph:v2.2.5`.
 meld_image := env_var_or_default("MELD_IMAGE", "meldproject/meld_graph:v2.2.5_gpu")
 pkg_image  := env_var_or_default("PKG_IMAGE", "localhost/meld7t/pkg:0.3.3")  # §2.2 convert+clean+package
-api_image  := env_var_or_default("API_IMAGE", "localhost/meld7t/api:0.1.3")  # §5 FastAPI
+api_image  := env_var_or_default("API_IMAGE", "localhost/meld7t/api:0.2.0")  # §5 FastAPI
 meld_data  := env_var_or_default("MELD_DATA", repo + "/meld-data")     # bind-mounted to /data
 fs_lic     := repo + "/secrets/license.txt"                            # FreeSurfer license
 meld_lic   := repo + "/secrets/meld_license.txt"                       # MELD license
@@ -46,8 +46,8 @@ gpu-check:
     echo "== CDI spec =="
     ls -l /etc/cdi/nvidia.yaml 2>/dev/null || { echo ">> no CDI spec — run: just cdi-generate"; nvidia-ctk cdi list || true; }
     echo "== GPU inside a rootless Podman container =="
-    podman run --rm --device nvidia.com/gpu=all \
-      docker.io/nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+    cuda_image=$({{repo}}/ops/release/image-lock.sh get cuda_smoke)
+    podman run --rm --pull=never --device nvidia.com/gpu=all "$cuda_image" nvidia-smi
 
 # Generate the CDI spec if gpu-check reports none (needs sudo; safe to re-run).
 cdi-generate:
@@ -89,20 +89,22 @@ services-reload:
 
 # Build the platform api image (FastAPI). Run on the dev machine; push to the internal registry.
 api-build:
-    podman build -t {{api_image}} -f platform/api/Containerfile platform/api/
+    {{repo}}/ops/release/build-api-image.sh {{api_image}} "$HOME/meld7t-release-input/api"
 
 # Build the SPA shell → platform/web/dist (Caddy serves it at /). Air-gap: bundled, no CDN (§9.4).
-#   Override the viewer origin port with VITE_VIEWER_PORT (default 8444).
+#   Override the viewer origin port with VITE_VIEWER_PORT (default 9444).
 web-build:
-    podman run --rm -v {{repo}}/platform/web:/app:z -w /app docker.io/library/node:22-slim \
-      bash -c "npm install --no-audit --no-fund && npm run build"
+    node_image=$({{repo}}/ops/release/image-lock.sh get node_builder); \
+      git_sha=$(git -C {{repo}} rev-parse HEAD); \
+      podman run --rm --pull=never -e MELD7T_GIT_SHA="$git_sha" \
+      -v {{repo}}/platform/web:/app:z -w /app "$node_image" \
+      bash -c 'npm ci --ignore-scripts --no-audit --no-fund && npm run build && \
+        printf "%s\\n" "$MELD7T_GIT_SHA" >dist/.meld7t-git-sha'
 
 # --- Worker (host service, §2.3): Arq queue consumer, GPU-serialized ---
 # Create the worker's Python 3.13 venv (uv) + deps. Needs secrets/worker.env (loopback URLs).
 worker-setup:
-    cd {{repo}}/platform/worker && uv venv --python 3.13 \
-      && uv pip install --python .venv arq redis 'sqlmodel==0.0.22' 'psycopg[binary]' \
-         pydantic-settings dicomweb-client immudb-py pytest
+    cd {{repo}}/platform/worker && uv sync --locked --python 3.13 --extra dev
 
 # Run the worker in the foreground (dev). Prod uses the meld7t-worker.service user unit.
 worker-run:
@@ -122,6 +124,12 @@ e2e detector="map":
 
 # Install + enable the worker as a systemd user service (boot-start needs linger).
 worker-install:
+    mkdir -p ~/.local/lib/meld7t ~/.config/meld7t/dev/env ~/.config/systemd/user
+    if [[ ! -e ~/.local/lib/meld7t/current ]]; then ln -s {{repo}} ~/.local/lib/meld7t/current; fi
+    if [[ ! -e ~/.config/meld7t/current ]]; then ln -s ~/.config/meld7t/dev ~/.config/meld7t/current; fi
+    if [[ -f {{repo}}/secrets/worker.env ]]; then \
+      install -m600 {{repo}}/secrets/worker.env ~/.config/meld7t/dev/env/worker.env; \
+    fi
     install -Dm644 {{repo}}/platform/worker/meld7t-worker.service \
       ~/.config/systemd/user/meld7t-worker.service
     systemctl --user daemon-reload
@@ -137,6 +145,10 @@ services-up: services-reload
 services-down:
     systemctl --user stop {{svc_units}} || true
 
+# Apply changed image/config/unit inputs and wait for health-gated Quadlets.
+services-restart: services-reload
+    systemctl --user restart {{svc_units}}
+
 # Show unit state + the running service containers.
 services-status:
     systemctl --user --no-pager status {{svc_units}} || true
@@ -145,6 +157,53 @@ services-status:
 # Follow one service's logs (default caddy):  just services-logs unit=orthanc
 services-logs unit="caddy":
     journalctl --user -u {{unit}} -f
+
+# --- Signed offline production release + disaster recovery ---
+
+# Validate the machine-readable image lock (blocks on REQUIRED_* placeholders).
+release-lock-check scope="runtime":
+    {{repo}}/ops/release/image-lock.sh validate {{scope}}
+
+# Build a hash-locked worker wheelhouse on the connected release workstation.
+worker-wheelhouse output="$HOME/meld7t-release-input/worker":
+    {{repo}}/ops/release/build-worker-wheelhouse.sh {{output}}
+
+api-wheelhouse output="$HOME/meld7t-release-input/api":
+    {{repo}}/ops/release/build-python-wheelhouse.sh {{repo}}/platform/api {{output}}
+
+# Pass the required export arguments directly, e.g.:
+# just release-export --output /media/release --release-id 0.2.0 ...
+release-export *ARGS:
+    {{repo}}/ops/release/export-airgap.sh {{ARGS}}
+
+release-verify bundle trusted_key:
+    {{repo}}/ops/release/verify-airgap.sh {{bundle}} {{trusted_key}}
+
+release-import *ARGS:
+    {{repo}}/ops/release/import-airgap.sh {{ARGS}}
+
+# Install production config/units without starting or activating the staged release.
+prod-install *ANSIBLE_ARGS:
+    ansible-playbook -i {{repo}}/ansible/inventory.ini {{repo}}/ansible/production.yml -K {{ANSIBLE_ARGS}}
+
+# Controlled migration requires a fresh signed/encrypted backup receipt.
+prod-state-init release_id:
+    {{repo}}/ops/deployment/initialize-first-install.sh {{release_id}} --confirm-new-host
+
+prod-migrate staged_release backup_dir trusted_backup_key:
+    {{staged_release}}/ops/deployment/migrate.sh {{staged_release}} {{backup_dir}} {{trusted_backup_key}}
+
+prod-activate release_id:
+    {{repo}}/ops/deployment/activate-release.sh {{release_id}} --confirm-migrated
+
+backup dest recipient_cert signing_key release="$HOME/.local/lib/meld7t/current":
+    {{repo}}/ops/deployment/backup.sh {{dest}} {{recipient_cert}} {{signing_key}} {{release}}
+
+backup-verify backup_dir trusted_key:
+    {{repo}}/ops/deployment/verify-backup.sh {{backup_dir}} {{trusted_key}}
+
+restore-drill backup_dir recipient_cert recipient_key trusted_key:
+    {{repo}}/ops/deployment/restore-drill.sh {{backup_dir}} {{recipient_cert}} {{recipient_key}} {{trusted_key}}
 
 # 2) Enter the mutable dev box (created by ansible/bootstrap.yml).
 dev:
@@ -194,7 +253,11 @@ meld-run subject *flags:
 # Build the pkg image (dcm2niix + O'Brien MP2RAGE clean). Run on the dev machine; push to the
 # internal registry for air-gap, then re-pin the digest in containers/images.lock.
 pkg-build:
-    podman build -t {{pkg_image}} -f containers/pkg/Containerfile containers/pkg/
+    test -z "$(git status --porcelain)"
+    podman build --pull=never \
+      --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+      -t {{pkg_image}} -f containers/pkg/Containerfile containers/pkg/
+    podman image inspect {{pkg_image}} --format '{{ "manifest={{.Digest}} image={{.Id}}" }}'
 
 # Prepare a MELD BIDS T1w input from raw DICOM using the pkg container (--network=none, §27).
 #   source = uni (default: O'Brien-cleaned MP2RAGE UNI — the surface-QC winner) | mprage
@@ -229,11 +292,12 @@ freeze:
     f="provenance/freeze-${ts}.txt"
     {
       echo "# frozen ${ts} (UTC)"
-      echo; echo "## OS deployment (rpm-ostree)"; rpm-ostree status || true
-      echo; echo "## podman images (with digests)"; podman images --digests || true
-      echo; echo "## nvidia driver"; nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
+      echo; echo "## source"; git rev-parse HEAD; git status --porcelain
+      echo; echo "## image lock"; sha256sum containers/images.lock; cat containers/images.lock
+      echo; echo "## OS deployment (rpm-ostree)"; rpm-ostree status
+      echo; echo "## podman images (with digests)"; podman images --digests
+      echo; echo "## nvidia driver"; nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
     } > "$f"
     # stable pointer for the gpu-check driver-drift guard
-    nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 | tr -d '[:space:]' > provenance/driver.lock || true
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 | tr -d '[:space:]' > provenance/driver.lock
     echo "wrote ${f} (and updated provenance/driver.lock)"
-

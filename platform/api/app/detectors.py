@@ -35,7 +35,7 @@ REGISTRY: dict[DetectorId, Detector] = {
         id=DetectorId.map, label="MAP", target="FCD (neocortex)",
         workups=(Workup.fcd, Workup.both),
         source_roles=(SeriesRole.t1_mprage, SeriesRole.t1_uni),   # MAP prefers MPRAGE (§25.4)
-        status="built", method="voxel morphometry (SPM MAP07)"),
+        status="built", method="experimental MAP-inspired SPM voxel morphometry"),
     DetectorId.hippunfold: Detector(
         id=DetectorId.hippunfold, label="HippUnfold", target="HS (hippocampus)",
         workups=(Workup.hs, Workup.both),

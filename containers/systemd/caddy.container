@@ -1,24 +1,47 @@
 [Unit]
-Description=Caddy — reverse proxy, static SPA host, OHIF viewer origin (spec §2.1, §3, §9)
-After=network-online.target
+Description=Caddy — TLS/authentication boundary and static application edge
+Wants=api.service orthanc.service ohif.service
+After=network-online.target api.service orthanc.service ohif.service
 
 [Container]
-Image=docker.io/library/caddy:2
+Image=docker.io/library/caddy@sha256:af5fdcd76f2db5e4e974ee92f96ee8c0fc3edb55bd4ba5032547cbf3f65e486d
+Pull=never
 ContainerName=caddy
-Network=meld-net.network
+Network=meld-edge.network
 Volume=caddy-data.volume:/data
-Volume=%h/.config/meld7t/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
-# Built SPA shell bundle (`just web-build` → platform/web/dist); Caddy serves it at / (§9.4).
-Volume=%h/meld7t/platform/web/dist:/srv/spa:ro,z
-# Bound to all interfaces (0.0.0.0) so the demo is reachable across the intranet/home LAN.
-# 9443 = shell + API; 9444 = OHIF viewer origin. HTTP catch-all (see Caddyfile; HTTPS is the
-# documented production hardening). Open these ports in the host firewall for remote devices.
+Volume=%h/.config/meld7t/current/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
+Volume=%h/.config/meld7t/current/caddy/auth:/etc/caddy/auth:ro,z
+Volume=%h/.config/meld7t/current/tls:/etc/caddy/tls:ro,z
+Volume=%h/.local/lib/meld7t/current/platform/web/dist:/srv/spa:ro,z
+EnvironmentFile=%h/.config/meld7t/current/env/caddy.env
 PublishPort=9443:9443
 PublishPort=9444:9444
+ReadOnly=true
+Tmpfs=/config:rw,noexec,nosuid,nodev,size=16m
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m
 NoNewPrivileges=true
+DropCapability=all
+PidsLimit=256
+HealthCmd=caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=10s
+HealthRetries=3
+HealthOnFailure=kill
+Notify=healthy
+LogDriver=journald
 
 [Service]
 Restart=always
+RestartSec=10
+TimeoutStartSec=90
+TimeoutStopSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=10
+MemoryHigh=512M
+MemoryMax=1G
+TasksMax=512
+CPUWeight=100
 
 [Install]
 WantedBy=default.target

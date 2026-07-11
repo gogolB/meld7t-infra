@@ -4,31 +4,31 @@ import { api } from "../api.js";
 import { Badge, useAsync, ErrorBox } from "../components.jsx";
 
 export default function Dashboard() {
-  const sys = useAsync(() => api.system(), [], 4000);
-  const q = useAsync(() => api.queue(), [], 4000);
-  const cases = useAsync(() => api.listCases(), [], 6000);
-  const audit = useAsync(() => api.auditVerify(), []);
+  const sys = useAsync(() => api.system(), [], 15000);
+  const q = useAsync(() => api.queue(), [], 15000);
+  const cases = useAsync(() => api.listCases(), [], 60000);
 
   return (
     <div>
       <h1>Dashboard</h1>
-      <p className="muted">Live status of cases, the GPU queue, and the audit ledger.</p>
+      <p className="muted">Live status of cases, compute work, and durable service handoffs.</p>
       <ErrorBox error={sys.error} />
 
       <div className="tiles">
         <div className="tile"><b>{sys.data?.cases ?? "–"}</b>cases</div>
         <div className="tile"><b>{sys.data?.runs?.total ?? "–"}</b>runs</div>
         <div className="tile">
-          <b className={q.data?.in_use_run ? "" : "muted"}>{q.data?.in_use_run ? "busy" : "idle"}</b>
+          <b className={q.data?.busy ? "" : "muted"}>{q.data?.busy ? "busy" : "idle"}</b>
           GPU {q.data?.paused ? "(paused)" : ""}
         </div>
         <div className="tile">
-          <b className={audit.data?.ok ? "ok-chip" : ""}>{audit.data ? (audit.data.ok ? "✓" : "✗") : "–"}</b>
-          audit chain {audit.data ? `(${audit.data.count})` : ""}
+          <b className={sys.data?.outbox_pending ? "" : "ok-chip"}>
+            {sys.data?.outbox_pending ?? "–"}</b>
+          durable handoffs pending
         </div>
       </div>
 
-      <h2>GPU queue (serialized — one job at a time)</h2>
+      <h2>Compute queue (GPU work is serialized; CPU work may run alongside it)</h2>
       <div className="panel">
         {q.data?.active?.length ? (
           <table>

@@ -7,10 +7,14 @@ export default function CaseView() {
   const { id } = useParams();
   const c = useAsync(() => api.getCase(id), [id]);
   const series = useAsync(() => api.listSeries(id), [id]);
-  const runs = useAsync(() => api.listRuns(id), [id], 4000);
+  const harmo = useAsync(() => api.harmonizationCandidates(id), [id]);
+  const runs = useAsync(() => api.listRuns(id), [id], 15000);
   const [recipe, setRecipe] = useState(null);
   const [roles, setRoles] = useState({});
   const [workup, setWorkup] = useState("fcd");
+  const [profileSelections, setProfileSelections] = useState({});
+  const [allowUnharmonized, setAllowUnharmonized] = useState(false);
+  const [unharmonizedReason, setUnharmonizedReason] = useState("");
   const [err, setErr] = useState(null);
 
   const roleFor = (s) => roles[s.orthanc_series_uid] ?? s.confirmed_role ?? s.proposed_role;
@@ -19,10 +23,28 @@ export default function CaseView() {
   const sync = wrap(async () => { await api.syncSeries(id); series.reload(); });
   const confirm = wrap(async () => {
     const payload = {}; (series.data || []).forEach((s) => { payload[s.orthanc_series_uid] = roleFor(s); });
-    await api.confirmSeries(id, payload); series.reload(); c.reload();
+    await api.confirmSeries(id, payload); series.reload(); harmo.reload(); c.reload();
   });
-  const build = wrap(async () => { setRecipe(await api.buildRecipe(id, workup)); c.reload(); });
+  const build = wrap(async () => {
+    setRecipe(await api.buildRecipe(id, workup, {
+      allow_unharmonized: allowUnharmonized,
+      unharmonized_reason: allowUnharmonized ? unharmonizedReason : null,
+    }));
+    c.reload();
+  });
   const run = wrap(async () => { await api.confirmRecipe(id); runs.reload(); c.reload(); setRecipe(null); });
+  const assign = (target) => wrap(async () => {
+    const key = `${target.detector_id}:${target.source_series_uid}`;
+    const profileId = profileSelections[key] ||
+      (!target.ambiguous_top ? target.candidates?.[0]?.profile?.id : null);
+    if (!profileId) throw new Error("No active profile matches this scanner/protocol target");
+    await api.assignHarmonization(id, {
+      profile_id: profileId,
+      detector_id: target.detector_id,
+      source_series_uid: target.source_series_uid,
+    });
+    harmo.reload(); c.reload();
+  });
 
   return (
     <div>
@@ -65,7 +87,67 @@ export default function CaseView() {
         </div>
       </div>
 
-      <h2>2 · Recipe <span className="muted">(detectors × sources, §25.1)</span></h2>
+      <h2>2 · Harmonization <span className="muted">(scanner + protocol → versioned profile)</span></h2>
+      <div className="panel">
+        <ErrorBox error={harmo.error} />
+        <p className="muted">Profiles are proposed from minimized, protected scanner/protocol
+          metadata. A researcher confirms each detector/source assignment; the worker verifies
+          artifact hashes again.</p>
+        {harmo.data?.targets?.length ? (
+          <table>
+            <thead><tr><th>Detector</th><th>Source</th><th>Fingerprint</th><th>Profile</th><th></th></tr></thead>
+            <tbody>{harmo.data.targets.map((target) => {
+              const key = `${target.detector_id}:${target.source_series_uid}`;
+              const assigned = target.assignment?.status === "confirmed" &&
+                !target.assignment?.stale;
+              return (
+                <tr key={key}>
+                  <td className="detector">{target.detector_id}</td>
+                  <td>{target.source_role}<br /><span className="muted">{target.source_series_uid}</span></td>
+                  <td className="muted">{target.fingerprint?.slice(0, 12) || "missing"}</td>
+                  <td>{assigned ? <span className="ok-chip">✓ confirmed</span> : (
+                    target.candidates?.length ? <select
+                      value={profileSelections[key] ||
+                        (target.ambiguous_top ? "" : target.candidates[0].profile.id)}
+                      onChange={(e) => setProfileSelections({ ...profileSelections, [key]: e.target.value })}>
+                      {target.ambiguous_top && <option value="">Choose explicitly…</option>}
+                      {target.candidates.map((candidate) => <option key={candidate.profile.id}
+                        value={candidate.profile.id}>{candidate.profile.code} v{candidate.profile.version}
+                        {` (score ${candidate.score})`}</option>)}
+                      </select> : <span className="err">No matching active profile</span>
+                  )}
+                    {target.ambiguous_top && !assigned && <div className="err">
+                      Equal-scoring profiles require an explicit selection.</div>}
+                    <details className="muted" style={{ marginTop: 6 }}>
+                      <summary>Match evidence</summary>
+                      <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify({
+                        candidates: target.candidates?.map((candidate) => ({
+                          code: candidate.profile.code,
+                          version: candidate.profile.version,
+                          score: candidate.score,
+                          reasons: candidate.reasons,
+                        })),
+                      }, null, 2)}</pre>
+                    </details>
+                  </td>
+                  <td>{!assigned && target.candidates?.length > 0 &&
+                    <button className="btn ghost" onClick={assign(target)}>Confirm profile</button>}</td>
+                </tr>
+              );
+            })}</tbody>
+          </table>
+        ) : <span className="muted">Confirm series roles to calculate profile candidates.</span>}
+        <div style={{ marginTop: 14 }}>
+          <label><input type="checkbox" checked={allowUnharmonized}
+            onChange={(e) => setAllowUnharmonized(e.target.checked)} /> Allow an explicitly
+            unharmonized exploratory run</label>
+          {allowUnharmonized && <input value={unharmonizedReason}
+            onChange={(e) => setUnharmonizedReason(e.target.value)}
+            placeholder="Research rationale (minimum 10 characters)" />}
+        </div>
+      </div>
+
+      <h2>3 · Recipe <span className="muted">(detectors × exact sources)</span></h2>
       <div className="panel">
         <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 10 }}>
           <div>
@@ -74,13 +156,17 @@ export default function CaseView() {
               {WORKUPS.map((w) => <option key={w} value={w}>{w.toUpperCase()}</option>)}
             </select>
           </div>
-          <button className="btn ghost" onClick={build}>Build recipe</button>
-          {recipe && <button className="btn" onClick={run}>Confirm &amp; run →</button>}
+          <button className="btn ghost" disabled={allowUnharmonized && unharmonizedReason.trim().length < 10}
+            onClick={build}>Build recipe</button>
+          {recipe && <button className="btn" disabled={recipe.summary.blocked > 0}
+            onClick={run}>Confirm &amp; run →</button>}
         </div>
         {recipe && (
           <>
             <p className="muted">
               Will run <b>{recipe.summary.will_run}</b>, pending <b>{recipe.summary.pending}</b>
+              {recipe.summary.blocked > 0 && <> · <span style={{ color: "var(--bad)" }}>
+                blocked <b>{recipe.summary.blocked}</b> (resolve before confirmation)</span></>}
               {recipe.summary.tandem && <> · <span className="badge b-built">tandem</span></>}
             </p>
             <table>
@@ -100,7 +186,7 @@ export default function CaseView() {
         )}
       </div>
 
-      <h2>3 · Runs</h2>
+      <h2>4 · Runs</h2>
       <div className="panel">
         <table>
           <thead><tr><th>Detector</th><th>Source</th><th>Status</th><th></th></tr></thead>

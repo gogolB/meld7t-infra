@@ -1,11 +1,12 @@
 [Unit]
-Description=meld-net — shared podman network for long-running services (spec §2)
+Description=meld-compute — isolated ephemeral packaging network
 
 [Network]
-# MVP topology: one user-defined network shared by all long-running services (§2).
-# §27 hardening will later split this into edge / app / data microsegmentation zones;
-# containers reference it as `Network=meld-net.network`, so that split is a drop-in change.
 NetworkName=meld-net
+Driver=bridge
+Internal=true
+Subnet=10.89.30.0/24
+Options=isolate=true
 
 [Install]
 WantedBy=default.target

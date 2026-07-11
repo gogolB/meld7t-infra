@@ -1,37 +1,36 @@
-# Pinned pipeline images — the source of truth for the software environment.
-# Update after a build/pull, then keep in sync via `just freeze`.
+# MELD 7T production image lock.
 #
-# Format:  <role>    <registry/repo@sha256:DIGEST | local image id>
+# Machine-readable format (exactly two whitespace-separated fields):
+#   <role> <fully-qualified-repository>@sha256:<manifest-digest>
+#
+# `ops/release/image-lock.sh validate` rejects tags, duplicate roles, malformed digests, and
+# REQUIRED_* placeholders.  A placeholder deliberately blocks release export: rebuild that image
+# from the current committed source, inspect its repository manifest digest, and replace the whole
+# placeholder token before signing an air-gap bundle.  Never substitute an image/config ID for a
+# repository manifest digest.
 
-# MELD Graph v2.2.5 GPU — validated end-to-end on real 7T data (FCD pipeline, --fastsurfer).
-meld_graph   docker.io/meldproject/meld_graph@sha256:e2333882ecf984ffac63970aebf7702deea8b979a3a1e508231d06c07cefd664
+# Scientific/runtime images.
+meld_graph docker.io/meldproject/meld_graph@sha256:e2333882ecf984ffac63970aebf7702deea8b979a3a1e508231d06c07cefd664
+spm docker.io/spmcentral/spm@sha256:46e4df84f8b5bd7698fda250e96504719db27f0c117c702e62817f8558327522
+hippunfold docker.io/khanlab/hippunfold@sha256:b14d6593839d09de56c21c585df2c02fe78e045d53f445f9d52727dd766a408a
 
-# pkg (spec §2.2) — DICOM->NIfTI (dcm2niix) + MP2RAGE O'Brien clean. Built from containers/pkg/
-# on the dev machine; base = python:3.13-slim. Locally built (no repo digest until pushed to the
-# internal registry) — record the image id; re-pin after `podman push` to registry:5000.
-pkg          localhost/meld7t/pkg:0.3.3   sha256:9c2710c31353162f4104c777fb73988d3f9116cb795eb1dc6e599a89e190173f
-#   base:      docker.io/library/python@sha256:af5bd286051a06b38587d30a8638958f4a2f38381aa80fe859c740af3411bd4d
-#   pins:      dcm2niix 1.0.20241211 (debian) · nibabel 5.4.2 · numpy 2.5.1 · scipy 1.18.0
-#   0.2.0:     + highdicom 0.24.0 + dicomweb-client 0.59.3 (DICOM-SEG packaging + STOW, §17)
-#   0.3.0:     + series_classify.py (header-based DICOM classification, §16)
-#   0.3.1:     + hippunfold_summarize.py (subfield volumes + L/R asymmetry, §25.5; multihist7
-#              vs tissue label schemes handled; validated on real subject → AI −4.69%, symmetric)
-#   0.3.2:     + map_morphometry.py (MAP07 junction/extension + asymmetry z, §25.4; validated on
-#              real subject → 3 single-subject candidates. Normative z-score seam ready.)
-#   0.3.3:     recon_prepare glob.escape fix — series dirs with [brackets] (anonymized exports)
+# These two source trees are changing in this hardening release.  Rebuild after all source changes
+# are committed; do not reuse the older local images whose manifests do not contain this code.
+pkg REQUIRED_REBUILD_CURRENT_SOURCE
+api REQUIRED_REBUILD_CURRENT_SOURCE
 
-# SPM12 Standalone r7771 + MATLAB MCR v97 (R2019b) — MAP detector engine (§25.4). Stock image
-# (like meld_graph/hippunfold); the worker mounts containers/map/segment.m and runs `spm12 script`.
-spm          docker.io/spmcentral/spm@sha256:46e4df84f8b5bd7698fda250e96504719db27f0c117c702e62817f8558327522
+# Long-running service images.
+postgres docker.io/library/postgres@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+redis docker.io/library/redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+orthanc docker.io/orthancteam/orthanc@sha256:57a3d037729897331027ddc00c12695b50f1effbbf805f855396f3d0248d2d5f
+immudb docker.io/codenotary/immudb@sha256:ca64fd851b3e60a43115e79f71c4830935f5652e0692628fc80a475c417743a7
+ohif docker.io/ohif/app@sha256:f130db413d37d829e0c98fa49505884343e53e8d6ec72940d44327e917304913
+caddy docker.io/library/caddy@sha256:af5fdcd76f2db5e4e974ee92f96ee8c0fc3edb55bd4ba5032547cbf3f65e486d
+registry docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 
-# api (spec §5) — FastAPI orchestration. Built from platform/api/ on the dev machine.
-api          localhost/meld7t/api:0.1.3   sha256:a8616e8525bd3ef30add6410009f90f2eda9c41ab10fa421302767736ab56470
-#   0.1.1:     HippUnfold detector flipped to "built" (recipe auto-includes HS; §25.5)
-#   0.1.2:     MAP detector flipped to "built" (recipe auto-includes MAP; §25.4)
-#   0.1.3:     audit append serialization (advisory lock) — fixes concurrent-write chain fork
-
-# --- Long-running service images (off-the-shelf; §2.1, §9) ---
-immudb       docker.io/codenotary/immudb@sha256:ca64fd851b3e60a43115e79f71c4830935f5652e0692628fc80a475c417743a7
-ohif         docker.io/ohif/app@sha256:f130db413d37d829e0c98fa49505884343e53e8d6ec72940d44327e917304913
-caddy        docker.io/library/caddy@sha256:98eb57d882ccd5213d1688764db10c1ca2c58a1ca3a6717a3411ad798f7a423a
-# postgres:16 · redis:7-alpine · orthancteam/orthanc:24.7.3 · registry:2 — re-pin via `just freeze`.
+# Offline build/dev inputs.  They are archived only when the export command requests build assets;
+# production runtime validation does not require them.
+python_base docker.io/library/python@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
+node_builder docker.io/library/node@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
+cuda_smoke docker.io/nvidia/cuda@sha256:0f6bfcbf267e65123bcc2287e2153dedfc0f24772fb5ce84afe16ac4b2fada95
+meld_dev registry.fedoraproject.org/fedora-toolbox@sha256:f94669859d5b9ff10f354bfe034cc3db3ee0d841a7b3ae7688da907c3c012d32

@@ -1,0 +1,4 @@
+# BRING-UP ONLY. `allow` is valid only for identities whose roles include reviewer or admin.
+clinical "allow"
+meld-admin "allow"
+meld-auditor "deny"

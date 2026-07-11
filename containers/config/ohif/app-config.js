@@ -7,7 +7,7 @@ window.config = {
   extensions: [],
   modes: [],
   customizationService: {},
-  showStudyList: true,
+  showStudyList: false,
   maxNumberOfWebWorkers: 3,
   showCPUFallbackMessage: true,
   showLoadingIndicator: true,

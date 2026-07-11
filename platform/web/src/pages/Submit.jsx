@@ -7,7 +7,7 @@ export default function Submit() {
   const nav = useNavigate();
   const [pseudonym, setPseudonym] = useState("");
   const [studyUid, setStudyUid] = useState("");
-  const [dicomPath, setDicomPath] = useState("");
+  const [assignedSubject, setAssignedSubject] = useState("");
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -18,7 +18,7 @@ export default function Submit() {
       const c = await api.createCase({
         pseudonym,
         orthanc_study_uid: studyUid || null,
-        dicom_path: dicomPath || null,
+        assigned_subject: assignedSubject || null,
       });
       nav(`/cases/${c.id}`);
     } catch (e) { setErr(e.message); setBusy(false); }
@@ -26,8 +26,9 @@ export default function Submit() {
 
   return (
     <div>
-      <h1>Submit a study</h1>
-      <p className="muted">Create a case, then confirm which series is which and choose the workup.</p>
+      <h1>Approved study intake</h1>
+      <p className="muted">Administrator-only in server mode. Create a case from a study already
+        approved in the dedicated research Orthanc, then hand it to a named researcher.</p>
       <form className="panel grow" style={{ maxWidth: 560 }} onSubmit={submit}>
         <ErrorBox error={err} />
         <label>Pseudonym *</label>
@@ -36,9 +37,11 @@ export default function Submit() {
         <label>Orthanc study UID (if already ingested — enables series sync)</label>
         <input value={studyUid} onChange={(e) => setStudyUid(e.target.value)}
                placeholder="1.2.840…" />
-        <label>Local DICOM staging path (worker input, single-box demo)</label>
-        <input value={dicomPath} onChange={(e) => setDicomPath(e.target.value)}
-               placeholder="/var/home/bazzite/meld7t/data/raw/subject 1 clean/DICOM" />
+        <label>Assigned institutional subject (optional)</label>
+        <input value={assignedSubject} onChange={(e) => setAssignedSubject(e.target.value)}
+               placeholder="researcher@example.org" />
+        <p className="muted">Local filesystem paths are never accepted by the browser. Offline
+          staging is performed by the authenticated ingest service or an operator runbook.</p>
         <div style={{ marginTop: 16 }}>
           <button className="btn" disabled={busy || !pseudonym}>{busy ? "Creating…" : "Create case"}</button>
         </div>

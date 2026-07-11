@@ -16,18 +16,22 @@ export default function MDT() {
         {d?.case && <Badge status={d.case.status} />}
         <Link to={`/cases/${id}`} className="muted" style={{ marginLeft: "auto" }}>edit case →</Link>
       </div>
-      <p className="muted">Workup {d?.case?.workup?.toUpperCase() || "–"} · presentable case summary for conference.
-        <b> Research / hypothesis-generating — not diagnostic; the reviewer read is the record.</b></p>
+      <p className="muted">Workup {d?.case?.workup?.toUpperCase() || "–"} · research conference summary.
+        <b> Research use only — not for diagnosis or treatment.</b></p>
       <ErrorBox error={s.error} />
 
-      <h2>Detector concordance <span className="muted">(§25.6)</span></h2>
+      <h2>Research evidence overlap <span className="muted">(distinct detector families + spatial key)</span></h2>
       <div className="panel">
         {conc && (
           <p>
             <b>{conc.detectors_with_findings}</b> detector run(s) with findings ·{" "}
-            {conc.concordant_regions > 0
-              ? <span className="ok-chip">{conc.concordant_regions} concordant region(s) — a strong surgical signal</span>
-              : <span style={{ color: "var(--warn)", fontWeight: 600 }}>0 concordant regions — findings DISCORDANT across sources (adjudicate carefully)</span>}
+            {!conc.spatial_concordance_available
+              ? <span style={{ color: "var(--warn)", fontWeight: 600 }}>
+                Spatial concordance unavailable: fewer than two harmonized detector integrations
+                emit a common spatial key.</span>
+              : conc.concordant_regions > 0
+              ? <span className="ok-chip">{conc.concordant_regions} spatially overlapping research finding(s)</span>
+              : <span style={{ color: "var(--warn)", fontWeight: 600 }}>0 eligible spatial overlaps; coarse text labels are not treated as concordance</span>}
           </p>
         )}
         {conc?.regions?.length ? (
@@ -36,7 +40,7 @@ export default function MDT() {
               <tr>
                 <th>Flagged region</th>
                 {conc.runs.map((r) => <th key={r.run_id}>{r.detector}·{r.source_role || "?"}</th>)}
-                <th>Concordant</th>
+                <th>Eligible overlap</th>
               </tr>
             </thead>
             <tbody>
@@ -48,7 +52,7 @@ export default function MDT() {
                       ? <span className="pill">conf {rg.by_run[r.run_id]}</span>
                       : <span className="muted">–</span>}</td>
                   ))}
-                  <td>{rg.concordant ? <span className="ok-chip">✓ concordant</span> : <span className="muted">single source</span>}</td>
+                  <td>{rg.concordant ? <span className="ok-chip">✓ distinct-detector overlap</span> : <span className="muted">not established</span>}</td>
                 </tr>
               ))}
             </tbody>
@@ -63,7 +67,7 @@ export default function MDT() {
             <span className="detector" style={{ fontSize: 15 }}>{rr.run.detector_id}</span>
             <span className="pill">{rr.run.source_role || "–"}</span>
             <Badge status={rr.run.status} />
-            {rr.result?.report_path &&
+            {rr.result?.has_report &&
               <a className="btn ghost" href={`/api/runs/${rr.run.id}/report`} target="_blank" rel="noreferrer"
                  style={{ marginLeft: "auto" }}>MELD PDF ↗</a>}
             <Link className="btn ghost" to={`/runs/${rr.run.id}/review`}>Open in viewer →</Link>
@@ -71,7 +75,14 @@ export default function MDT() {
 
           {rr.clusters?.length ? (
             <p className="muted" style={{ margin: "8px 0" }}>
-              {rr.clusters.map((c) => `#${c.index} ${c.hemi} ${c.location} (size ${c.size}, conf ${c.confidence})`).join(" · ")}
+              {rr.clusters.map((c) => {
+                const metrics = rr.result?.metric_schema || {};
+                return `#${c.index} ${c.hemi} ${c.location} (` +
+                  `${metrics.size?.label || "detector size"} ${c.size}` +
+                  `${metrics.size?.unit ? ` ${metrics.size.unit}` : ""}, ` +
+                  `${metrics.confidence?.label || "detector score"} ${c.confidence}` +
+                  `${metrics.confidence?.unit ? ` ${metrics.confidence.unit}` : ""})`;
+              }).join(" · ")}
             </p>
           ) : <p className="muted">No clusters above operating point.</p>}
 

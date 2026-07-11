@@ -17,6 +17,7 @@ import pathlib
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -41,6 +42,7 @@ pytestmark = pytest.mark.skipif(
     not E2E, reason="local live-stack E2E — run via `just e2e` (needs services + a detector image)")
 
 sys.path[:0] = [str(REPO / "platform" / "api"), str(REPO / "platform" / "worker")]
+sys.path.insert(0, str(REPO / "containers" / "pkg"))
 
 
 def _dicom_available() -> bool:
@@ -55,6 +57,7 @@ def _spawn_worker() -> subprocess.Popen:
     arq = os.path.join(os.path.dirname(sys.executable), "arq")
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{REPO}/platform/api:{REPO}/platform/worker"
+    env["MELD7T_DICOM_IMPORT_ROOT"] = os.path.realpath(DICOM)
     return subprocess.Popen([arq, "worker.tasks.WorkerSettings"], cwd=str(REPO), env=env)
 
 
@@ -71,38 +74,74 @@ def test_submit_brain_spawns_worker_produces_result():
     from app import models
     from app.config import settings
     from app.db import engine
-    from app.models import (Case, CaseStatus, Cluster, DetectorId, Recipe, Result, Run,
+    from app.models import (Case, CaseStatus, Cluster, DetectorId, Provenance, Recipe, Result, Run,
                             RunStatus, Series, SeriesRole, Workup)
-    from app.recipe import build_recipe
+    from app.recipe import build_recipe, spec_hash
+    from app.workflow import logical_run_key, run_input_contract_hash
+    from recon_prepare import discover
 
-    uid = "e2e-uni"
-    # 1) a case on the brain, with a confirmed T1 (UNI) series — the submit step.
+    discovered = discover(DICOM)
+    confirmed = {uid: item["role"] for uid, item in discovered.items()
+                 if item["role"] != SeriesRole.unknown.value}
+    assert confirmed, "pilot DICOM contains no classifiable research series"
+    # 1) a case with exact, real DICOM UIDs and confirmed roles — the submit step.
     with Session(engine) as s:
-        case = Case(pseudonym="E2E-LOCAL", dicom_path=DICOM, status=CaseStatus.series_confirmed)
+        case = Case(pseudonym="E2E-LOCAL", created_by="e2e", dicom_path=DICOM,
+                    status=CaseStatus.series_confirmed)
         s.add(case)
         s.commit()
         s.refresh(case)
         cid = case.id
-        s.add(Series(case_id=cid, orthanc_series_uid=uid, series_description="E2E UNI",
-                     proposed_role=SeriesRole.t1_uni, confirmed_role=SeriesRole.t1_uni))
+        for uid, role in confirmed.items():
+            s.add(Series(
+                case_id=cid, orthanc_series_uid=uid,
+                series_description=discovered[uid]["tags"].get("description"),
+                proposed_role=SeriesRole(role), confirmed_role=SeriesRole(role),
+                instance_count=discovered[uid]["tags"]["instance_count"],
+            ))
         s.commit()
 
     # 2) build the recipe and materialise the one target run (like recipe/confirm does).
-    entries = build_recipe(Workup.both, {uid: SeriesRole.t1_uni.value})
+    entries = build_recipe(Workup.both, confirmed, require_harmonization=False,
+                           unharmonized_reason="local end-to-end test")
     target = [e for e in entries if e["detector_id"] == DETECTOR and e["status"] == "created"]
     assert target, f"recipe did not schedule a '{DETECTOR}' run (is it built?)"
+    target = target[0]
     with Session(engine) as s:
-        recipe = Recipe(case_id=cid, workup=Workup.both, spec=entries)
+        recipe = Recipe(
+            case_id=cid, workup=Workup.both, spec=entries,
+            spec_hash=spec_hash(entries), confirmed_at=datetime.now(timezone.utc),
+        )
         s.add(recipe)
         s.commit()
         s.refresh(recipe)
+        logical_key = logical_run_key(recipe.id, target["entry_id"])
+        input_hash = run_input_contract_hash(
+            recipe_id=recipe.id, recipe_spec_hash=recipe.spec_hash,
+            logical_key=logical_key, detector_id=DETECTOR,
+            source_role=target["source_role"],
+            source_series_uid=target["source_series_uid"], params=target["params"],
+        )
         run = Run(case_id=cid, recipe_id=recipe.id, detector_id=DetectorId(DETECTOR),
-                  source_role=SeriesRole.t1_uni, source_series_uid=uid,
-                  status=RunStatus.queued, params={})
+                  source_role=SeriesRole(target["source_role"]),
+                  source_series_uid=target["source_series_uid"],
+                  logical_key=logical_key, status=RunStatus.queued, params=target["params"],
+                  execution_contract={"schema_version": 2,
+                                      "input_contract_sha256": input_hash})
         s.add(run)
         s.commit()
         s.refresh(run)
         rid = run.id
+        case = s.get(Case, cid)
+        case.status = CaseStatus.queued
+        s.add(case)
+        s.add(Provenance(
+            run_id=rid, params=target["params"],
+            input_series_uid=target["source_series_uid"],
+            harmonization=target["params"].get("harmonization"),
+            release_manifest_digest=settings.release_manifest_digest,
+        ))
+        s.commit()
 
     # 3) enqueue it on the real queue.
     async def _enqueue():
@@ -138,5 +177,9 @@ def test_submit_brain_spawns_worker_produces_result():
         assert run.detector_version                       # and stamped the detector version
         result = s.exec(select(Result).where(Result.run_id == rid)).first()
         assert result is not None, "no Result row written"
+        assert result.output_manifest and result.output_manifest["files"]
         clusters = s.exec(select(Cluster).where(Cluster.result_id == result.id)).all()
         assert result.n_clusters == len(clusters)         # bookkeeping matches the rows
+        provenance = s.exec(select(Provenance).where(Provenance.run_id == rid)).one()
+        assert provenance.source_manifest and provenance.recon_provenance
+        assert provenance.harmonization["mode"] == "unharmonized"

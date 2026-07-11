@@ -7,14 +7,23 @@
 
   "HttpPort": 8042,
   "HttpTimeout": 60,
+  "HttpDescribeErrors": false,
+  "HttpCompressionEnabled": true,
+  "KeepAlive": true,
 
-  "// access": "Not published; reachable only by Caddy + the worker on meld-net. Auth is",
-  "// access2": "enforced at the API/proxy tier (§4), so Orthanc's own auth is disabled here.",
+  "// access": "Caddy, API, and worker use one rotated internal service credential. Browser users",
+  "// access2": "authenticate separately at Caddy and never receive the Orthanc credential.",
   "RemoteAccessAllowed": true,
-  "AuthenticationEnabled": false,
+  "AuthenticationEnabled": true,
+  "SslEnabled": false,
 
   "// dicom-scp": "C-STORE listener is out of MVP scope (§23); enable + publish 4242 later.",
   "DicomServerEnabled": false,
+
+  "// durability": "Storage is quiesced and backed up together with its PostgreSQL index.",
+  "StorageCompression": true,
+  "SaveJobs": true,
+  "StableAge": 10,
 
   "PostgreSQL": {
     "EnableIndex": true,

@@ -10,12 +10,13 @@ dependencies = [
     "psycopg[binary]==3.2.3",
     "pydantic-settings==2.7.1",
     "dicomweb-client==0.59.3",
-    "immudb-py==1.4.0",
+    "requests==2.34.2",
+    "immudb-py==1.5.0",
     # `app` package (models/db/config/detectors/audit) is provided on PYTHONPATH from ../api
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==8.3.4"]
+dev = ["pytest==9.1.1"]
 
 [build-system]
 requires = ["hatchling"]

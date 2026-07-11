@@ -3,9 +3,10 @@ import { api } from "../api.js";
 import { useAsync, ErrorBox } from "../components.jsx";
 
 export default function Admin() {
-  const sys = useAsync(() => api.system(), [], 4000);
-  const q = useAsync(() => api.queue(), [], 4000);
+  const sys = useAsync(() => api.system(), [], 15000);
+  const q = useAsync(() => api.queue(), [], 15000);
   const audit = useAsync(() => api.auditVerify(), []);
+  const profiles = useAsync(() => api.harmonizationProfiles(""), []);
 
   const detectors = sys.data?.detectors || {};
   const byStatus = sys.data?.runs?.by_status || {};
@@ -28,8 +29,11 @@ export default function Admin() {
         <div className="panel grow">
           <h2>Audit ledger (immudb)</h2>
           <p>{audit.data
-            ? (audit.data.ok ? <span className="ok-chip">✓ hash chain intact ({audit.data.count} records)</span>
-               : <span className="err">✗ chain broken at #{audit.data.broken_at}</span>)
+            ? (audit.data.fully_verified
+              ? <span className="ok-chip">✓ PostgreSQL chain + immudb proofs verified ({audit.data.count} records)</span>
+              : audit.data.ok
+                ? <span style={{ color: "var(--warn)", fontWeight: 600 }}>Local chain intact; immutable mirror incomplete ({audit.data.count} records)</span>
+                : <span className="err">✗ audit verification failed at #{audit.data.broken_at ?? "ledger"}</span>)
             : "…"}</p>
         </div>
       </div>
@@ -54,6 +58,28 @@ export default function Admin() {
             ))}</tbody>
           </table>
         </div>
+      </div>
+
+      <div className="panel">
+        <h2>Harmonization profiles</h2>
+        <p className="muted">Profile artifacts are created and transferred through the signed
+          offline release workflow. One administrator independently validates the signed scientific
+          evidence and hashes; a second administrator activates the profile.</p>
+        <ErrorBox error={profiles.error} />
+        <table>
+          <thead><tr><th>Code</th><th>Version</th><th>Detector</th><th>Method</th><th>Status</th><th></th></tr></thead>
+          <tbody>{(profiles.data || []).map((p) => (
+            <tr key={p.id}><td>{p.code}</td><td>{p.version}</td><td>{p.detector_id || "generic"}</td>
+              <td>{p.method}</td><td><span className="pill">{p.status}</span></td>
+              <td>{p.status === "draft" ? <button className="btn ghost"
+                onClick={() => api.validateHarmonizationProfile(p.id).then(profiles.reload)}>Independently validate</button>
+                : p.status === "validated" ? <button className="btn ghost"
+                  onClick={() => api.activateHarmonizationProfile(p.id).then(profiles.reload)}>Activate (second admin)</button>
+                : p.status === "active" ? <button className="btn ghost"
+                  onClick={() => api.retireHarmonizationProfile(p.id).then(profiles.reload)}>Retire</button> : null}</td>
+            </tr>
+          ))}</tbody>
+        </table>
       </div>
     </div>
   );

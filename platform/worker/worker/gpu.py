@@ -11,41 +11,49 @@ from __future__ import annotations
 import asyncio
 import subprocess
 
+from arq import Retry
+
 from .config import wsettings
 
-# TTL > Arq job_timeout (4 h): a crashed holder's lock self-heals, but a live job is killed by the
-# timeout long before its lock could expire — so two GPU jobs can never overlap in normal operation.
-_LOCK_TTL_S = 5 * 60 * 60
 _POLL_S = 2.0
+_COMPARE_DELETE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 async def wait_if_paused(redis) -> None:
-    """Block while an admin has paused the queue (§18)."""
-    while await redis.get(wsettings.queue_paused_key):
-        await asyncio.sleep(5)
+    """Defer queued work while paused without consuming its execution timeout."""
+    if await redis.get(wsettings.queue_paused_key):
+        raise Retry(defer=60)
 
 
 class gpu_lease:
     """Async context manager: a blocking single-holder GPU mutex (spec §18).
 
-    Acquire waits (polling `SET NX`) until the one GPU slot is free, then holds it — keyed to
-    run_id so the dashboard shows the current GPU holder. Release only clears the lock if we still
-    own it, so a successor that acquired after a TTL expiry is never clobbered."""
+    Acquire waits (polling `SET NX`) until the one GPU slot is free, then holds it. Ownership uses
+    both run ID and claim token, preventing an expired attempt from deleting a retry's lease."""
 
-    def __init__(self, redis, run_id: str) -> None:
+    def __init__(self, redis, run_id: str, claim_token: str) -> None:
         self.redis = redis
         self.run_id = run_id
+        self.owner = f"{run_id}:{claim_token}"
 
     async def __aenter__(self):
+        # Keep the lease beyond the configured detector hard timeout and cleanup grace. Deriving
+        # this from configuration prevents an operator-extended job from outliving a fixed lease.
+        lock_ttl_s = wsettings.subprocess_timeout_s + wsettings.subprocess_stop_grace_s + 15 * 60
         while not await self.redis.set(
-                wsettings.gpu_lock_key, self.run_id, nx=True, ex=_LOCK_TTL_S):
+                wsettings.gpu_lock_key, self.owner, nx=True, ex=lock_ttl_s):
             await asyncio.sleep(_POLL_S)
         return self
 
     async def __aexit__(self, *exc):
-        cur = await self.redis.get(wsettings.gpu_lock_key)
-        if cur is not None and (cur.decode() if isinstance(cur, bytes) else cur) == self.run_id:
-            await self.redis.delete(wsettings.gpu_lock_key)
+        # One server-side operation: a TTL expiry/successor acquisition cannot occur between the
+        # ownership comparison and delete.
+        await self.redis.eval(_COMPARE_DELETE, 1, wsettings.gpu_lock_key, self.owner)
 
 
 def gpu_status() -> dict:

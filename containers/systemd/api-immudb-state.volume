@@ -1,0 +1,8 @@
+[Unit]
+Description=Persistent, API-exclusive immudb verified root state
+
+[Volume]
+VolumeName=api-immudb-state
+
+[Install]
+WantedBy=default.target

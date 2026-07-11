@@ -14,6 +14,7 @@ Selection is propose-then-FAIL-loud, never silent-auto (§16). Override any role
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -45,14 +46,48 @@ def read_series_tags(series_dir: str) -> dict:
         return {"scanning_sequence": [], "image_type": [], "tr": 0.0, "te": 0.0,
                 "ti": None, "n_echoes": 1, "description": ""}
     ds = pydicom.dcmread(files[0], stop_before_pixels=True)
+    series_uid = str(ds.get("SeriesInstanceUID", "") or "")
+    study_uid = str(ds.get("StudyInstanceUID", "") or "")
+    patient = (str(ds.get("PatientID", "") or ""),
+               str(ds.get("IssuerOfPatientID", "") or ""),
+               str(ds.get("PatientName", "") or ""))
+    if not series_uid or not study_uid:
+        raise ValueError(f"DICOM series is missing Study/SeriesInstanceUID: {series_dir}")
     echoes = set()
-    for f in files[:40]:
+    pixel_scalings = set()
+    for f in files:
         try:
-            d = pydicom.dcmread(f, stop_before_pixels=True, specific_tags=["EchoTime"])
+            d = pydicom.dcmread(
+                f, stop_before_pixels=True,
+                specific_tags=["EchoTime", "StudyInstanceUID", "SeriesInstanceUID", "PatientID",
+                               "IssuerOfPatientID", "PatientName", "RescaleSlope",
+                               "RescaleIntercept", "BitsStored", "PixelRepresentation"],
+            )
+            identity = (str(d.get("PatientID", "") or ""),
+                        str(d.get("IssuerOfPatientID", "") or ""),
+                        str(d.get("PatientName", "") or ""))
+            if str(d.get("SeriesInstanceUID", "")) != series_uid:
+                raise ValueError(f"directory mixes SeriesInstanceUIDs: {series_dir}")
+            if str(d.get("StudyInstanceUID", "")) != study_uid or identity != patient:
+                raise ValueError(f"directory mixes study/patient identities: {series_dir}")
             if "EchoTime" in d and d.EchoTime not in (None, ""):
                 echoes.add(round(float(d.EchoTime), 2))
-        except Exception:
-            pass
+            pixel_scalings.add((
+                float(d.get("RescaleSlope", 1) or 1),
+                float(d.get("RescaleIntercept", 0) or 0),
+                int(d.get("BitsStored", 0) or 0),
+                int(d.get("PixelRepresentation", 0) or 0),
+            ))
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"could not validate DICOM header {f}: {exc}") from exc
+    if len(pixel_scalings) != 1:
+        raise ValueError(f"series contains inconsistent DICOM pixel scaling: {series_dir}")
+    slope, intercept, bits_stored, pixel_representation = next(iter(pixel_scalings))
+    if (not math.isfinite(slope) or not math.isfinite(intercept) or slope == 0
+            or bits_stored < 1 or bits_stored > 32 or pixel_representation not in {0, 1}):
+        raise ValueError(f"series contains invalid DICOM pixel scaling: {series_dir}")
     seq = ds.get("ScanningSequence", [])
     seq = [seq] if isinstance(seq, str) else list(seq or [])
     ti = ds.get("InversionTime", None)
@@ -64,6 +99,15 @@ def read_series_tags(series_dir: str) -> dict:
         "ti": float(ti) if ti not in (None, "") else None,
         "n_echoes": len(echoes) if echoes else 1,
         "description": str(ds.get("SeriesDescription", "")),
+        "study_uid": study_uid,
+        "series_uid": series_uid,
+        "instance_count": len(files),
+        "pixel_scaling": {
+            "rescale_slope": slope,
+            "rescale_intercept": intercept,
+            "bits_stored": bits_stored,
+            "pixel_representation": pixel_representation,
+        },
     }
 
 
@@ -75,17 +119,27 @@ def discover(root: str) -> dict:
             continue
         tags = read_series_tags(dirpath)
         role, reason = classify(tags)
-        out[os.path.basename(dirpath)] = {"path": dirpath, "role": role, "reason": reason,
-                                          "tags": tags}
+        uid = tags["series_uid"]
+        if uid in out:
+            raise ValueError(f"SeriesInstanceUID {uid} appears in more than one directory")
+        out[uid] = {"path": dirpath, "folder": os.path.basename(dirpath), "role": role,
+                    "reason": reason, "tags": tags}
     return out
 
 
-def select(role: str, series: dict, override: str | None) -> tuple[str, str]:
+def select(role: str, series: dict, override: str | None,
+           override_uid: str | None = None) -> tuple[str, str]:
     """Return (series_dir, reason) for a role. Header first, then name fallback, else fail loud."""
+    if override_uid:
+        if override_uid not in series:
+            sys.exit(f"ERROR: confirmed SeriesInstanceUID '{override_uid}' not found. "
+                     f"Available UIDs: {sorted(series)}")
+        return series[override_uid]["path"], f"confirmed SeriesInstanceUID → {override_uid}"
     if override:
-        if override not in series:
-            sys.exit(f"ERROR: --{role}-series '{override}' not found. Available: {sorted(series)}")
-        return series[override]["path"], f"operator override → {override}"
+        hits = [s for s in series.values() if s["folder"] == override]
+        if len(hits) != 1:
+            sys.exit(f"ERROR: --{role}-series '{override}' did not resolve exactly once")
+        return hits[0]["path"], f"operator folder override → {override}"
 
     # 1) header classification
     hits = [(n, s) for n, s in series.items() if s["role"] == role]
@@ -102,7 +156,7 @@ def select(role: str, series: dict, override: str | None) -> tuple[str, str]:
 
     # 2) name-pattern fallback
     rx = re.compile(NAME_PATTERNS.get(role, role), re.IGNORECASE)
-    named = sorted(n for n in series if rx.search(n))
+    named = sorted(uid for uid, s in series.items() if rx.search(s["folder"]))
     if len(named) == 1:
         return series[named[0]]["path"], f"name fallback /{rx.pattern}/ (header inconclusive)"
 
@@ -110,15 +164,20 @@ def select(role: str, series: dict, override: str | None) -> tuple[str, str]:
              f"Series: { {n: s['role'] for n, s in series.items()} }. Pass --{role}-series.")
 
 
-def dcm2niix_largest(series_dir, workdir, tag):
+def dcm2niix_single(series_dir, workdir, tag):
     sub = os.path.join(workdir, tag)
     os.makedirs(sub, exist_ok=True)
     subprocess.run(["dcm2niix", "-o", sub, "-f", "%d_%s", "-z", "y", series_dir],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                   check=True)
     niis = [os.path.join(sub, f) for f in os.listdir(sub) if f.endswith(".nii.gz")]
     if not niis:
         sys.exit(f"ERROR: dcm2niix produced no NIfTI for {series_dir}")
-    return max(niis, key=os.path.getsize)
+    if len(niis) != 1:
+        sys.exit(
+            f"ERROR: one confirmed DICOM series produced {len(niis)} NIfTI files; "
+            "refusing to choose silently"
+        )
+    return niis[0]
 
 
 def main():
@@ -131,43 +190,66 @@ def main():
     ap.add_argument("--also-t2", action="store_true", help="also emit sub-<id>_T2w (HippUnfold)")
     for role in ("uni", "inv1", "inv2", "mprage", "t2"):
         ap.add_argument(f"--{role}-series", default=None)
+        ap.add_argument(f"--{role}-series-uid", default=None,
+                        help=f"exact confirmed SeriesInstanceUID for {role}")
     a = ap.parse_args()
+    if re.fullmatch(r"sub-[A-Za-z0-9][A-Za-z0-9_-]{0,79}", a.subject) is None:
+        raise ValueError("--subject must be one safe BIDS subject identifier")
+    if not math.isfinite(a.beta_factor) or a.beta_factor <= 0:
+        raise ValueError("--beta-factor must be finite and positive")
 
     series = discover(a.dicom_root)
     if not series:
         sys.exit(f"ERROR: no DICOM series under {a.dicom_root}")
 
-    anat = os.path.join(a.out, a.subject, "anat")
+    subject_root = os.path.join(a.out, a.subject)
+    if os.path.exists(subject_root):
+        shutil.rmtree(subject_root)
+    anat = os.path.join(subject_root, "anat")
     os.makedirs(anat, exist_ok=True)
-    _v = subprocess.run(["dcm2niix", "--version"], capture_output=True, text=True)
+    _v = subprocess.run(["dcm2niix", "--version"], capture_output=True, text=True, check=True)
+    version_lines = (_v.stdout + _v.stderr).strip().splitlines()
+    if not version_lines:
+        raise RuntimeError("dcm2niix returned no version string")
     prov = {"source": a.source, "subject": a.subject,
-            "dcm2niix": (_v.stdout + _v.stderr).strip().splitlines()[-1],
+            "dcm2niix": version_lines[-1],
             "classified": {n: {"role": s["role"], "reason": s["reason"]} for n, s in series.items()},
             "series": {}}
 
     with tempfile.TemporaryDirectory() as work:
         if a.source == "mprage":
-            sd, why = select("t1_mprage", series, a.mprage_series)
-            shutil.copyfile(dcm2niix_largest(sd, work, "mprage"),
+            sd, why = select("t1_mprage", series, a.mprage_series, a.mprage_series_uid)
+            shutil.copyfile(dcm2niix_single(sd, work, "mprage"),
                             os.path.join(anat, f"{a.subject}_T1w.nii.gz"))
-            prov["series"]["T1w"] = {"folder": os.path.basename(sd), "why": why}
+            chosen = read_series_tags(sd)
+            prov["series"]["T1w"] = {"folder": os.path.basename(sd),
+                                         "series_uid": chosen["series_uid"],
+                                         "pixel_scaling": chosen["pixel_scaling"],
+                                         "why": why}
         else:  # uni → O'Brien clean from UNI + INV1 + INV2
-            picks = {r: select(f"t1_{r}", series, getattr(a, f"{r}_series"))
+            picks = {r: select(f"t1_{r}", series, getattr(a, f"{r}_series"),
+                               getattr(a, f"{r}_series_uid"))
                      for r in ("uni", "inv1", "inv2")}
-            niis = {r: dcm2niix_largest(p[0], work, r) for r, p in picks.items()}
+            niis = {r: dcm2niix_single(p[0], work, r) for r, p in picks.items()}
             from clean_uni import obrien_clean
             info = obrien_clean(niis["uni"], niis["inv1"], niis["inv2"],
                                 os.path.join(anat, f"{a.subject}_T1w.nii.gz"), a.beta_factor)
-            prov["series"]["T1w"] = {r: {"folder": os.path.basename(p[0]), "why": p[1]}
+            prov["series"]["T1w"] = {r: {"folder": os.path.basename(p[0]),
+                                                "series_uid": read_series_tags(p[0])["series_uid"],
+                                                "pixel_scaling": read_series_tags(p[0])[
+                                                    "pixel_scaling"],
+                                                "why": p[1]}
                                      for r, p in picks.items()}
             prov["obrien"] = {"beta_factor": a.beta_factor, "beta": info["beta"]}
 
         if a.also_t2:
-            sd, why = select("t2", series, a.t2_series)
-            shutil.copyfile(dcm2niix_largest(sd, work, "t2"),
+            sd, why = select("t2", series, a.t2_series, a.t2_series_uid)
+            shutil.copyfile(dcm2niix_single(sd, work, "t2"),
                             os.path.join(anat, f"{a.subject}_T2w.nii.gz"))
             prov["series"]["T2w"] = {"folder": os.path.basename(sd), "why": why,
-                                     "qt2_capable": is_qt2_capable(series[os.path.basename(sd)]["tags"])}
+                                     "series_uid": read_series_tags(sd)["series_uid"],
+                                     "qt2_capable": is_qt2_capable(
+                                         series[read_series_tags(sd)["series_uid"]]["tags"])}
 
     with open(os.path.join(anat, f"{a.subject}_recon-provenance.json"), "w") as fh:
         json.dump(prov, fh, indent=2)

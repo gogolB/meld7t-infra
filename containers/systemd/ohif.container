@@ -1,20 +1,30 @@
 [Unit]
-Description=OHIF viewer — Cornerstone3D DICOMweb viewer (spec §9)
+Description=OHIF — read-only DICOMweb viewer
 After=network-online.target
 
 [Container]
-Image=docker.io/ohif/app:v3.9.1
+Image=docker.io/ohif/app@sha256:f130db413d37d829e0c98fa49505884343e53e8d6ec72940d44327e917304913
+Pull=never
 ContainerName=ohif
-Network=meld-net.network
-# App config points OHIF at the same-origin /dicom-web (Orthanc via Caddy). No CDN (§9.4).
-Volume=%h/.config/meld7t/ohif/app-config.js:/usr/share/nginx/html/app-config.js:ro,z
-# Not published — Caddy (viewer site) proxies to ohif on meld-net.
-# nginx binds :80; rootless non-root needs the bind cap.
+Network=meld-edge.network
+Volume=%h/.config/meld7t/current/ohif/app-config.js:/usr/share/nginx/html/app-config.js:ro,z
+ReadOnly=true
+Tmpfs=/var/cache/nginx:rw,nosuid,nodev,size=64m
+Tmpfs=/var/run:rw,nosuid,nodev,size=8m
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m
 AddCapability=NET_BIND_SERVICE
 NoNewPrivileges=true
+PidsLimit=256
+LogDriver=journald
 
 [Service]
 Restart=always
+RestartSec=10
+TimeoutStopSec=30
+MemoryHigh=384M
+MemoryMax=768M
+TasksMax=384
+CPUWeight=50
 
 [Install]
 WantedBy=default.target

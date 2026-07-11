@@ -1,25 +1,35 @@
 [Unit]
-Description=Orthanc — DICOM store + DICOMweb (spec §2.1, §4)
+Description=Orthanc — internal DICOM store and DICOMweb
+Wants=postgres.service
 After=network-online.target postgres.service
-Requires=postgres.service
 
 [Container]
-Image=docker.io/orthancteam/orthanc:24.7.3
+Image=docker.io/orthancteam/orthanc@sha256:57a3d037729897331027ddc00c12695b50f1effbbf805f855396f3d0248d2d5f
+Pull=never
 ContainerName=orthanc
+Network=meld-edge.network
+Network=meld-data.network
 Network=meld-net.network
-# DICOM files on the storage volume; the index lives in PostgreSQL (see orthanc.json).
 Volume=orthanc-storage.volume:/var/lib/orthanc/db
-Volume=%h/.config/meld7t/orthanc/orthanc.json:/etc/orthanc/orthanc.json:ro,z
-# Loopback-only publish so the host worker can WADO-pull DICOM input; not on the intranet (§4).
+Volume=%h/.config/meld7t/current/orthanc/orthanc.json:/etc/orthanc/orthanc.json:ro,z
 PublishPort=127.0.0.1:8042:8042
-# The orthancteam image merges ORTHANC__SECTION__KEY env into config — this injects the
-# PostgreSQL password (ORTHANC__POSTGRESQL__PASSWORD) so it never sits in the JSON.
-EnvironmentFile=%h/.config/meld7t/services.env
+EnvironmentFile=%h/.config/meld7t/current/env/orthanc.env
 NoNewPrivileges=true
+PidsLimit=1024
+LogDriver=journald
 
 [Service]
 Restart=always
-TimeoutStartSec=120
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=120
+StartLimitIntervalSec=600
+StartLimitBurst=10
+MemoryHigh=2G
+MemoryMax=4G
+TasksMax=1536
+CPUWeight=150
+IOWeight=250
 
 [Install]
 WantedBy=default.target

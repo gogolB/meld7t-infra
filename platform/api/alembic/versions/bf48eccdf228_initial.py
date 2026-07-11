@@ -184,4 +184,12 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_cases_orthanc_study_uid'), table_name='cases')
     op.drop_table('cases')
     op.drop_table('audit')
+    # PostgreSQL enum types outlive their tables; dropping them makes a full downgrade/re-upgrade
+    # deterministic for disaster-recovery and migration rehearsal environments.
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        for enum_name in (
+            "device", "runstatus", "detectorid", "seriesrole", "workup", "casestatus"
+        ):
+            postgresql.ENUM(name=enum_name).drop(bind, checkfirst=True)
     # ### end Alembic commands ###

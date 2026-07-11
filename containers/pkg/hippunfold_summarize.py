@@ -37,7 +37,11 @@ def _scheme(dseg_path: str) -> str:
 def hemi_volume_mm3(dseg_path: str) -> tuple[float, dict]:
     img = nib.load(dseg_path)
     data = np.asanyarray(img.dataobj)
+    if data.ndim != 3 or 0 in data.shape or not np.all(np.isfinite(data)):
+        raise ValueError(f"invalid/non-finite hippocampal dseg: {dseg_path}")
     voxvol = float(np.prod(img.header.get_zooms()[:3]))
+    if not np.isfinite(voxvol) or voxvol <= 0:
+        raise ValueError(f"invalid voxel geometry in hippocampal dseg: {dseg_path}")
     labels, counts = np.unique(data[data > 0], return_counts=True)
     if _scheme(dseg_path) == "subfields":
         per_label = {SUBFIELD_LABELS.get(int(l), str(int(l))): float(c) * voxvol
@@ -52,7 +56,7 @@ def hemi_volume_mm3(dseg_path: str) -> tuple[float, dict]:
 def find_dseg(root: str, subject: str, hemi: str) -> str | None:
     """Locate a per-hemisphere volumetric subfield labelmap, most-preferred first.
 
-    1. native T2w-space subfield dseg (emitted by some versions/flags) — clinically ideal space;
+    1. native T2w-space subfield dseg (emitted by some versions/flags) — preferred analysis space;
     2. corobl-space postproc dseg (ALWAYS produced, isotropic, identical res both hemis) — the
        robust fallback: because both hemispheres share the same voxel grid, L/R volumes are
        directly comparable for the asymmetry index even though it isn't the subject's native space.
@@ -67,9 +71,13 @@ def find_dseg(root: str, subject: str, hemi: str) -> str | None:
         f"{root}/**/*hemi-{hemi}_space-corobl_desc-postproc_dseg.nii.gz",
     ]
     for p in pats:
-        hits = sorted(glob.glob(p, recursive=True))
-        if hits:
+        hits = sorted({hit for hit in glob.glob(p, recursive=True) if os.path.isfile(hit)})
+        if len(hits) == 1:
             return hits[0]
+        if len(hits) > 1:
+            raise ValueError(
+                f"ambiguous HippUnfold {hemi} dseg output for {subject}: {hits}"
+            )
     return None
 
 
@@ -79,6 +87,8 @@ def main():
     ap.add_argument("--subject", required=True)
     ap.add_argument("--ai-threshold", type=float, default=10.0)  # % asymmetry to flag
     a = ap.parse_args()
+    if not np.isfinite(a.ai_threshold) or a.ai_threshold < 0:
+        raise ValueError("--ai-threshold must be a finite non-negative percentage")
 
     vols, subfields, sources = {}, {}, {}
     for hemi in ("L", "R"):
@@ -86,14 +96,26 @@ def main():
         if p:
             vols[hemi], subfields[hemi] = hemi_volume_mm3(p)
             sources[hemi] = os.path.relpath(p, a.root)
+    if set(vols) != {"L", "R"}:
+        raise FileNotFoundError("both left and right HippUnfold dseg outputs are required")
+    if any(not np.isfinite(v) or v <= 0 for v in vols.values()):
+        raise ValueError("both hippocampal grey-matter volumes must be finite and positive")
+    spaces = {"corobl" if "corobl" in source else "T2w" for source in sources.values()}
+    if len(spaces) != 1:
+        raise ValueError("left/right HippUnfold outputs use different spaces")
+    schemes = {_scheme(source) for source in sources.values()}
+    if len(schemes) != 1:
+        raise ValueError("left/right HippUnfold outputs use different label schemes")
     space = "corobl" if any("corobl" in s for s in sources.values()) else "T2w"
 
     out = {"subject": a.subject, "volumes_mm3": vols, "subfields_mm3": subfields,
            "dseg_space": space, "dseg_sources": sources, "clusters": []}
-    if "L" in vols and "R" in vols and (vols["L"] + vols["R"]) > 0:
-        L, R = vols["L"], vols["R"]
-        ai = 100.0 * (L - R) / (0.5 * (L + R))
-        out["asymmetry_index_pct"] = round(ai, 2)
+    L, R = vols["L"], vols["R"]
+    ai = 100.0 * (L - R) / (0.5 * (L + R))
+    out["asymmetry_index_pct"] = round(ai, 2)
+    out["ai_threshold_pct"] = a.ai_threshold
+    out["flagged"] = abs(ai) >= a.ai_threshold
+    if out["flagged"]:
         atrophic = "left" if L < R else "right"
         out["clusters"] = [{
             "index": 1, "hemi": atrophic, "location": "hippocampus",
@@ -103,9 +125,11 @@ def main():
                          "asymmetry_index_pct": round(ai, 2), "dseg_space": space,
                          "subfields_L_mm3": subfields.get("L", {}),
                          "subfields_R_mm3": subfields.get("R", {}),
-                         "flagged": abs(ai) >= a.ai_threshold},
+                         "flagged": True},
         }]
+    out["n_clusters"] = len(out["clusters"])
     print(json.dumps(out))
+    return 0
 
 
 if __name__ == "__main__":

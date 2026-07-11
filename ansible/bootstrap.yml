@@ -42,7 +42,10 @@
     user_path: "{{ lookup('env', 'HOME') }}/.local/bin:{{ lookup('env', 'PATH') }}"
 
     dev_box: "meld-dev"
-    dev_image: "registry.fedoraproject.org/fedora-toolbox:44"
+    # Keep the development/release environment reproducible too. Update this together with the
+    # `meld_dev` row in containers/images.lock after reviewing a new Toolbox base.
+    dev_image: "registry.fedoraproject.org/fedora-toolbox@sha256:f94669859d5b9ff10f354bfe034cc3db3ee0d841a7b3ae7688da907c3c012d32"
+    cuda_smoke_image: "docker.io/nvidia/cuda@sha256:0f6bfcbf267e65123bcc2287e2153dedfc0f24772fb5ce84afe16ac4b2fada95"
 
     recreate_dev_box: false
     install_brew_tools: false
@@ -62,7 +65,8 @@
     # --- Long-running services: rootless Podman Quadlet (spec §2) ---
     svc_user: "{{ lookup('env', 'USER') }}"
     quadlet_user_dir: "{{ home_dir }}/.config/containers/systemd"
-    svc_config_dir: "{{ home_dir }}/.config/meld7t"
+    svc_config_root: "{{ home_dir }}/.config/meld7t"
+    svc_config_dir: "{{ home_dir }}/.config/meld7t/dev"
     svc_env_src: "{{ repo_dir }}/secrets/services.env"
 
     distrobox_init_timeout_seconds: 900
@@ -105,6 +109,9 @@
       - gzip
       - curl
       - dnf-plugins-core
+      - just
+      - ansible-core
+      - uv
 
   tasks:
     # -------------------------------------------------------------------------
@@ -194,7 +201,7 @@
         podman run --rm
         --device nvidia.com/gpu=all
         --security-opt=label=disable
-        docker.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+        {{ cuda_smoke_image }}
         nvidia-smi -L
       changed_when: false
       register: gpu_container
@@ -350,19 +357,78 @@
         mode: "0700"
       loop:
         - "{{ quadlet_user_dir }}"
+        - "{{ svc_config_root }}"
         - "{{ svc_config_dir }}"
         - "{{ svc_config_dir }}/caddy"
+        - "{{ svc_config_dir }}/caddy/auth"
+        - "{{ svc_config_dir }}/env"
+        - "{{ svc_config_dir }}/licenses"
         - "{{ svc_config_dir }}/orthanc"
         - "{{ svc_config_dir }}/postgres"
+        - "{{ svc_config_dir }}/redis"
+        - "{{ svc_config_dir }}/tls"
         - "{{ svc_config_dir }}/ohif"
+        - "{{ svc_config_dir }}/trust"
+        - "{{ home_dir }}/.local/lib/meld7t"
+        - "{{ home_dir }}/meld7t-state"
+        - "{{ repo_dir }}/meld-data"
       when: svc_env_stat.stat.exists
       tags: [services]
 
-    - name: Install the services secrets file (0600)
+    - name: Install the shared developer environment under per-service filenames
       ansible.builtin.copy:
         src: "{{ svc_env_src }}"
-        dest: "{{ svc_config_dir }}/services.env"
+        dest: "{{ svc_config_dir }}/env/{{ item }}.env"
         mode: "0600"
+      loop: [postgres, redis, orthanc, immudb, api, caddy]
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Keep Orthanc's direct development endpoint unauthenticated
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/orthanc.env"
+        regexp: '^ORTHANC__AUTHENTICATION_ENABLED='
+        line: ORTHANC__AUTHENTICATION_ENABLED=false
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Configure safe immudb development-mode overrides
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/immudb.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: IMMUDB_AUTH, value: "true" }
+        - { key: IMMUDB_DEVMODE, value: "false" }
+        - { key: IMMUDB_MAINTENANCE, value: "false" }
+        - { key: IMMUDB_SIGNINGKEY, value: "/run/secrets/immudb-signing-private.pem" }
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Read developer Redis password from services.env
+      ansible.builtin.set_fact:
+        dev_redis_password: >-
+          {{ (lookup('ansible.builtin.file', svc_env_src)
+              | regex_search('(?m)^REDIS_PASSWORD=(.+)$', '\\1') | first) }}
+      no_log: true
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Install authenticated developer Redis config
+      ansible.builtin.copy:
+        dest: "{{ svc_config_dir }}/redis/redis.conf"
+        mode: "0600"
+        content: |
+          bind 0.0.0.0
+          protected-mode yes
+          port 6379
+          requirepass {{ dev_redis_password }}
+          dir /data
+          appendonly yes
+          appendfsync everysec
+          aof-use-rdb-preamble yes
+          maxmemory-policy noeviction
+      no_log: true
       when: svc_env_stat.stat.exists
       tags: [services]
 
@@ -372,7 +438,7 @@
         dest: "{{ item.dest }}"
         mode: "{{ item.mode }}"
       loop:
-        - src: "{{ repo_dir }}/containers/config/caddy/Caddyfile"
+        - src: "{{ repo_dir }}/containers/config/caddy/Caddyfile.dev"
           dest: "{{ svc_config_dir }}/caddy/Caddyfile"
           mode: "0644"
         - src: "{{ repo_dir }}/containers/config/orthanc/orthanc.json"
@@ -385,6 +451,91 @@
           dest: "{{ svc_config_dir }}/ohif/app-config.js"
           mode: "0644"
       when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Generate a development-only immudb signing key
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - genpkey
+          - -algorithm
+          - EC
+          - -pkeyopt
+          - ec_paramgen_curve:P-256
+          - -out
+          - "{{ svc_config_dir }}/trust/immudb-signing-private.pem"
+      args:
+        creates: "{{ svc_config_dir }}/trust/immudb-signing-private.pem"
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Derive the development immudb signing public key
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - pkey
+          - -in
+          - "{{ svc_config_dir }}/trust/immudb-signing-private.pem"
+          - -pubout
+          - -out
+          - "{{ svc_config_dir }}/trust/immudb-signing-public.pem"
+      args:
+        creates: "{{ svc_config_dir }}/trust/immudb-signing-public.pem"
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Create the development immudb signing Podman secret when absent
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman secret exists meld7t-immudb-signing-key \
+          || podman secret create meld7t-immudb-signing-key \
+            {{ (svc_config_dir + '/trust/immudb-signing-private.pem') | quote }} >/dev/null
+      args:
+        executable: /bin/bash
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Point the stable developer config path at the dev config
+      ansible.builtin.file:
+        src: "{{ svc_config_dir }}"
+        dest: "{{ svc_config_root }}/current"
+        state: link
+        force: true
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Check stable developer release link
+      ansible.builtin.stat:
+        path: "{{ home_dir }}/.local/lib/meld7t/current"
+      register: dev_current_link
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Point the stable developer release path at this checkout when unconfigured
+      ansible.builtin.file:
+        src: "{{ repo_dir }}"
+        dest: "{{ home_dir }}/.local/lib/meld7t/current"
+        state: link
+      when:
+        - svc_env_stat.stat.exists
+        - not dev_current_link.stat.exists
+      tags: [services]
+
+    - name: Check stable developer data path
+      ansible.builtin.stat:
+        path: "{{ home_dir }}/meld7t-state/meld-data"
+      register: dev_data_link
+      when: svc_env_stat.stat.exists
+      tags: [services]
+
+    - name: Point stable developer data at checkout scratch when unconfigured
+      ansible.builtin.file:
+        src: "{{ repo_dir }}/meld-data"
+        dest: "{{ home_dir }}/meld7t-state/meld-data"
+        state: link
+      when:
+        - svc_env_stat.stat.exists
+        - not dev_data_link.stat.exists
       tags: [services]
 
     - name: Install Quadlet unit files into the user generator path
@@ -570,7 +721,7 @@
         distrobox enter
         --name {{ dev_box | quote }}
         --no-tty
-        -- bash -lc 'command -v nvim && command -v git && command -v python3 && command -v node && command -v lazygit'
+        -- bash -lc 'command -v nvim && command -v git && command -v python3 && command -v node && command -v lazygit && command -v just && command -v ansible-playbook && command -v uv'
       args:
         executable: /bin/bash
       changed_when: false
