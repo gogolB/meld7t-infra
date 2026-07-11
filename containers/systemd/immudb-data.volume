@@ -1,0 +1,5 @@
+[Unit]
+Description=immudb data — immutable audit ledger storage (spec §26)
+
+[Volume]
+VolumeName=immudb-data

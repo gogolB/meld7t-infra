@@ -1,0 +1,840 @@
+---
+# Minimal, network-independent Bazzite production deployment.  Run this play from a release staged
+# by ops/release/import-airgap.sh; it never invokes dnf, Homebrew, Distrobox, GitHub, or a registry.
+- name: Install a verified MELD 7T production release on Bazzite
+  hosts: local
+  connection: local
+  gather_facts: true
+
+  vars:
+    repo_dir: "{{ (playbook_dir + '/..') | realpath }}"
+    home_dir: "{{ lookup('env', 'HOME') }}"
+    svc_user: "{{ lookup('env', 'USER') }}"
+    svc_uid: "{{ lookup('pipe', 'id -u') }}"
+    release_root: "{{ home_dir }}/.local/lib/meld7t"
+    state_root: "{{ home_dir }}/meld7t-state"
+    meld_data_dir: "{{ state_root }}/meld-data"
+    dicom_staging_dir: "{{ meld_data_dir }}/staging"
+    durable_mount_point: "/var/mnt/meld7t"
+    backup_root: "{{ durable_mount_point }}/backups"
+    dicom_import_root: "{{ durable_mount_point }}/raw"
+    harmonization_root: "{{ release_root }}/current/harmonization"
+    production_secret_dir: "{{ home_dir }}/meld7t-secrets/production"
+    svc_config_root: "{{ home_dir }}/.config/meld7t"
+    svc_config_dir: "{{ svc_config_root }}/releases/{{ release_id }}"
+    staged_quadlet_dir: "{{ svc_config_dir }}/quadlets"
+    quadlet_user_dir: "{{ home_dir }}/.config/containers/systemd"
+    worker_unit_dir: "{{ home_dir }}/.config/systemd/user"
+    release_receipt_dir: "{{ repo_dir }}/release-receipt"
+    release_image_lock: "{{ release_receipt_dir }}/images.lock"
+    runtime_images_src: "{{ release_receipt_dir }}/runtime-images.env"
+    worker_artifacts: "{{ repo_dir }}/artifacts/worker"
+
+    # Mandatory site values.  Supply through an encrypted inventory/vault, never commit them.
+    allowed_client_cidr: "REQUIRED"
+    nas_host: "REQUIRED"
+    nas_export: "REQUIRED"
+    nfs_sec: "krb5p"
+    allow_nfs_sec_sys: false
+    nfs_nconnect: 4
+    approved_os_checksum: "REQUIRED"
+    host_change_control_id: "REQUIRED"
+    golden_case_acceptance_id: "REQUIRED"
+    nas_encryption_attestation_id: "REQUIRED"
+    required_service_user: "meld7t-svc"
+
+    required_secret_files:
+      - postgres.env
+      - redis.env
+      - orthanc.env
+      - immudb.env
+      - api.env
+      - caddy.env
+      - worker.env
+      - redis.conf
+      - tls.crt
+      - tls.key
+      - caddy-users.caddy
+      - caddy-roles.caddy
+      - caddy-dicom-access.caddy
+      - identity-approval.txt
+      - freesurfer.txt
+      - meld.txt
+      - immudb-signing-private.pem
+      - immudb-signing-public.pem
+      - backup-signing-public.pem
+      - release-signing-public.pem
+
+  pre_tasks:
+    - name: Assert mandatory site variables are configured
+      ansible.builtin.assert:
+        that:
+          - allowed_client_cidr != 'REQUIRED'
+          - nas_host != 'REQUIRED'
+          - nas_export != 'REQUIRED'
+          - nfs_sec in ['krb5p', 'krb5i', 'krb5', 'sys']
+          - nfs_sec != 'sys' or allow_nfs_sec_sys | bool
+          - approved_os_checksum is match('^[0-9a-f]{64}$')
+          - host_change_control_id != 'REQUIRED'
+          - golden_case_acceptance_id != 'REQUIRED'
+          - nas_encryption_attestation_id != 'REQUIRED'
+          - required_service_user != 'REQUIRED'
+        fail_msg: >-
+          Set allowed_client_cidr/nas_host/nas_export. NFS sec=sys additionally requires the
+          explicit allow_nfs_sec_sys risk acceptance; production defaults to krb5p.
+
+    - name: Validate the allowed client CIDR is constrained
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1], strict=False);
+            assert n.prefixlen > 0 and not n.is_unspecified
+          - "{{ allowed_client_cidr }}"
+      changed_when: false
+
+    - name: Assert the dedicated service account identity and noninteractive shell
+      ansible.builtin.shell: |
+        set -euo pipefail
+        row=$(getent passwd {{ svc_user | quote }})
+        [[ $(id -u) -ge 1000 && $(id -u) -ne 0 ]]
+        [[ $(cut -d: -f1 <<<"$row") == {{ required_service_user | quote }} ]]
+        shell=$(cut -d: -f7 <<<"$row")
+        [[ $shell == */nologin || $shell == */false ]]
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Read host OS identity
+      ansible.builtin.slurp:
+        src: /etc/os-release
+      register: os_release
+
+    - name: Assert this is an ostree-based Bazzite deployment
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.system == 'Linux'
+          - "'ID=bazzite' in (os_release.content | b64decode) or 'ID=\"bazzite\"' in (os_release.content | b64decode)"
+          - lookup('env', 'USER') == svc_user
+        fail_msg: This production play intentionally supports Bazzite only.
+
+    - name: Assert ostree boot marker exists
+      ansible.builtin.stat:
+        path: /run/ostree-booted
+      register: ostree_boot
+      failed_when: not ostree_boot.stat.exists
+
+    - name: Assert required offline host commands are present
+      ansible.builtin.shell: "command -v {{ item | quote }}"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      loop:
+        - podman
+        - systemctl
+        - loginctl
+        - openssl
+        - python3
+        - python3.13
+        - findmnt
+        - nvidia-smi
+        - nvidia-ctk
+        - firewall-cmd
+        - timeout
+        - diff
+        - just
+
+    - name: Assert SELinux is enforcing
+      ansible.builtin.command: getenforce
+      changed_when: false
+      register: selinux_mode
+      failed_when: selinux_mode.stdout | trim != 'Enforcing'
+
+    - name: Assert host time is synchronized to the hospital time source
+      ansible.builtin.command: timedatectl show --property=NTPSynchronized --value
+      changed_when: false
+      register: ntp_sync
+      failed_when: ntp_sync.stdout | trim != 'yes'
+
+    - name: Assert known automatic Bazzite update timers are disabled
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for unit in rpm-ostreed-automatic.timer ublue-update.timer uupd.timer; do
+          state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+          [[ "$state" != enabled ]] || { echo "$unit is enabled" >&2; exit 1; }
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Validate signed release image lock
+      ansible.builtin.command:
+        argv:
+          - "{{ repo_dir }}/ops/release/image-lock.sh"
+          - --lock
+          - "{{ release_image_lock }}"
+          - validate
+          - runtime
+      changed_when: false
+
+    - name: Verify every locked runtime image is already present offline
+      ansible.builtin.command:
+        argv:
+          - "{{ repo_dir }}/ops/release/image-lock.sh"
+          - --lock
+          - "{{ release_image_lock }}"
+          - verify-local
+      changed_when: false
+
+    - name: Check production secret inputs
+      ansible.builtin.stat:
+        path: "{{ production_secret_dir }}/{{ item }}"
+      register: secret_inputs
+      loop: "{{ required_secret_files }}"
+      no_log: true
+
+    - name: Assert every production secret input exists
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.pw_name == svc_user
+          - item.stat.mode in ['0400', '0600']
+        fail_msg: "Missing production input under secrets/production (see config examples)."
+      loop: "{{ secret_inputs.results }}"
+      no_log: true
+
+    - name: Verify the immudb signing private/public key pair
+      ansible.builtin.shell: |
+        set -euo pipefail
+        private=$(openssl pkey -in {{ (production_secret_dir + '/immudb-signing-private.pem') | quote }} \
+          -pubout -outform DER | sha256sum | cut -d' ' -f1)
+        public=$(openssl pkey -pubin \
+          -in {{ (production_secret_dir + '/immudb-signing-public.pem') | quote }} \
+          -outform DER | sha256sum | cut -d' ' -f1)
+        [[ $private == "$public" ]]
+        openssl pkey -in {{ (production_secret_dir + '/immudb-signing-private.pem') | quote }} \
+          -text -noout | grep -Eq 'ASN1 OID: prime256v1|NIST CURVE: P-256'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+
+    - name: Read release identity
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sed -n 's/^MELD7T_RELEASE_ID=//p' {{ (release_receipt_dir + '/release.env') | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: release_id_cmd
+
+    - name: Read signed source revision
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sed -n 's/^MELD7T_GIT_SHA=//p' {{ (release_receipt_dir + '/release.env') | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: release_git_sha_cmd
+
+    - name: Read signed MAP script digest
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sed -n 's/^MELD7T_MAP_SCRIPT_SHA256=//p' {{ (release_receipt_dir + '/release.env') | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: release_map_script_sha_cmd
+
+    - name: Compute signed release manifest digest
+      ansible.builtin.command:
+        argv: [sha256sum, "{{ release_receipt_dir }}/SHA256SUMS"]
+      changed_when: false
+      register: release_digest_cmd
+
+    - name: Read booted Bazzite ostree deployment checksum
+      ansible.builtin.shell: |
+        set -euo pipefail
+        rpm-ostree status --json | python3 -c \
+          'import json,sys; rows=json.load(sys.stdin)["deployments"]; print(next(x["checksum"] for x in rows if x.get("booted")))'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: os_checksum_cmd
+
+    - name: Set release facts
+      ansible.builtin.set_fact:
+        release_id: "{{ release_id_cmd.stdout | trim }}"
+        release_manifest_digest: "{{ release_digest_cmd.stdout.split()[0] }}"
+        worker_venv_dir: "{{ release_root }}/venvs/{{ release_id_cmd.stdout | trim }}"
+        os_checksum: "{{ os_checksum_cmd.stdout | trim }}"
+        release_git_sha: "{{ release_git_sha_cmd.stdout | trim }}"
+        release_map_script_sha: "{{ release_map_script_sha_cmd.stdout | trim }}"
+
+    - name: Assert release identity is safe
+      ansible.builtin.assert:
+        that:
+          - release_id is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+          - release_manifest_digest is match('^[0-9a-f]{64}$')
+          - os_checksum is match('^[0-9a-f]{64}$')
+          - os_checksum == approved_os_checksum
+          - release_git_sha is match('^[0-9a-f]{40}$|^[0-9a-f]{64}$')
+          - release_map_script_sha is match('^[0-9a-f]{64}$')
+
+    - name: Verify the signed MAP script digest against staged source
+      ansible.builtin.command:
+        argv: [sha256sum, "{{ repo_dir }}/containers/map/segment.m"]
+      changed_when: false
+      register: installed_map_script_digest
+      failed_when: installed_map_script_digest.stdout.split()[0] != release_map_script_sha
+
+    - name: Reverify release signature, signer, retained receipt members, and attestations
+      ansible.builtin.shell: |
+        set -euo pipefail
+        receipt={{ release_receipt_dir | quote }}
+        trusted={{ (production_secret_dir + '/release-signing-public.pem') | quote }}
+        openssl dgst -sha256 -verify "$trusted" -signature "$receipt/SHA256SUMS.sig" \
+          "$receipt/SHA256SUMS" >/dev/null
+        actual_signer=$(openssl pkey -pubin -in "$trusted" -outform DER | sha256sum | cut -d' ' -f1)
+        expected_signer=$(sed -n 's/^MELD7T_SIGNER_SHA256=//p' "$receipt/release.env")
+        [[ $actual_signer == "$expected_signer" ]]
+        for member in release.env images.lock source.tar.gz attestations.tar.gz; do
+          expected=$(awk -v p="./$member" '$2 == p {print $1}' "$receipt/SHA256SUMS")
+          [[ $expected =~ ^[0-9a-f]{64}$ ]]
+          [[ $(sha256sum "$receipt/$member" | cut -d' ' -f1) == "$expected" ]]
+        done
+        tmp=$(mktemp -d /tmp/meld7t-attestation-install.XXXXXX)
+        trap 'rm -rf -- "$tmp"' EXIT
+        tar -xzf "$receipt/attestations.tar.gz" -C "$tmp"
+        diff -qr --no-dereference "$tmp" {{ (repo_dir + '/attestations') | quote }} >/dev/null
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+  tasks:
+    - name: Create production directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ release_root }}/venvs", mode: "0750" }
+        - { path: "{{ state_root }}", mode: "0700" }
+        - { path: "{{ meld_data_dir }}", mode: "0700" }
+        - { path: "{{ dicom_staging_dir }}", mode: "0700" }
+        - { path: "{{ svc_config_root }}", mode: "0700" }
+        - { path: "{{ svc_config_root }}/releases", mode: "0700" }
+        - { path: "{{ svc_config_dir }}", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/env", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/caddy", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/caddy/auth", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/tls", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/licenses", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/postgres", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/redis", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/orthanc", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/ohif", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/trust", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/systemd", mode: "0700" }
+        - { path: "{{ staged_quadlet_dir }}", mode: "0700" }
+        - { path: "{{ state_root }}/audit", mode: "0700" }
+        - { path: "{{ quadlet_user_dir }}", mode: "0700" }
+        - { path: "{{ worker_unit_dir }}", mode: "0700" }
+
+    - name: Prove active compute state is on local storage
+      ansible.builtin.command:
+        argv: [findmnt, -T, "{{ dicom_staging_dir }}", -n, -o, FSTYPE]
+      changed_when: false
+      register: state_fstype
+      failed_when: state_fstype.stdout | trim in ['nfs', 'nfs4', 'cifs', 'smb3']
+
+    - name: Prove local PHI and Podman storage have an encrypted block-device ancestor
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for path in {{ state_root | quote }} {{ (home_dir + '/.local/share/containers') | quote }}; do
+          mkdir -p "$path"
+          source=$(findmnt -T "$path" -n -o SOURCE | sed 's/\[.*$//')
+          lsblk -s -n -o TYPE "$source" | grep -Fxq crypt || {
+            echo "$path is not backed by a LUKS/dm-crypt device" >&2
+            exit 1
+          }
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Require the configured worst-case worker scratch reserve
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import shutil,sys;
+            values=dict(line.split('=',1) for line in open(sys.argv[1], encoding='utf-8')
+            if line.strip() and not line.lstrip().startswith(('#',';')) and '=' in line);
+            number=lambda key,default:int(values.get(key,default));
+            required=number('MELD7T_STORAGE_MIN_FREE_BYTES',53687091200)+
+            number('MELD7T_WORKER_MAX_JOBS',2)*
+            (number('MELD7T_DICOM_MAX_BYTES_PER_RUN',107374182400)+
+            number('MELD7T_STORAGE_OUTPUT_HEADROOM_BYTES',26843545600));
+            free=shutil.disk_usage(sys.argv[2]).free;
+            assert free>=required, f'compute storage has {free} bytes free; {required} required'
+          - "{{ production_secret_dir }}/worker.env"
+          - "{{ state_root }}"
+      changed_when: false
+
+    - name: Compute durable NFS mount unit name
+      ansible.builtin.command:
+        argv: [systemd-escape, -p, --suffix=mount, "{{ durable_mount_point }}"]
+      changed_when: false
+      register: durable_mount_unit
+
+    - name: Compute durable NFS automount unit name
+      ansible.builtin.command:
+        argv: [systemd-escape, -p, --suffix=automount, "{{ durable_mount_point }}"]
+      changed_when: false
+      register: durable_automount_unit
+
+    - name: Create durable mount point
+      ansible.builtin.file:
+        path: "{{ durable_mount_point }}"
+        state: directory
+        owner: "{{ svc_user }}"
+        mode: "0750"
+      become: true
+
+    - name: Install production NFS mount unit
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ durable_mount_unit.stdout }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=MELD 7T encrypted durable data tier
+          After=network-online.target
+          Wants=network-online.target
+
+          [Mount]
+          What={{ nas_host }}:{{ nas_export }}
+          Where={{ durable_mount_point }}
+          Type=nfs4
+          Options=vers=4.2,hard,noatime,nconnect={{ nfs_nconnect }},sec={{ nfs_sec }},_netdev
+          TimeoutSec=30
+
+          [Install]
+          WantedBy=remote-fs.target
+      become: true
+
+    - name: Install production NFS automount unit
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ durable_automount_unit.stdout }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Automount MELD 7T durable data tier
+
+          [Automount]
+          Where={{ durable_mount_point }}
+          TimeoutIdleSec=600
+
+          [Install]
+          WantedBy=multi-user.target
+      become: true
+
+    - name: Enable and start durable automount
+      ansible.builtin.systemd:
+        name: "{{ durable_automount_unit.stdout }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      become: true
+
+    - name: Ensure encrypted backup destination exists on the durable tier
+      ansible.builtin.file:
+        path: "{{ backup_root }}"
+        state: directory
+        mode: "0700"
+
+    - name: Create required empty named volumes before first baseline backup
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if ! podman volume exists {{ item | quote }}; then
+          podman volume create {{ item | quote }} >/dev/null
+          echo created
+        fi
+      args:
+        executable: /bin/bash
+      register: volume_create
+      changed_when: "'created' in volume_create.stdout"
+      loop:
+        - postgres-data
+        - redis-data
+        - orthanc-storage
+        - immudb-data
+        - api-immudb-state
+        - caddy-data
+        - registry-data
+
+    - name: Compute immudb signing private-key digest
+      ansible.builtin.command:
+        argv: [sha256sum, "{{ production_secret_dir }}/immudb-signing-private.pem"]
+      changed_when: false
+      register: immudb_signing_key_digest
+      no_log: true
+
+    - name: Inspect the existing rootless Podman immudb signing secret
+      ansible.builtin.command:
+        argv:
+          - podman
+          - secret
+          - inspect
+          - --format
+          - "{{ '{{ index .Spec.Labels \"io.meld7t.sha256\" }}' }}"
+          - meld7t-immudb-signing-key
+      changed_when: false
+      failed_when: false
+      register: immudb_signing_secret
+      no_log: true
+
+    - name: Reject an implicit immudb signing-key rotation
+      ansible.builtin.assert:
+        that:
+          - immudb_signing_secret.rc != 0 or immudb_signing_secret.stdout | trim == immudb_signing_key_digest.stdout.split()[0]
+        fail_msg: >-
+          Existing Podman immudb signing key differs. Use the approved ledger-key rotation and
+          trust-state reset procedure; this play will not rotate it implicitly.
+      no_log: true
+
+    - name: Create the rootless Podman immudb signing secret once
+      ansible.builtin.command:
+        argv:
+          - podman
+          - secret
+          - create
+          - --label
+          - "io.meld7t.sha256={{ immudb_signing_key_digest.stdout.split()[0] }}"
+          - meld7t-immudb-signing-key
+          - "{{ production_secret_dir }}/immudb-signing-private.pem"
+      when: immudb_signing_secret.rc != 0
+      no_log: true
+
+    - name: Install split service environments
+      ansible.builtin.copy:
+        src: "{{ production_secret_dir }}/{{ item }}.env"
+        dest: "{{ svc_config_dir }}/env/{{ item }}.env"
+        mode: "0600"
+      loop: [postgres, redis, orthanc, immudb, api, caddy, worker]
+      no_log: true
+
+    - name: Install release-derived runtime image environment
+      ansible.builtin.copy:
+        src: "{{ runtime_images_src }}"
+        dest: "{{ svc_config_dir }}/env/runtime-images.env"
+        mode: "0600"
+
+    - name: Read the signed expected-active harmonization inventory as compact JSON
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import json,sys; value=json.load(open(sys.argv[1], encoding='utf-8'));
+            assert isinstance(value,list) and value;
+            print(json.dumps(value, separators=(',',':'), sort_keys=True))
+          - "{{ repo_dir }}/harmonization/expected-active-profiles.json"
+      changed_when: false
+      register: harmonization_expected_profiles_json
+
+    - name: Persist release and site acceptance identifiers
+      ansible.builtin.copy:
+        dest: "{{ svc_config_dir }}/acceptance.env"
+        mode: "0600"
+        content: |
+          MELD7T_RELEASE_ID={{ release_id }}
+          MELD7T_RELEASE_MANIFEST_DIGEST={{ release_manifest_digest }}
+          MELD7T_GIT_SHA={{ release_git_sha }}
+          MELD7T_OS_CHECKSUM={{ os_checksum }}
+          MELD7T_HOST_CHANGE_CONTROL_ID={{ host_change_control_id }}
+          MELD7T_GOLDEN_CASE_ACCEPTANCE_ID={{ golden_case_acceptance_id }}
+          MELD7T_NAS_ENCRYPTION_ATTESTATION_ID={{ nas_encryption_attestation_id }}
+          MELD7T_ALLOWED_CLIENT_CIDR={{ allowed_client_cidr }}
+          MELD7T_SERVICE_USER={{ svc_user }}
+
+    - name: Stamp release-derived provenance and expected profiles into API environment
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/api.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
+        - { key: MELD7T_HARMONIZATION_EXPECTED_PROFILES, value: "{{ harmonization_expected_profiles_json.stdout }}" }
+      no_log: true
+
+    - name: Stamp release-derived paths and provenance into worker environment
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/worker.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: MELD7T_REPO_DIR, value: "{{ release_root }}/current" }
+        - { key: MELD7T_MELD_DATA, value: "{{ meld_data_dir }}" }
+        - { key: MELD7T_DICOM_STAGING, value: "{{ dicom_staging_dir }}" }
+        - { key: MELD7T_DICOM_IMPORT_ROOT, value: "{{ dicom_import_root }}" }
+        - { key: MELD7T_HARMONIZATION_ROOT, value: "{{ harmonization_root }}" }
+        - { key: MELD7T_FS_LICENSE, value: "{{ svc_config_dir }}/licenses/freesurfer.txt" }
+        - { key: MELD7T_MELD_LICENSE, value: "{{ svc_config_dir }}/licenses/meld.txt" }
+        - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
+        - { key: MELD7T_GIT_SHA, value: "{{ release_git_sha }}" }
+        - { key: MELD7T_OS_CHECKSUM, value: "{{ os_checksum }}" }
+        - { key: MELD7T_WORKER_VENV, value: "{{ worker_venv_dir }}" }
+        - { key: MELD7T_IMMUDB_ROOT_STATE_PATH, value: "{{ state_root }}/audit/worker.root" }
+        - { key: MELD7T_IMMUDB_PUBLIC_KEY_PATH, value: "{{ svc_config_dir }}/trust/immudb-signing-public.pem" }
+      no_log: true
+
+    - name: Stamp release provenance into runtime images environment
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/runtime-images.env"
+        regexp: '^MELD7T_RELEASE_MANIFEST_DIGEST='
+        line: "MELD7T_RELEASE_MANIFEST_DIGEST={{ release_manifest_digest }}"
+
+    - name: Install private configs, TLS, and licenses
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ production_secret_dir }}/redis.conf", dest: "{{ svc_config_dir }}/redis/redis.conf", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/tls.crt", dest: "{{ svc_config_dir }}/tls/tls.crt", mode: "0644" }
+        - { src: "{{ production_secret_dir }}/tls.key", dest: "{{ svc_config_dir }}/tls/tls.key", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/freesurfer.txt", dest: "{{ svc_config_dir }}/licenses/freesurfer.txt", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/meld.txt", dest: "{{ svc_config_dir }}/licenses/meld.txt", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/caddy-users.caddy", dest: "{{ svc_config_dir }}/caddy/auth/users.caddy", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/caddy-roles.caddy", dest: "{{ svc_config_dir }}/caddy/auth/roles.caddy", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/caddy-dicom-access.caddy", dest: "{{ svc_config_dir }}/caddy/auth/dicom-access.caddy", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/identity-approval.txt", dest: "{{ svc_config_dir }}/caddy/auth/identity-approval.txt", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/immudb-signing-public.pem", dest: "{{ svc_config_dir }}/trust/immudb-signing-public.pem", mode: "0644" }
+        - { src: "{{ production_secret_dir }}/backup-signing-public.pem", dest: "{{ svc_config_dir }}/trust/backup-signing-public.pem", mode: "0600" }
+        - { src: "{{ production_secret_dir }}/release-signing-public.pem", dest: "{{ svc_config_dir }}/trust/release-signing-public.pem", mode: "0600" }
+      no_log: true
+
+    - name: Install tracked non-secret service configuration
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ repo_dir }}/containers/config/caddy/Caddyfile", dest: "{{ svc_config_dir }}/caddy/Caddyfile", mode: "0644" }
+        - { src: "{{ repo_dir }}/containers/config/orthanc/orthanc.json", dest: "{{ svc_config_dir }}/orthanc/orthanc.json", mode: "0644" }
+        - { src: "{{ repo_dir }}/containers/config/postgres/init-databases.sh", dest: "{{ svc_config_dir }}/postgres/init-databases.sh", mode: "0755" }
+        - { src: "{{ repo_dir }}/containers/config/ohif/app-config.js", dest: "{{ svc_config_dir }}/ohif/app-config.js", mode: "0644" }
+
+    - name: Validate secret relationships, TLS, paths, and locked worker images
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ repo_dir }}/ops/deployment/validate-production-config.py"
+          - "{{ svc_config_dir }}"
+          - "{{ release_image_lock }}"
+      changed_when: false
+      no_log: true
+
+    - name: Revalidate signed release governance attestations
+      ansible.builtin.shell: |
+        set -euo pipefail
+        root={{ (repo_dir + '/attestations') | quote }}
+        for name in approval.txt sbom.spdx.json vulnerability-report.json \
+          vulnerability-exceptions.txt license-report.json golden-case-evidence.txt; do
+          [[ -s "$root/$name" ]] || { echo "missing/non-empty attestation: $name" >&2; exit 1; }
+        done
+        grep -Eq '^APPROVED_BY=.+$' "$root/vulnerability-exceptions.txt"
+        grep -Eq '^RATIONALE=.+$' "$root/vulnerability-exceptions.txt"
+        expiry=$(sed -n 's/^EXPIRES=//p' "$root/vulnerability-exceptions.txt")
+        [[ $expiry =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+        [[ $(date -u -d "$expiry" +%s) -ge $(date -u +%s) ]]
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Re-verify every signed harmonization profile before installation
+      ansible.builtin.shell: |
+        set -euo pipefail
+        root={{ (repo_dir + '/harmonization') | quote }}
+        count=0
+        if [[ -d "$root/profiles" ]]; then
+          while IFS= read -r -d '' profile; do
+            python3 {{ (repo_dir + '/ops/harmonization/manage.py') | quote }} verify \
+              --profile "$profile" --harmonization-root "$root"
+            python3 {{ (repo_dir + '/ops/harmonization/manage.py') | quote }} \
+              verify-runtime-images --profile "$profile" \
+              --image-lock {{ release_image_lock | quote }}
+            ((count += 1))
+          done < <(find "$root/profiles" -maxdepth 1 -type f -name '*.json' -print0 | sort -z)
+        fi
+        ((count > 0)) || { echo "production requires at least one approved profile" >&2; exit 1; }
+        python3 {{ (repo_dir + '/ops/harmonization/manage.py') | quote }} \
+          verify-expected-inventory \
+          --inventory "$root/expected-active-profiles.json" --profiles "$root/profiles"
+        expected_sha=$(sed -n 's/^MELD7T_HARMONIZATION_INVENTORY_SHA256=//p' \
+          {{ runtime_images_src | quote }})
+        [[ $expected_sha =~ ^[0-9a-f]{64}$ ]]
+        [[ $(sha256sum "$root/expected-active-profiles.json" | cut -d' ' -f1) == "$expected_sha" ]]
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Resolve locked Caddy image for config validation
+      ansible.builtin.command:
+        argv:
+          - "{{ repo_dir }}/ops/release/image-lock.sh"
+          - --lock
+          - "{{ release_image_lock }}"
+          - get
+          - caddy
+      changed_when: false
+      register: caddy_image
+
+    - name: Validate production Caddy config inside the locked image
+      ansible.builtin.command:
+        argv:
+          - podman
+          - run
+          - --rm
+          - --pull=never
+          - --network=none
+          - --env-file
+          - "{{ svc_config_dir }}/env/caddy.env"
+          - --volume
+          - "{{ svc_config_dir }}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z"
+          - --volume
+          - "{{ svc_config_dir }}/tls:/etc/caddy/tls:ro,z"
+          - --volume
+          - "{{ svc_config_dir }}/caddy/auth:/etc/caddy/auth:ro,z"
+          - "{{ caddy_image.stdout }}"
+          - caddy
+          - validate
+          - --config
+          - /etc/caddy/Caddyfile
+          - --adapter
+          - caddyfile
+      changed_when: false
+      no_log: true
+
+    - name: Install offline worker environment for this release
+      ansible.builtin.command:
+        argv:
+          - "{{ repo_dir }}/ops/release/install-worker-offline.sh"
+          - "{{ worker_artifacts }}"
+          - "{{ worker_venv_dir }}"
+      args:
+        creates: "{{ worker_venv_dir }}/.meld7t-requirements.sha256"
+
+    - name: Render digest-only Quadlets into the release-scoped staging directory
+      ansible.builtin.command:
+        argv:
+          - "{{ repo_dir }}/ops/deployment/install-quadlets.sh"
+          - "{{ repo_dir }}/containers/systemd"
+          - "{{ staged_quadlet_dir }}"
+          - "{{ release_image_lock }}"
+      register: quadlet_install
+      changed_when: "'installed digest-rendered' in quadlet_install.stdout"
+
+    - name: Stage hardened worker service
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/platform/worker/meld7t-worker.service"
+        dest: "{{ svc_config_dir }}/systemd/meld7t-worker.service"
+        mode: "0644"
+
+    - name: Stage local monitoring service and timer
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/ops/deployment/systemd/{{ item }}"
+        dest: "{{ svc_config_dir }}/systemd/{{ item }}"
+        mode: "0644"
+      loop:
+        - meld7t-health.service
+        - meld7t-health.timer
+
+    - name: Configure monitored backup location
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/systemd/meld7t-health.service"
+        insertafter: '^Environment=MELD7T_CONFIG_ROOT='
+        regexp: '^Environment=MELD7T_BACKUP_ROOT='
+        line: "Environment=MELD7T_BACKUP_ROOT={{ backup_root }}"
+
+    - name: Configure trusted backup verification key for monitoring
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/systemd/meld7t-health.service"
+        insertafter: '^Environment=MELD7T_BACKUP_ROOT='
+        regexp: '^Environment=MELD7T_BACKUP_VERIFY_KEY='
+        line: "Environment=MELD7T_BACKUP_VERIFY_KEY={{ svc_config_root }}/current/trust/backup-signing-public.pem"
+
+    - name: Enable linger for the dedicated service account
+      ansible.builtin.command:
+        argv: [loginctl, enable-linger, "{{ svc_user }}"]
+      become: true
+      changed_when: false
+
+    - name: Create source-restricted firewall zone when absent
+      ansible.builtin.shell: |
+        set -euo pipefail
+        firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -Fxq meld7t \
+          || firewall-cmd --permanent --new-zone=meld7t
+      args:
+        executable: /bin/bash
+      become: true
+
+    - name: Reconcile the exact source and ports on the production firewall zone
+      ansible.builtin.shell: |
+        set -euo pipefail
+        wanted_source={{ allowed_client_cidr | quote }}
+        while IFS= read -r source; do
+          [[ -z $source || $source == "$wanted_source" ]] \
+            || firewall-cmd --permanent --zone=meld7t --remove-source="$source"
+        done < <(firewall-cmd --permanent --zone=meld7t --list-sources | tr ' ' '\n')
+        while IFS= read -r port; do
+          case "$port" in 9443/tcp|9444/tcp|'') ;; *)
+            firewall-cmd --permanent --zone=meld7t --remove-port="$port" ;;
+          esac
+        done < <(firewall-cmd --permanent --zone=meld7t --list-ports | tr ' ' '\n')
+        firewall-cmd --permanent --zone=meld7t --set-target=DROP
+        firewall-cmd --permanent --zone=meld7t --add-source="$wanted_source"
+        firewall-cmd --permanent --zone=meld7t --add-port=9443/tcp
+        firewall-cmd --permanent --zone=meld7t --add-port=9444/tcp
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: true
+
+    - name: Assert application ports are absent from every other firewall zone
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for zone in $(firewall-cmd --permanent --get-zones); do
+          [[ $zone == meld7t ]] && continue
+          ports=" $(firewall-cmd --permanent --zone="$zone" --list-ports) "
+          [[ $ports != *' 9443/tcp '* && $ports != *' 9444/tcp '* ]] || {
+            echo "application port exposed in unrelated zone: $zone" >&2
+            exit 1
+          }
+        done
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: Reload firewall after idempotent zone updates
+      ansible.builtin.command: firewall-cmd --reload
+      become: true
+      changed_when: true
+
+    - name: Print controlled activation sequence
+      ansible.builtin.debug:
+        msg:
+          - "Release {{ release_id }} is installed but not activated or started."
+          - "Configuration, Quadlets, and user units are staged under release {{ release_id }}; live symlinks are unchanged."
+          - "First install: activate the staged unit/config symlinks in initialization mode, create the immudb runtime principal, take a baseline backup, then migrate."
+          - "Upgrade: pause/drain queue, take signed encrypted backup, run migrate.sh, then activate-release.sh."
+          - "After activation, run restore-drill.sh against the new backup and record the result."

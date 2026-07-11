@@ -1,0 +1,149 @@
+# Production edge.  This file deliberately has no HTTP listener and no ACME dependency.
+# Institution-issued certificate/key files are mounted read-only by caddy.container.
+{
+	admin off
+	auto_https off
+}
+
+(authenticated) {
+	# Stock Caddy basic authentication is the closed-network adapter. The installed file must contain
+	# unique per-person institutional accounts before activation; the three-account example is only a
+	# bring-up fallback and is rejected by the production configuration validator.
+	basic_auth {
+		import /etc/caddy/auth/users.caddy
+	}
+
+	map {http.auth.user.id} {meld_roles} {
+		import /etc/caddy/auth/roles.caddy
+	}
+	map {http.auth.user.id} {dicom_access} {
+		import /etc/caddy/auth/dicom-access.caddy
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		-Server
+	}
+
+	# Keep operational metadata but hash request URIs (which may contain DICOM UIDs) and remove
+	# credentials/cookies from the structured journal stream.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri hash
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-MELD-Proxy-Secret delete
+			}
+		}
+	}
+}
+
+https://{$SITE_ADDRESS}:9443 {
+	import authenticated
+	tls {$TLS_CERT_FILE} {$TLS_KEY_FILE}
+	encode zstd gzip
+	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self' data:; frame-src https://{$SITE_ADDRESS}:9444; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+	# Browser DICOMweb is authenticated at this boundary; Orthanc is not exposed directly.
+	@dicom_write {
+		path /dicom-web/*
+		method POST PUT PATCH DELETE
+	}
+	handle @dicom_write {
+		respond "Browser DICOMweb is read-only" 405
+	}
+	@dicom_allowed {
+		path /dicom-web/*
+		method GET HEAD OPTIONS
+		expression {dicom_access} == "allow"
+	}
+	handle @dicom_allowed {
+		header {
+			Cache-Control "private, no-store, max-age=0"
+			Pragma "no-cache"
+			Expires "0"
+		}
+		reverse_proxy orthanc:8042 {
+			header_up -Authorization
+			header_up -Cookie
+			header_up Authorization "Basic {$MELD7T_ORTHANC_BASIC_AUTH_B64}"
+		}
+	}
+	@dicom_forbidden path /dicom-web/*
+	handle @dicom_forbidden {
+		respond "DICOMweb requires reviewer or admin role" 403
+	}
+
+	# Strip every caller-provided identity header and assert the Caddy-authenticated account.
+	handle /api/* {
+		reverse_proxy api:8000 {
+			header_up -Authorization
+			header_up -X-Remote-User
+			header_up -X-Remote-Roles
+			header_up -X-MELD-Proxy-Secret
+			header_up X-Remote-User {http.auth.user.id}
+			header_up X-Remote-Roles {meld_roles}
+			header_up X-MELD-Proxy-Secret {$MELD7T_AUTH_PROXY_SHARED_SECRET}
+		}
+	}
+
+	handle {
+		root * /srv/spa
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+# OHIF remains on its own origin because its build uses root-absolute assets.  It receives the same
+# authenticated boundary and can only reach Orthanc through this site's DICOMweb handler.
+https://{$SITE_ADDRESS}:9444 {
+	import authenticated
+	tls {$TLS_CERT_FILE} {$TLS_KEY_FILE}
+	encode zstd gzip
+	header {
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://{$SITE_ADDRESS}:9443; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors https://{$SITE_ADDRESS}:9443"
+		Cache-Control "private, no-store, max-age=0"
+		Pragma "no-cache"
+		Expires "0"
+	}
+
+	@viewer_write {
+		path /dicom-web/*
+		method POST PUT PATCH DELETE
+	}
+	handle @viewer_write {
+		respond "Browser DICOMweb is read-only" 405
+	}
+
+	@viewer_allowed {
+		expression {dicom_access} == "allow"
+	}
+	handle @viewer_allowed {
+		@viewer_dicom_read {
+			path /dicom-web/*
+			method GET HEAD OPTIONS
+		}
+		handle @viewer_dicom_read {
+			reverse_proxy orthanc:8042 {
+				header_up -Authorization
+				header_up -Cookie
+				header_up Authorization "Basic {$MELD7T_ORTHANC_BASIC_AUTH_B64}"
+			}
+		}
+		handle {
+			reverse_proxy ohif:80 {
+				header_up -Authorization
+				header_up -Cookie
+			}
+		}
+	}
+	handle {
+		respond "OHIF requires reviewer or admin role" 403
+	}
+}

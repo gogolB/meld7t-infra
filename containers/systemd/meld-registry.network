@@ -1,0 +1,12 @@
+[Unit]
+Description=meld-registry — isolated optional local release cache
+
+[Network]
+NetworkName=meld-registry-net
+Driver=bridge
+Internal=true
+Subnet=10.89.40.0/24
+Options=isolate=true
+
+[Install]
+WantedBy=default.target

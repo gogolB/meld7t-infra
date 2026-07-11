@@ -1,8 +1,36 @@
-# Pinned pipeline images — the source of truth for the software environment.
-# Populate after `just pull`, then keep updated via `just freeze`.
+# MELD 7T production image lock.
 #
-# Format:  <role>    <registry/repo@sha256:DIGEST>
+# Machine-readable format (exactly two whitespace-separated fields):
+#   <role> <fully-qualified-repository>@sha256:<manifest-digest>
 #
-# meld_graph   TODO@sha256:...        # from the MELD install docs
-# freesurfer   TODO@sha256:...        # OR fastsurfer — decided in Phase 1/2
+# `ops/release/image-lock.sh validate` rejects tags, duplicate roles, malformed digests, and
+# REQUIRED_* placeholders.  A placeholder deliberately blocks release export: rebuild that image
+# from the current committed source, inspect its repository manifest digest, and replace the whole
+# placeholder token before signing an air-gap bundle.  Never substitute an image/config ID for a
+# repository manifest digest.
 
+# Scientific/runtime images.
+meld_graph docker.io/meldproject/meld_graph@sha256:e2333882ecf984ffac63970aebf7702deea8b979a3a1e508231d06c07cefd664
+spm docker.io/spmcentral/spm@sha256:46e4df84f8b5bd7698fda250e96504719db27f0c117c702e62817f8558327522
+hippunfold docker.io/khanlab/hippunfold@sha256:b14d6593839d09de56c21c585df2c02fe78e045d53f445f9d52727dd766a408a
+
+# These two source trees are changing in this hardening release.  Rebuild after all source changes
+# are committed; do not reuse the older local images whose manifests do not contain this code.
+pkg REQUIRED_REBUILD_CURRENT_SOURCE
+api REQUIRED_REBUILD_CURRENT_SOURCE
+
+# Long-running service images.
+postgres docker.io/library/postgres@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+redis docker.io/library/redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+orthanc docker.io/orthancteam/orthanc@sha256:57a3d037729897331027ddc00c12695b50f1effbbf805f855396f3d0248d2d5f
+immudb docker.io/codenotary/immudb@sha256:ca64fd851b3e60a43115e79f71c4830935f5652e0692628fc80a475c417743a7
+ohif docker.io/ohif/app@sha256:f130db413d37d829e0c98fa49505884343e53e8d6ec72940d44327e917304913
+caddy docker.io/library/caddy@sha256:af5fdcd76f2db5e4e974ee92f96ee8c0fc3edb55bd4ba5032547cbf3f65e486d
+registry docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+
+# Offline build/dev inputs.  They are archived only when the export command requests build assets;
+# production runtime validation does not require them.
+python_base docker.io/library/python@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
+node_builder docker.io/library/node@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
+cuda_smoke docker.io/nvidia/cuda@sha256:0f6bfcbf267e65123bcc2287e2153dedfc0f24772fb5ce84afe16ac4b2fada95
+meld_dev registry.fedoraproject.org/fedora-toolbox@sha256:f94669859d5b9ff10f354bfe034cc3db3ee0d841a7b3ae7688da907c3c012d32

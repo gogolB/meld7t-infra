@@ -1,0 +1,4 @@
+# Replace this file with the hospital IAM/security approval record.  The first non-comment line must
+# be exactly the token below; retain the external ticket/change-control reference on later lines.
+INSTITUTIONAL_UNIQUE_IDENTITY_APPROVED
+TICKET=REPLACE_WITH_HOSPITAL_IAM_APPROVAL_REFERENCE

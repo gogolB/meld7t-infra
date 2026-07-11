@@ -1,0 +1,27 @@
+# meld7t pkg image (spec §2.2): DICOM↔NIfTI conversion + MP2RAGE O'Brien background clean.
+#
+# Built on the internet dev machine; pinned by digest in containers/images.lock and carried
+# across the air-gap (never pulled in prod). Compute jobs run it with --network=none (§27) —
+# it only reads/writes mounted volumes. dcmqi (NIfTI→DICOM-SEG/param-map out, §17) is added
+# here when the output-packaging step is built; for now it covers the recon INPUT path.
+# Keep rebuilds anchored to a reviewed base manifest.  The resulting pkg image is independently
+# scanned, signed into the air-gap release, and pinned in containers/images.lock.
+FROM docker.io/library/python@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
+
+# dcm2niix: DICOM → NIfTI. Baked in at build (air-gap: no runtime download).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends dcm2niix \
+ && rm -rf /var/lib/apt/lists/*
+
+# O'Brien MP2RAGE clean deps + DICOM packaging (§17): highdicom (DICOM-SEG), dicomweb-client (STOW).
+RUN pip install --no-cache-dir \
+      nibabel==5.4.2 \
+      numpy==2.5.1 \
+      scipy==1.18.0 \
+      highdicom==0.24.0 \
+      dicomweb-client==0.59.3 \
+      requests==2.34.2
+
+COPY clean_uni.py recon_prepare.py package_dicom.py series_classify.py \
+     hippunfold_summarize.py map_morphometry.py verify_cache.py /opt/pkg/
+WORKDIR /work

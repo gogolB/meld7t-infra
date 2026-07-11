@@ -1,0 +1,17 @@
+[Unit]
+Description=MELD 7T local production health gate
+After=caddy.service api.service meld7t-worker.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/meld7t/current/ops/deployment/healthcheck.sh
+Environment=MELD7T_STATE_ROOT=%h/meld7t-state
+Environment=MELD7T_CONFIG_ROOT=%h/.config/meld7t/current
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/containers -%t/containers -%t/libpod -%t/netns
+LockPersonality=true
+RestrictSUIDSGID=true
+TimeoutStartSec=60

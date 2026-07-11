@@ -1,0 +1,17 @@
+# Copy to secrets/production/redis.conf (0600), replacing the one placeholder below with the same
+# URL-percent-encoded-safe secret used by redis.env, api.env, and worker.env.
+bind 0.0.0.0
+protected-mode yes
+port 6379
+requirepass REPLACE_WITH_RANDOM_REDIS_SECRET
+dir /data
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes
+save 900 1
+save 300 10
+save 60 10000
+maxmemory-policy noeviction
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command CONFIG ""

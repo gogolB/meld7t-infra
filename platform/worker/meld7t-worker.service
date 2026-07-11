@@ -1,0 +1,44 @@
+[Unit]
+Description=meld7t worker — single-active GPU/CPU detector executor
+Wants=postgres.service redis.service orthanc.service immudb.service
+After=network-online.target postgres.service redis.service orthanc.service immudb.service
+StartLimitIntervalSec=600
+StartLimitBurst=10
+ConditionPathExists=%h/.local/lib/meld7t/current/platform/worker/run-dev.sh
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/lib/meld7t/current
+Environment=MELD7T_SYSTEMD_ENV=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-%h/.config/meld7t/current/env/worker.env
+EnvironmentFile=-%h/.config/meld7t/current/env/runtime-images.env
+ExecStart=%h/.local/lib/meld7t/current/platform/worker/run-dev.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+TimeoutStopSec=90
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=%h/meld7t-state %h/.local/share/containers -%t/containers -%t/libpod -%t/netns
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=10.89.30.0/24
+TasksMax=2048
+LimitNOFILE=65536
+CPUWeight=80
+IOWeight=80
+
+[Install]
+WantedBy=default.target

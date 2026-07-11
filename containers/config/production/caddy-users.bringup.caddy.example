@@ -1,0 +1,4 @@
+# BRING-UP ONLY. Never activate a hospital deployment with shared role accounts.
+clinical REPLACE_WITH_CADDY_BCRYPT_HASH
+meld-admin REPLACE_WITH_DIFFERENT_CADDY_BCRYPT_HASH
+meld-auditor REPLACE_WITH_DIFFERENT_CADDY_BCRYPT_HASH

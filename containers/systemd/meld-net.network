@@ -1,0 +1,12 @@
+[Unit]
+Description=meld-compute — isolated ephemeral packaging network
+
+[Network]
+NetworkName=meld-net
+Driver=bridge
+Internal=true
+Subnet=10.89.30.0/24
+Options=isolate=true
+
+[Install]
+WantedBy=default.target

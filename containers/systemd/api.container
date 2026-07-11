@@ -1,0 +1,46 @@
+[Unit]
+Description=meld7t API — authenticated orchestration and durable outbox
+Wants=postgres.service redis.service orthanc.service immudb.service
+After=network-online.target postgres.service redis.service orthanc.service immudb.service
+
+[Container]
+# Production installation replaces this source-build tag with the signed digest from images.lock.
+Image=localhost/meld7t/api:0.2.0
+Pull=never
+ContainerName=api
+Network=meld-edge.network
+Network=meld-data.network
+Volume=%h/meld7t-state/meld-data:/data:ro,z
+Volume=%h/.local/lib/meld7t/current/harmonization:/data/harmonization:ro,z
+Volume=api-immudb-state.volume:/var/lib/meld7t/immudb-state:U
+Volume=%h/.config/meld7t/current/trust/immudb-signing-public.pem:/run/secrets/immudb-public-key.pem:ro,z
+EnvironmentFile=%h/.config/meld7t/current/env/api.env
+ReadOnly=true
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m
+NoNewPrivileges=true
+DropCapability=all
+PidsLimit=256
+HealthCmd=python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=3).read()'
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=30s
+HealthRetries=3
+HealthOnFailure=kill
+Notify=healthy
+LogDriver=journald
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=45
+StartLimitIntervalSec=300
+StartLimitBurst=10
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=512
+CPUWeight=100
+IOWeight=100
+
+[Install]
+WantedBy=default.target

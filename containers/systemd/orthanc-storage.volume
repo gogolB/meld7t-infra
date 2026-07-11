@@ -1,0 +1,5 @@
+[Unit]
+Description=Orthanc DICOM storage (spec §2.5)
+
+[Volume]
+VolumeName=orthanc-storage

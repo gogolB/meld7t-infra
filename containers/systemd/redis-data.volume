@@ -1,0 +1,5 @@
+[Unit]
+Description=Redis data — queue + hot cache persistence (spec §2.5)
+
+[Volume]
+VolumeName=redis-data

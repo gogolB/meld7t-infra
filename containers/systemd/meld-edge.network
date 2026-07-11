@@ -1,0 +1,12 @@
+[Unit]
+Description=meld-edge — Caddy to API/OHIF/Orthanc only
+
+[Network]
+NetworkName=meld-edge
+Driver=bridge
+Internal=true
+Subnet=10.89.10.0/24
+Options=isolate=true
+
+[Install]
+WantedBy=default.target

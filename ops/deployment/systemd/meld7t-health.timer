@@ -1,0 +1,11 @@
+[Unit]
+Description=Run MELD 7T production health gate every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

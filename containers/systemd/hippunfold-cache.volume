@@ -1,0 +1,5 @@
+[Unit]
+Description=HippUnfold immutable model/template cache imported with the signed release
+
+[Volume]
+VolumeName=hippunfold-cache

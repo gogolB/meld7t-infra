@@ -1,0 +1,9 @@
+{
+  "roles": ["t1_uni", "t1_mprage"],
+  "acquisition": {
+    "manufacturer": {"eq": "siemens healthineers"},
+    "model": {"in": ["magnetom terra"]},
+    "field_strength_t": {"target": 7.0, "tolerance": 0.2},
+    "protocol_name": {"regex": "mp2rage|mprage"}
+  }
+}

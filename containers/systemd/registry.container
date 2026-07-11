@@ -1,0 +1,27 @@
+[Unit]
+Description=Registry — optional loopback-only image cache (signed release remains authoritative)
+After=network-online.target
+
+[Container]
+Image=docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+Pull=never
+ContainerName=registry
+Network=meld-registry.network
+Volume=registry-data.volume:/var/lib/registry
+PublishPort=127.0.0.1:5000:5000
+NoNewPrivileges=true
+PidsLimit=512
+LogDriver=journald
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStopSec=90
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=768
+CPUWeight=50
+IOWeight=100
+
+[Install]
+WantedBy=default.target

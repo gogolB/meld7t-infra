@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "code": "H_SITE_PROTOCOL",
+    "version": 1,
+    "detector_id": "meld_fcd"
+  },
+  "approval_id": "SITE-CHANGE-AND-SCIENTIFIC-APPROVAL-ID",
+  "independent_reviewer": "institutional-reviewer-identity",
+  "approved_at": "2026-07-10T12:00:00Z",
+  "acquisition_fingerprints": [
+    "REPLACE_WITH_64_HEX_KEYED_ACQUISITION_FINGERPRINT"
+  ],
+  "qc": {
+    "included": 20,
+    "excluded": 0
+  },
+  "holdout": {
+    "case_count": 3,
+    "positive_cases": 1,
+    "negative_cases": 1,
+    "control_cases": 1
+  },
+  "metrics_sha256": "REPLACE_WITH_64_HEX_HOLDOUT_METRICS_DIGEST",
+  "golden_case_evidence_sha256": "REPLACE_WITH_64_HEX_GOLDEN_CASE_EVIDENCE_DIGEST",
+  "methodology_sha256": "REPLACE_WITH_64_HEX_METHOD_DOCUMENT_DIGEST",
+  "image_digests": {
+    "meld": "REPLACE_WITH_MELD_IMAGE_AT_SHA256_DIGEST"
+  }
+}

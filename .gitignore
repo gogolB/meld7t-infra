@@ -13,3 +13,14 @@ meld-data/
 __pycache__/
 .venv/
 *.log
+
+# platform test artifacts
+test_meld.db
+*.sqlite
+
+# worker venv
+platform/worker/.venv/
+
+# web build artifacts
+platform/web/node_modules/
+platform/web/dist/
