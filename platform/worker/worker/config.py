@@ -26,6 +26,15 @@ class WorkerSettings(BaseSettings):
     dicom_max_instances_per_run: int = Field(default=20_000, ge=1, le=1_000_000)
     dicom_max_bytes_per_run: int = Field(
         default=100 * 1024 * 1024 * 1024, ge=1024 * 1024, le=10 * 1024**4)
+    case_upload_root: str = "/var/home/bazzite/meld7t-state/case-uploads"
+    case_upload_max_bytes: int = Field(
+        default=100 * 1024 * 1024 * 1024, ge=1024 * 1024, le=2 * 1024**4)
+    case_upload_max_files: int = Field(default=100_000, ge=1, le=1_000_000)
+    case_upload_max_expanded_bytes: int = Field(
+        default=100 * 1024 * 1024 * 1024, ge=1024 * 1024, le=10 * 1024**4)
+    case_upload_max_instance_bytes: int = Field(
+        default=16 * 1024 * 1024 * 1024, ge=1024 * 1024, le=1024**4)
+    branding_logo_path: str | None = None
     harmonization_root: str = "/var/home/bazzite/meld7t/meld-data/harmonization"
     harmonization_generated_root: str = "/var/home/bazzite/meld7t-state/harmonization-profiles"
     harmonization_upload_root: str = "/var/home/bazzite/meld7t-state/harmonization-uploads"
@@ -106,7 +115,7 @@ class WorkerSettings(BaseSettings):
     worker_max_jobs: int = Field(default=2, ge=1, le=8)
 
     @field_validator(
-        "repo_dir", "meld_data", "dicom_staging", "dicom_import_root",
+        "repo_dir", "meld_data", "dicom_staging", "dicom_import_root", "case_upload_root",
         "harmonization_root", "harmonization_generated_root", "harmonization_upload_root",
         "harmonization_build_root", "fs_license", "meld_license",
     )
@@ -115,6 +124,16 @@ class WorkerSettings(BaseSettings):
         path = Path(value)
         if not path.is_absolute() or ".." in path.parts:
             raise ValueError("worker filesystem paths must be absolute and contain no '..'")
+        return str(path)
+
+    @field_validator("branding_logo_path")
+    @classmethod
+    def optional_absolute_path(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        path = Path(value.strip())
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("branding logo path must be absolute without '..'")
         return str(path)
 
     @field_validator("harmonization_builder_adapter")

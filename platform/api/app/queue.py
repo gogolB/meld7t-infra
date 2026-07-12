@@ -19,7 +19,8 @@ from sqlmodel import Session, select
 
 from .config import settings
 from .models import (
-    Case, CaseStatus, HarmonizationBuild, HarmonizationBuildStatus,
+    Case, CaseReport, CaseReportStatus, CaseStatus, CaseUpload, CaseUploadStatus,
+    HarmonizationBuild, HarmonizationBuildStatus,
     HarmonizationUpload, HarmonizationUploadStatus, Job as JobRow, OutboxEvent, OutboxStatus,
     Run, RunStatus,
 )
@@ -166,6 +167,24 @@ async def enqueue_run(run_id: str, *, attempt: int = 0) -> None:
     await pool.enqueue_job("run_detector", run_id, _job_id=f"run:{run_id}:attempt:{attempt}")
 
 
+async def enqueue_case_upload(upload_id: str, dispatch_token: str | None = None) -> None:
+    pool = await get_pool()
+    token = dispatch_token or "initial"
+    await pool.enqueue_job(
+        "ingest_case_upload", upload_id,
+        _job_id=f"case-upload:{upload_id}:{token}",
+    )
+
+
+async def enqueue_case_report(report_id: str, dispatch_token: str | None = None) -> None:
+    pool = await get_pool()
+    token = dispatch_token or "initial"
+    await pool.enqueue_job(
+        "generate_case_report", report_id,
+        _job_id=f"case-report:{report_id}:{token}",
+    )
+
+
 async def enqueue_harmonization_build(build_id: str, *, attempt: int = 1,
                                       dispatch_token: str | None = None) -> None:
     pool = await get_pool()
@@ -222,6 +241,16 @@ async def dispatch_outbox_events(session: Session, *, limit: int = 50) -> dict[s
             if event.topic == "run.enqueue":
                 await enqueue_run(str(event.payload["run_id"]),
                                   attempt=int(event.payload.get("attempt", 0)))
+            elif event.topic == "case.upload.ingest":
+                await enqueue_case_upload(
+                    str(event.payload["upload_id"]),
+                    dispatch_token=event.payload.get("dispatch_token"),
+                )
+            elif event.topic == "case.report.generate":
+                await enqueue_case_report(
+                    str(event.payload["report_id"]),
+                    dispatch_token=event.payload.get("dispatch_token"),
+                )
             elif event.topic == "harmonization.build.enqueue":
                 await enqueue_harmonization_build(
                     str(event.payload["build_id"]),
@@ -370,6 +399,127 @@ async def reconcile_harmonization_jobs(session: Session, *, limit: int = 100) ->
     return counts
 
 
+async def reconcile_case_uploads(session: Session, *, limit: int = 100) -> dict[str, int]:
+    """Reopen routine intake handoffs left without a live broker job."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.queue_reconcile_grace_s)
+    uploads = session.exec(select(CaseUpload).where(
+        CaseUpload.status.in_([CaseUploadStatus.staged, CaseUploadStatus.importing])
+    ).order_by(CaseUpload.updated_at).limit(limit)).all()
+    pool = None
+    counts = {"checked": 0, "created": 0, "reopened": 0}
+    for upload in uploads:
+        dedupe_key = f"case.upload.ingest:{upload.id}"
+        event = session.exec(select(OutboxEvent).where(
+            OutboxEvent.dedupe_key == dedupe_key)).first()
+        if event is None:
+            session.add(OutboxEvent(
+                dedupe_key=dedupe_key, topic="case.upload.ingest",
+                aggregate_type="case_upload", aggregate_id=upload.id,
+                payload={"upload_id": upload.id},
+            ))
+            counts["created"] += 1
+            continue
+        published_at = event.published_at
+        if published_at is not None and published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        if (event.status != OutboxStatus.published or published_at is None
+                or published_at >= cutoff):
+            continue
+        counts["checked"] += 1
+        if pool is None:
+            pool = await get_pool()
+        token = event.payload.get("dispatch_token")
+        job_id = f"case-upload:{upload.id}:{token or 'initial'}"
+        status = await Job(job_id, pool).status()
+        if status not in {JobStatus.not_found, JobStatus.complete}:
+            continue
+        dispatch_token = f"reconcile-{event.attempts + 1}"
+        event.payload = {"upload_id": upload.id, "dispatch_token": dispatch_token}
+        event.status = OutboxStatus.pending
+        event.available_at = datetime.now(timezone.utc)
+        event.published_at = None
+        event.last_error = f"reconciled missing Redis job ({status.value})"
+        session.add(event)
+        counts["reopened"] += 1
+    if counts["created"] or counts["reopened"]:
+        session.commit()
+    return counts
+
+
+async def reconcile_case_reports(session: Session, *, limit: int = 100) -> dict[str, int]:
+    """Reopen report handoffs whose deterministic broker job disappeared."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.queue_reconcile_grace_s)
+    reports = session.exec(select(CaseReport).where(
+        CaseReport.status == CaseReportStatus.queued
+    ).order_by(CaseReport.updated_at).limit(limit)).all()
+    pool = None
+    counts = {"checked": 0, "created": 0, "reopened": 0}
+    for report in reports:
+        dedupe_key = f"case.report.generate:{report.id}"
+        event = session.exec(select(OutboxEvent).where(
+            OutboxEvent.dedupe_key == dedupe_key)).first()
+        if event is None:
+            session.add(OutboxEvent(
+                dedupe_key=dedupe_key, topic="case.report.generate",
+                aggregate_type="case_report", aggregate_id=report.id,
+                payload={"report_id": report.id},
+            ))
+            counts["created"] += 1
+            continue
+        published_at = event.published_at
+        if published_at is not None and published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        if (event.status != OutboxStatus.published or published_at is None
+                or published_at >= cutoff):
+            continue
+        counts["checked"] += 1
+        if pool is None:
+            pool = await get_pool()
+        token = event.payload.get("dispatch_token") or "initial"
+        status = await Job(f"case-report:{report.id}:{token}", pool).status()
+        if status not in {JobStatus.not_found, JobStatus.complete}:
+            continue
+        dispatch_token = f"reconcile-{event.attempts + 1}"
+        event.payload = {"report_id": report.id, "dispatch_token": dispatch_token}
+        event.status = OutboxStatus.pending
+        event.available_at = datetime.now(timezone.utc)
+        event.published_at = None
+        event.last_error = f"reconciled missing Redis job ({status.value})"
+        session.add(event)
+        counts["reopened"] += 1
+    if counts["created"] or counts["reopened"]:
+        session.commit()
+    return counts
+
+
+def reap_stale_case_reports(session: Session, *, limit: int = 100) -> dict[str, int]:
+    """Fence a crashed report renderer so an old worker cannot publish after timeout."""
+    from . import audit
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.case_report_timeout_minutes)
+    statement = select(CaseReport).where(
+        CaseReport.status == CaseReportStatus.generating,
+        CaseReport.updated_at <= cutoff,
+    ).order_by(CaseReport.updated_at).limit(limit)
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        statement = statement.with_for_update(skip_locked=True)
+    rows = session.exec(statement).all()
+    for row in rows:
+        row.status = CaseReportStatus.failed
+        row.last_error = "generation_timeout"
+        row.updated_at = datetime.now(timezone.utc)
+        row.completed_at = row.updated_at
+        session.add(row)
+        audit.record(
+            session, actor="service:api-reconciler", action="case_report.fail",
+            entity_type="case_report", entity_id=row.id,
+            payload={"error_code": "generation_timeout"},
+        )
+    if rows:
+        session.commit()
+    return {"reaped": len(rows)}
+
+
 def reap_stale_runs(session: Session, *, limit: int = 100) -> dict[str, int]:
     """Fail expired active claims so a worker/host crash cannot strand a case forever.
 
@@ -432,6 +582,82 @@ def reap_stale_runs(session: Session, *, limit: int = 100) -> dict[str, int]:
             failed_cases += 1
     session.commit()
     return {"reaped": len(rows), "cases_failed": failed_cases}
+
+
+def reap_stale_case_uploads(session: Session, *, limit: int = 100) -> dict[str, int]:
+    """Expire abandoned routine chunks and clear terminal upload archives."""
+    from . import audit
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.case_upload_expiry_hours)
+    statement = select(CaseUpload).where(
+        CaseUpload.status == CaseUploadStatus.receiving,
+        CaseUpload.updated_at <= cutoff,
+    ).order_by(CaseUpload.updated_at).limit(limit)
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        statement = statement.with_for_update(skip_locked=True)
+    rows = session.exec(statement).all()
+    root = Path(settings.case_upload_root).resolve()
+    removed = 0
+    for row in rows:
+        candidate = root / row.storage_key
+        file_removed = False
+        try:
+            if candidate.parent == root and candidate.is_file() and not candidate.is_symlink():
+                candidate.unlink()
+                removed += 1
+                file_removed = True
+        except OSError:
+            pass
+        row.status = CaseUploadStatus.failed
+        row.last_error = "upload_session_expired"
+        row.updated_at = datetime.now(timezone.utc)
+        if file_removed:
+            row.staging_cleaned_at = row.updated_at
+        session.add(row)
+        audit.record(
+            session, actor="service:api-reconciler", action="case_upload.expire",
+            entity_type="case_upload", entity_id=row.id,
+            payload={"received_size": row.received_size,
+                     "staging_file_removed": file_removed},
+        )
+
+    terminal = session.exec(select(CaseUpload).where(
+        CaseUpload.status.in_([CaseUploadStatus.ready, CaseUploadStatus.failed]),
+        CaseUpload.staging_cleaned_at.is_(None),
+    ).order_by(CaseUpload.updated_at).limit(limit)).all()
+    terminal_removed = 0
+    for row in terminal:
+        if (row.import_result or {}).get("phase") == "rollback_incomplete":
+            # Exact source bytes and the receipt are the operator's evidence/recovery material;
+            # never reap them as ordinary terminal staging.
+            row.updated_at = datetime.now(timezone.utc)
+            session.add(row)
+            continue
+        candidate = root / row.storage_key
+        receipt = root / f"{row.storage_key}.receipt"
+        clean = True
+        for path in (candidate, receipt):
+            try:
+                if path.parent == root and path.is_file() and not path.is_symlink():
+                    path.unlink()
+                    terminal_removed += 1
+                elif path.exists() or path.is_symlink():
+                    clean = False
+            except OSError:
+                clean = False
+        if clean:
+            row.staging_cleaned_at = datetime.now(timezone.utc)
+            session.add(row)
+        else:
+            # Rotate an undeletable/corrupt entry behind later terminal cleanup work. Without this,
+            # the oldest ``limit`` rows can be selected forever and prevent every newer archive
+            # from being reaped.
+            row.updated_at = datetime.now(timezone.utc)
+            session.add(row)
+    if rows or terminal:
+        session.commit()
+    return {"expired": len(rows), "files_removed": removed,
+            "terminal_files_removed": terminal_removed}
 
 
 def reap_stale_harmonization_uploads(session: Session, *, limit: int = 100) -> dict[str, int]:

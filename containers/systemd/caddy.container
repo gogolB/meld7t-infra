@@ -12,6 +12,7 @@ Volume=caddy-data.volume:/data
 Volume=%h/.config/meld7t/current/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
 Volume=%h/.config/meld7t/current/caddy/auth:/etc/caddy/auth:ro,z
 Volume=%h/.config/meld7t/current/tls:/etc/caddy/tls:ro,z
+Volume=%h/.config/meld7t/current/branding:/srv/branding:ro,z
 Volume=%h/.local/lib/meld7t/current/platform/web/dist:/srv/spa:ro,z
 EnvironmentFile=%h/.config/meld7t/current/env/caddy.env
 PublishPort=9443:9443

@@ -18,6 +18,7 @@ import numpy as np
 
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
+HAS_HIGHDICOM = importlib.util.find_spec("highdicom") is not None
 
 import map_morphometry  # noqa: E402
 import recon_prepare  # noqa: E402
@@ -49,7 +50,59 @@ def _load_package_dicom():
     return module
 
 
+def _load_derived_dicom():
+    package_dicom = _load_package_dicom()
+    sys.modules["package_dicom"] = package_dicom
+    spec = importlib.util.spec_from_file_location(
+        "package_derived_dicom_under_test", PKG / "package_derived_dicom.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class PackageContractsTest(unittest.TestCase):
+    @unittest.skipUnless(HAS_HIGHDICOM, "real highdicom is exercised in the pkg image")
+    def test_real_highdicom_builds_map_seg_and_parametric_maps(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shape = (4, 5, 6)
+            affine = np.diag([1.5, 2.0, 2.5, 1.0])
+            t1 = root / "T1.nii.gz"
+            deformation = root / "iy_T1.nii"
+            nib.save(nib.Nifti1Image(np.ones(shape, dtype=np.float32), affine), t1)
+            indices = np.indices(shape).reshape(3, -1).T
+            world = nib.affines.apply_affine(affine, indices).reshape((*shape, 3))
+            nib.save(nib.Nifti1Image(world[:, :, :, None, :], affine), deformation)
+            paths = {}
+            for feature, axis in (("junction", 0), ("extension", 1)):
+                threshold = (np.indices(shape)[axis] > 1).astype(np.uint8)
+                z_map = np.linspace(-4, 7, np.prod(shape), dtype=np.float32).reshape(shape)
+                paths[f"{feature}_threshold"] = root / f"{feature}_threshold.nii.gz"
+                paths[f"{feature}_z"] = root / f"{feature}_z.nii.gz"
+                nib.save(nib.Nifti1Image(threshold, affine), paths[f"{feature}_threshold"])
+                nib.save(nib.Nifti1Image(z_map, affine), paths[f"{feature}_z"])
+            manifest = root / "manifest.json"
+            subprocess.run([
+                sys.executable, str(PKG / "package_derived_dicom.py"), "map",
+                "--t1", str(t1), "--inverse-deformation", str(deformation),
+                "--junction-threshold", str(paths["junction_threshold"]),
+                "--junction-z", str(paths["junction_z"]),
+                "--extension-threshold", str(paths["extension_threshold"]),
+                "--extension-z", str(paths["extension_z"]),
+                "--pseudonym", "P001", "--uid-seed", "run-1",
+                "--study-uid-seed", "recipe-1", "--expected-clusters", "1",
+                "--harmonization-status", "unharmonized",
+                "--manifest-output", str(manifest),
+            ], check=True, capture_output=True, text=True)
+            document = json.loads(manifest.read_text())
+            roles = {item["role"] for item in document["derived_series"]["series"]}
+            self.assertEqual(roles, {
+                "map_native_t1_reference", "map_candidate_segmentation",
+                "map_junction_z_parametric_map", "map_extension_z_parametric_map",
+            })
+            self.assertEqual(document["derived_series"]["harmonization"]["status"],
+                             "unharmonized")
+
     def test_hippunfold_cache_runtime_verifies_exact_file_closure(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -123,10 +176,14 @@ class PackageContractsTest(unittest.TestCase):
         class DICOMwebClient:
             response_sops = ["1.2.3.1"]
             qido_sops = ["1.2.3.1", "1.2.3.2"]
+            last_url = None
+            last_session = None
 
             def __init__(self, *, url, session):
                 self.url = url
                 self.session = session
+                type(self).last_url = url
+                type(self).last_session = session
 
             def store_instances(self, _datasets):
                 return types.SimpleNamespace(
@@ -167,7 +224,12 @@ class PackageContractsTest(unittest.TestCase):
                 package_dicom.stow("http://orthanc/dicom-web", datasets)
 
             DICOMwebClient.qido_sops = ["1.2.3.1", "1.2.3.2"]
-            package_dicom.stow("http://orthanc/dicom-web", datasets)
+            package_dicom.stow(
+                "http://meld-internal:p%40ssword@orthanc:8042/dicom-web", datasets)
+            self.assertEqual(
+                DICOMwebClient.last_url, "http://orthanc:8042/dicom-web")
+            self.assertEqual(
+                DICOMwebClient.last_session.auth, ("meld-internal", "p@ssword"))
 
     def test_seg_wado_semantics_bind_per_frame_geometry(self):
         package_dicom = _load_package_dicom()
@@ -203,6 +265,118 @@ class PackageContractsTest(unittest.TestCase):
         first = package_dicom._critical_dicom_semantics(dataset([0, 0, 0]))
         changed = package_dicom._critical_dicom_semantics(dataset([0, 0, 0.7]))
         self.assertNotEqual(first, changed)
+
+    def test_parametric_map_wado_semantics_bind_float_pixels(self):
+        package_dicom = _load_package_dicom()
+
+        def dataset(values, slope=1.0):
+            mapping = types.SimpleNamespace(
+                LUTLabel="MAPZ", LUTExplanation="MAP z", RealWorldValueSlope=slope,
+                RealWorldValueIntercept=0.0, MeasurementUnitsCodeSequence=[
+                    types.SimpleNamespace(CodeValue="1", CodingSchemeDesignator="UCUM",
+                                          CodeMeaning="no units")],
+                QuantityDefinitionSequence=[],
+            )
+            return types.SimpleNamespace(
+                SOPClassUID="1.2.840", SOPInstanceUID="1.2.840.1",
+                StudyInstanceUID="1.2.5", SeriesInstanceUID="1.2.6",
+                FrameOfReferenceUID="1.2.7", Modality="OT", NumberOfFrames=1,
+                FloatPixelData=np.asarray(values, dtype=np.float32).tobytes(),
+                SharedFunctionalGroupsSequence=[types.SimpleNamespace(
+                    RealWorldValueMappingSequence=[mapping])],
+            )
+
+        first = package_dicom._critical_dicom_semantics(dataset([0.0, 1.0]))
+        changed = package_dicom._critical_dicom_semantics(dataset([0.0, 2.0]))
+        self.assertEqual(first["pixel_data_keyword"], "FloatPixelData")
+        self.assertNotEqual(first["pixel_sha256"], changed["pixel_sha256"])
+        changed_mapping = package_dicom._critical_dicom_semantics(
+            dataset([0.0, 1.0], slope=2.0))
+        self.assertNotEqual(first, changed_mapping)
+
+    def test_recipe_study_uid_is_shared_but_run_series_uids_are_unique(self):
+        package_dicom = _load_package_dicom()
+        self.assertEqual(
+            package_dicom.deterministic_uid("recipe-1", "study"),
+            package_dicom.deterministic_uid("recipe-1", "study"),
+        )
+        self.assertNotEqual(
+            package_dicom.deterministic_uid("run-1", "map-seg-series"),
+            package_dicom.deterministic_uid("run-2", "map-seg-series"),
+        )
+
+    def test_unharmonized_warning_is_visible_and_hashed_in_series_manifest(self):
+        package_dicom = _load_package_dicom()
+        datasets = [types.SimpleNamespace(
+            StudyInstanceUID="1.2.3", SeriesInstanceUID="1.2.4",
+            SOPInstanceUID="1.2.5", Modality="SEG", SeriesDescription="MAP candidates",
+        )]
+        provenance = package_dicom.harmonization_provenance("unharmonized")
+        package_dicom.mark_harmonization(datasets, provenance)
+        self.assertIn("UNHARMONIZED RESEARCH RESULT", datasets[0].SeriesDescription)
+        self.assertIn("UNHARMONIZED RESEARCH RESULT", datasets[0].DerivationDescription)
+        manifest = package_dicom.derived_series_manifest(
+            datasets, {"1.2.4": "map_candidate_segmentation"}, provenance)
+        self.assertEqual(manifest["harmonization"]["status"], "unharmonized")
+        before = package_dicom._critical_dicom_semantics(datasets[0])
+        datasets[0].DerivationDescription = "warning removed"
+        after = package_dicom._critical_dicom_semantics(datasets[0])
+        self.assertNotEqual(before, after)
+
+    def test_spm_inverse_deformation_pulls_mni_map_to_native_grid(self):
+        derived = _load_derived_dicom()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shape = (4, 5, 6)
+            affine = np.diag([1.5, 2.0, 2.5, 1.0])
+            native = root / "T1.nii.gz"
+            mni = root / "z.nii.gz"
+            deformation = root / "iy_T1.nii"
+            values = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+            nib.save(nib.Nifti1Image(np.ones(shape, dtype=np.float32), affine), native)
+            nib.save(nib.Nifti1Image(values, affine), mni)
+            indices = np.indices(shape).reshape(3, -1).T
+            world = nib.affines.apply_affine(affine, indices).reshape((*shape, 3))
+            nib.save(nib.Nifti1Image(world[:, :, :, None, :], affine), deformation)
+
+            pulled, pulled_affine = derived.pull_mni_to_native(
+                str(mni), str(deformation), str(native), order=1)
+            np.testing.assert_allclose(pulled, values, atol=1e-4)
+            np.testing.assert_allclose(pulled_affine, affine)
+
+    def test_spm_inverse_deformation_rejects_wrong_native_grid(self):
+        derived = _load_derived_dicom()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            native = root / "T1.nii.gz"
+            mni = root / "z.nii.gz"
+            deformation = root / "iy_T1.nii"
+            nib.save(nib.Nifti1Image(np.ones((4, 4, 4)), np.eye(4)), native)
+            nib.save(nib.Nifti1Image(np.ones((4, 4, 4)), np.eye(4)), mni)
+            nib.save(nib.Nifti1Image(np.zeros((3, 4, 4, 1, 3)), np.eye(4)), deformation)
+            with self.assertRaisesRegex(derived.dicom.GeometryError, "does not match"):
+                derived.pull_mni_to_native(
+                    str(mni), str(deformation), str(native), order=0)
+
+    def test_hippunfold_dseg_resampling_is_discrete_and_requires_overlap(self):
+        derived = _load_derived_dicom()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            native = root / "T2.nii.gz"
+            dseg = root / "hemi-L_desc-subfields_dseg.nii.gz"
+            nib.save(nib.Nifti1Image(np.ones((6, 6, 6)), np.eye(4)), native)
+            data = np.zeros((3, 3, 3), dtype=np.uint8)
+            data[1, 1, 1] = 3
+            nib.save(nib.Nifti1Image(data, np.diag([2.0, 2.0, 2.0, 1.0])), dseg)
+            resampled, _ = derived.resample_dseg_to_native(str(dseg), str(native))
+            self.assertLessEqual(set(np.unique(resampled)), {0, 3})
+            self.assertTrue(np.any(resampled == 3))
+
+            shifted = np.eye(4)
+            shifted[:3, 3] = 1000
+            nib.save(nib.Nifti1Image(data, shifted), dseg)
+            with self.assertRaisesRegex(derived.dicom.GeometryError, "no overlap"):
+                derived.resample_dseg_to_native(str(dseg), str(native))
 
     def test_recon_exact_uid_override_never_rediscovers(self):
         series = {

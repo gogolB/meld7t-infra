@@ -139,6 +139,52 @@ def test_server_blocks_ad_hoc_profile_create_validate_and_activate(monkeypatch):
                 "missing", principal=principal, session=session)
 
 
+def test_development_profile_workflow_allows_one_admin_for_every_transition(monkeypatch):
+    isolated = create_engine("sqlite://")
+    SQLModel.metadata.create_all(isolated)
+    principal = Principal(
+        subject="operator", roles=frozenset({Role.admin}),
+        auth_method="trusted_proxy", request_id="single-admin-profile",
+    )
+    monkeypatch.setattr(settings, "deployment_mode", "development")
+    monkeypatch.setattr(
+        harmonization_routes, "verify_artifact_manifest",
+        lambda *_args, **_kwargs: {"files": [], "manifest_sha256": "a" * 64},
+    )
+    monkeypatch.setattr(
+        harmonization_routes, "validate_profile_semantics",
+        lambda *_args, **_kwargs: None,
+    )
+    body = harmonization_routes.ProfileCreate(
+        code="HDEV", version=1, name="development profile", method="identity",
+        selector={"acquisition": {"model": {"eq": "terra"}}},
+        artifact_manifest={"files": []},
+        parameters={"scientific_validation": {"independent_reviewer": "another-user"}},
+    )
+    with Session(isolated) as session:
+        created = harmonization_routes.create_profile(
+            body, principal=principal, session=session)
+        with pytest.raises(HTTPException, match="does not match"):
+            harmonization_routes.validate_profile(
+                created["id"], principal=principal, session=session)
+        profile = session.get(models.HarmonizationProfile, created["id"])
+        profile.parameters = {
+            **profile.parameters,
+            "scientific_validation": {"independent_reviewer": principal.subject},
+        }
+        session.add(profile)
+        session.commit()
+
+        validated = harmonization_routes.validate_profile(
+            created["id"], principal=principal, session=session)
+        assert validated["status"] == "validated"
+        active = harmonization_routes.activate_profile(
+            created["id"], principal=principal, session=session)
+        assert active["status"] == "active"
+        session.refresh(profile)
+        assert profile.created_by == profile.validated_by == principal.actor
+
+
 def test_runtime_profile_trust_requires_exact_signed_document(monkeypatch):
     isolated = create_engine("sqlite://")
     SQLModel.metadata.create_all(isolated)
@@ -828,7 +874,7 @@ async def test_missing_harmonization_broker_job_reopens_durable_handoff(monkeypa
         assert event.payload["dispatch_token"] == "reconcile-2"
 
 
-def test_generated_candidate_requires_bound_evidence_and_three_administrators(
+def test_generated_candidate_accepts_single_admin_with_bound_evidence(
         monkeypatch, tmp_path):
     isolated = create_engine("sqlite://")
     SQLModel.metadata.create_all(isolated)
@@ -836,19 +882,19 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
     selector = {"roles": ["t1_uni"], "acquisition": {"model": {"eq": "terra"}}}
     frozen = {
         "schema_version": 1, "cohort_id": "cohort", "profile": {
-            "code": "HTHREEADMINS", "version": 1, "detector_id": "meld_fcd"},
+            "code": "HSINGLEADMIN", "version": 1, "detector_id": "meld_fcd"},
         "source_role": "t1_uni", "selector": selector, "minimum_controls": 20,
         "cv_folds": 5, "studies": [], "demographics_sha256": "d" * 64,
         "cv_plan_sha256": "e" * 64,
     }
     frozen["manifest_sha256"] = canonical_sha256(frozen)
-    data_root = tmp_path / "profiles" / "HTHREEADMINS" / "v1"
+    data_root = tmp_path / "profiles" / "HSINGLEADMIN" / "v1"
     data_root.mkdir(parents=True)
-    artifact = data_root / "MELD_HTHREEADMINScombat_parameters.hdf5"
+    artifact = data_root / "MELD_HSINGLEADMINcombat_parameters.hdf5"
     artifact.write_bytes(b"combat")
     artifact_manifest = {
         "schema_version": 1,
-        "files": [{"path": "profiles/HTHREEADMINS/v1/" + artifact.name,
+        "files": [{"path": "profiles/HSINGLEADMIN/v1/" + artifact.name,
                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
                    "size": artifact.stat().st_size}],
         "cohort_manifest_sha256": frozen["manifest_sha256"],
@@ -893,8 +939,8 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
     artifact_manifest["builder_adapter_sha256"] = ADAPTER_SHA256
     with Session(isolated) as session:
         cohort = models.HarmonizationCohort(
-            id="cohort", name="three admins", site_code="SITE",
-            profile_code="HTHREEADMINS", profile_version=1, source_role="t1_uni",
+            id="cohort", name="single admin", site_code="SITE",
+            profile_code="HSINGLEADMIN", profile_version=1, source_role="t1_uni",
             selector=selector, min_controls=20, cv_folds=5, status="frozen",
             frozen_manifest=frozen, created_by="user:initiator", approved_by="user:initiator",
         )
@@ -921,7 +967,7 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
                 "selector_canonical_sha256": canonical_json_sha256(selector),
                 "build_images": {"meld": qc["builder_image_digest"]},
                 "builder_adapter_sha256": ADAPTER_SHA256,
-                "data_root": "profiles/HTHREEADMINS/v1", "storage_scope": "generated",
+                "data_root": "profiles/HSINGLEADMIN/v1", "storage_scope": "generated",
                 "internal_cv_report_sha256": qc["report_sha256"],
             }, created_by="service:harmonization-builder",
         )
@@ -947,7 +993,7 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
             "schema_version": 1,
             "profile": {"code": cohort.profile_code, "version": 1,
                         "detector_id": "meld_fcd"},
-            "approval_id": "GOLDEN-001", "independent_reviewer": "validator",
+            "approval_id": "GOLDEN-001", "independent_reviewer": "initiator",
             "approved_at": "2026-07-11T12:00:00Z",
             "acquisition_fingerprints": ["a" * 64],
             "qc": {"included": 20, "excluded": 0},
@@ -958,8 +1004,8 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
             "image_digests": {"meld": qc["builder_image_digest"]},
             "builder_adapter_sha256": ADAPTER_SHA256,
         }
-        validator = Principal(
-            subject="validator", roles=frozenset({Role.admin}),
+        administrator = Principal(
+            subject="initiator", roles=frozenset({Role.admin}),
             auth_method="trusted_proxy", request_id="validate")
         with pytest.raises(HTTPException, match="adapter differs"):
             cohort_routes.validate_build(
@@ -967,7 +1013,7 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
                 cohort_routes.BuildValidation(scientific_validation={
                     **report, "builder_adapter_sha256": "0" * 64,
                 }),
-                principal=validator, session=session,
+                principal=administrator, session=session,
             )
         with pytest.raises(HTTPException, match="methodology"):
             cohort_routes.validate_build(
@@ -975,22 +1021,22 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
                 cohort_routes.BuildValidation(scientific_validation={
                     **report, "methodology_sha256": "0" * 64,
                 }),
-                principal=validator, session=session,
+                principal=administrator, session=session,
             )
         validated = cohort_routes.validate_build(
             build.id, cohort_routes.BuildValidation(scientific_validation=report),
-            principal=validator, session=session)
+            principal=administrator, session=session)
         assert validated["status"] == "validated"
-        activator = Principal(
-            subject="activator", roles=frozenset({Role.admin}),
-            auth_method="trusted_proxy", request_id="activate")
         active = cohort_routes.activate_build(
-            build.id, principal=activator, session=session)
+            build.id, principal=administrator, session=session)
         assert active["status"] == "active"
         session.refresh(profile)
         assert profile.status == models.HarmonizationProfileStatus.active
+        session.refresh(build)
+        assert (build.initiated_by == build.validated_by == build.activated_by
+                == administrator.actor)
         exported = cohort_routes.export_build_for_release(
-            build.id, principal=activator, session=session)
+            build.id, principal=administrator, session=session)
         assert exported["profile_document"]["parameters"]["storage_scope"] == "release"
         assert exported["builder_adapter_sha256"] == ADAPTER_SHA256
         assert exported["profile_document"]["artifact_manifest"][
@@ -998,6 +1044,16 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
         assert exported["expected_inventory_entry"]["document_sha256"] \
             == profile_import._release_promotion_sha256(profile)
         assert runtime_profile_trusted(session, profile) is True
+        monkeypatch.setattr(main, "engine", isolated)
+        monkeypatch.setattr(main.settings, "harmonization_expected_profiles", [])
+        assert main._scan_harmonization_profiles_off_loop()["ready"] is True
+        build.activated_by = None
+        session.add(build)
+        session.commit()
+        assert runtime_profile_trusted(session, profile) is False
+        build.activated_by = administrator.actor
+        session.add(build)
+        session.commit()
         profile.parameters = {
             **profile.parameters, "builder_adapter_sha256": "8" * 64,
         }
@@ -1010,10 +1066,10 @@ def test_generated_candidate_requires_bound_evidence_and_three_administrators(
         session.commit()
         with pytest.raises(HTTPException, match="active generated profile"):
             cohort_routes.export_build_for_release(
-                build.id, principal=activator, session=session)
+                build.id, principal=administrator, session=session)
 
 
-def test_independent_rejection_archives_candidate_and_requires_new_version():
+def test_single_admin_rejection_archives_candidate_and_requires_new_version():
     isolated = create_engine("sqlite://")
     SQLModel.metadata.create_all(isolated)
     with Session(isolated) as session:
@@ -1042,7 +1098,7 @@ def test_independent_rejection_archives_candidate_and_requires_new_version():
         session.add(build)
         session.commit()
         reviewer = Principal(
-            subject="reviewer", roles=frozenset({Role.admin}),
+            subject="initiator", roles=frozenset({Role.admin}),
             auth_method="trusted_proxy", request_id="reject",
         )
         result = cohort_routes.reject_build(

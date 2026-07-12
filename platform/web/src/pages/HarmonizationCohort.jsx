@@ -515,7 +515,7 @@ export default function HarmonizationCohort() {
                 onChange={(e) => setCriteria(e.target.value)} required /></div>
           </div>
           <p className="muted">Criteria must come from the approved methodology. Internal
-            cross-validation measures stability; it does not replace independent validation.</p>
+            cross-validation measures stability; it does not replace external validation.</p>
           <button className="btn" disabled={busy === "build"}>
             {busy === "build" ? "Queueing…" : "Queue build"}</button>
         </form>
@@ -575,7 +575,7 @@ export default function HarmonizationCohort() {
         </div>}
 
         {build.data?.status === "qc_review" && <div className="action-box">
-          <h3>Independent scientific validation</h3>
+          <h3>Scientific validation</h3>
           <p className="warning">The internal control-cohort cross-validation above measures
             stability only. Validation still requires an external schema-v1 report with positive,
             negative, and control holdouts and profile-bound evidence hashes.</p>
@@ -586,7 +586,7 @@ export default function HarmonizationCohort() {
           <textarea id="scientific-validation-json" rows="12" value={scientificValidation}
             onChange={(e) => setScientificValidation(e.target.value)} required />
           <button type="button" className="btn" disabled={busy === "validate"}
-            onClick={validateBuild}>Independently validate candidate</button>
+            onClick={validateBuild}>Validate candidate</button>
           <div className="subpanel">
             <h3>Reject candidate</h3>
             <label htmlFor="rejection-reason">Scientific rejection reason</label>
@@ -600,8 +600,8 @@ export default function HarmonizationCohort() {
           </div>
         </div>}
         {build.data?.status === "validated" && <div className="action-box">
-          <p>A third administrator, independent of both the build initiator and validator, must
-            activate this immutable profile.</p>
+          <p>Activate the scientifically validated immutable profile for matching research
+            studies. The authenticated actor and evidence remain recorded in the audit trail.</p>
           <button type="button" className="btn" disabled={busy === "activate"}
             onClick={() => action("activate", () => api.activateHarmonizationBuild(buildId),
               "Profile activated for matching research studies.")}>Activate profile</button>

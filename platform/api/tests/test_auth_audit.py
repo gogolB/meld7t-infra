@@ -11,11 +11,11 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 from starlette.requests import Request
 
-from app import audit, auth
+from app import audit, auth, harmonization_routes
 from app.config import LocalAuthToken, Settings
 from app.models import AuditRecord, OutboxEvent, OutboxStatus
 from app.models import Case
-from app.routes import _authorize_case
+from app.routes import _authorize_case, _case_public
 
 
 LONG_USER_TOKEN = "user-token-" + "a" * 48
@@ -101,18 +101,26 @@ def test_service_intake_can_be_assigned_to_named_submitter():
         auth_method="bearer_token", request_id="assigned-test",
     )
     _authorize_case(assigned, case, mutate=True)
+    assert _case_public(case, assigned)["permissions"] == {"can_mutate": True}
     unassigned = auth.Principal(
         subject="someone-else@example.test", roles=frozenset({auth.Role.submitter}),
         auth_method="bearer_token", request_id="unassigned-test",
     )
     with pytest.raises(HTTPException, match="case access denied"):
         _authorize_case(unassigned, case, mutate=True)
+    assert _case_public(case, unassigned)["permissions"] == {"can_mutate": False}
     intake = auth.Principal(
         subject="different-intake", roles=frozenset({auth.Role.service}),
         auth_method="service_token", request_id="intake-test", service=True,
     )
+    # Every authenticated institutional identity may review; ownership still fences mutations.
+    _authorize_case(intake, case)
+    harmonization_routes._case_access(intake, case)
+    assert _case_public(case, intake)["permissions"] == {"can_mutate": False}
     with pytest.raises(HTTPException, match="case access denied"):
-        _authorize_case(intake, case)
+        _authorize_case(intake, case, mutate=True)
+    with pytest.raises(HTTPException, match="case access denied"):
+        harmonization_routes._case_access(intake, case, mutate=True)
 
 
 def test_bearer_and_service_tokens_create_typed_principals(monkeypatch):

@@ -115,6 +115,14 @@ jobs:
           uv sync --locked --python 3.13 --extra dev
           uv run --locked pytest
 
+      - name: Test and build web application
+        working-directory: platform/web
+        shell: bash
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+          npm run build
+
       - name: Test release and deployment tooling
         shell: bash
         run: |
@@ -128,6 +136,7 @@ jobs:
           --with nibabel==5.4.2
           --with numpy==2.5.1
           --with scipy==1.18.0
+          --with highdicom==0.24.0
           python -m unittest discover -s containers/pkg/tests -v
 
       - name: Build release assets

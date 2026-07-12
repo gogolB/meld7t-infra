@@ -77,6 +77,7 @@ async def run_process(
     capture_stdout: bool = False,
     timeout_s: int | None = None,
     display_cmd: list[str] | None = None,
+    env: dict[str, str] | None = None,
 ) -> ProcessResult:
     """Run ``cmd`` with a hard timeout and cancellation-safe process/container cleanup."""
     timeout = timeout_s if timeout_s is not None else wsettings.subprocess_timeout_s
@@ -89,6 +90,7 @@ async def run_process(
             stdout=asyncio.subprocess.PIPE if capture_stdout else log,
             stderr=log,
             start_new_session=True,
+            env=({**os.environ, **env} if env is not None else None),
         )
         try:
             if capture_stdout:

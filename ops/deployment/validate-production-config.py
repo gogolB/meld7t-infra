@@ -19,6 +19,10 @@ PLACEHOLDER = re.compile(r"CHANGE_ME|REPLACE_|OPERATOR|example\.hospital|placeho
 DIGEST_REF = re.compile(r"^[^\s@]+/[^\s@]+@sha256:[0-9a-f]{64}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 BCRYPT = re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$")
+OPTIONAL_EMPTY_ENV_KEYS = {"MELD7T_BRANDING_LOGO_PATH"}
+MAX_REPORT_LOGO_BYTES = 5 * 1024 * 1024
+MAX_REPORT_LOGO_DIMENSION = 8192
+MAX_REPORT_LOGO_PIXELS = 4_000_000
 
 
 def fail(message: str) -> None:
@@ -46,6 +50,9 @@ def env_file(path: Path) -> dict[str, str]:
             fail(f"{path}:{line_no}: duplicate variable {key}")
         if re.search(r"\s[#;]", value):
             fail(f"{path}:{line_no}: trailing comments are forbidden in EnvironmentFile values")
+        if not value and key in OPTIONAL_EMPTY_ENV_KEYS:
+            values[key] = ""
+            continue
         if not value or PLACEHOLDER.search(value):
             fail(f"{path}:{line_no}: empty or placeholder value for {key}")
         values[key] = value
@@ -76,6 +83,155 @@ def strong_secret(value: str, label: str, minimum: int = 32) -> None:
         fail(f"{label} must be at least {minimum} characters with adequate variation")
 
 
+def orthanc_storage_cap(values: dict[str, str], label: str) -> int:
+    try:
+        storage_mib = int(values["ORTHANC__MAXIMUM_STORAGE_SIZE"])
+    except ValueError as exc:
+        fail(f"{label} storage cap must be numeric: {exc}")
+    if not 102400 <= storage_mib <= 10 * 1024 * 1024:
+        fail(f"{label} storage cap must be between 100 GiB and 10 TiB")
+    if values["ORTHANC__MAXIMUM_STORAGE_MODE"] != "Reject":
+        fail(f"{label} must reject at its cap instead of recycling studies")
+    return storage_mib
+
+
+def _report_logo_dimensions(payload: bytes) -> tuple[int, int]:
+    png_signature = b"\x89PNG\r\n\x1a\n"
+    if payload.startswith(png_signature):
+        if (len(payload) < 24 or payload[8:12] != b"\x00\x00\x00\r"
+                or payload[12:16] != b"IHDR"):
+            fail("report branding logo has an invalid PNG header")
+        return (int.from_bytes(payload[16:20], "big"),
+                int.from_bytes(payload[20:24], "big"))
+
+    if not payload.startswith(b"\xff\xd8"):
+        fail("report branding logo must contain PNG or JPEG data")
+    position = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while position < len(payload):
+        if payload[position] != 0xFF:
+            fail("report branding logo has an invalid JPEG marker stream")
+        while position < len(payload) and payload[position] == 0xFF:
+            position += 1
+        if position >= len(payload):
+            break
+        marker = payload[position]
+        position += 1
+        if marker in {0x01, *range(0xD0, 0xDA)}:
+            if marker in {0xD8, 0xD9}:
+                if marker == 0xD9:
+                    break
+            continue
+        if position + 2 > len(payload):
+            break
+        length = int.from_bytes(payload[position:position + 2], "big")
+        if length < 2 or position + length > len(payload):
+            fail("report branding logo has an invalid JPEG segment")
+        if marker in sof_markers:
+            if length < 7:
+                fail("report branding logo has an invalid JPEG frame header")
+            return (int.from_bytes(payload[position + 5:position + 7], "big"),
+                    int.from_bytes(payload[position + 3:position + 5], "big"))
+        if marker == 0xDA:
+            break
+        position += length
+    fail("report branding logo has no supported JPEG frame header")
+
+
+def validate_branding_tree(branding_root: Path, expected_uid: int) -> int:
+    """Reject links, special files, foreign owners, and writable branding assets."""
+    try:
+        root_metadata = branding_root.lstat()
+    except FileNotFoundError:
+        fail("installed branding directory is missing")
+    root_mode = stat.S_IMODE(root_metadata.st_mode)
+    if (not stat.S_ISDIR(root_metadata.st_mode) or branding_root.is_symlink()
+            or root_metadata.st_uid != expected_uid or root_mode & 0o022
+            or root_mode & 0o500 != 0o500):
+        fail("installed branding root must be a service-owned, non-writable regular directory")
+
+    files = 0
+    pending = [branding_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            fail(f"installed branding tree cannot be inspected: {type(exc).__name__}")
+        for entry in entries:
+            metadata = entry.stat(follow_symlinks=False)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISLNK(metadata.st_mode):
+                fail("branding tree must not contain symbolic links")
+            if metadata.st_uid != expected_uid or mode & 0o022:
+                fail("branding tree entries must be service-owned and not group/world writable")
+            path = Path(entry.path)
+            if stat.S_ISDIR(metadata.st_mode):
+                if mode & 0o500 != 0o500:
+                    fail("branding directories must be readable and searchable by their owner")
+                pending.append(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                if not mode & 0o400 or metadata.st_nlink != 1:
+                    fail("branding files must be owner-readable files with a single hard link")
+                files += 1
+            else:
+                fail("branding tree must contain only regular files and directories")
+    return files
+
+
+def validate_report_branding(api: dict[str, str], worker: dict[str, str],
+                             config_root: Path) -> tuple[int, int] | None:
+    api_path = api.get("MELD7T_BRANDING_LOGO_PATH", "").strip()
+    worker_path = worker.get("MELD7T_BRANDING_LOGO_PATH", "").strip()
+    if not api_path:
+        if worker_path:
+            fail("text-only branding requires the worker report logo path to be absent")
+        return None
+    if api_path != "/run/branding/report-logo.png":
+        fail("API report branding logo must use /run/branding/report-logo.png")
+
+    installed = config_root / "branding" / "report-logo.png"
+    if worker_path != str(installed):
+        fail("worker report branding logo must map to the installed deployment asset")
+    try:
+        metadata = installed.lstat()
+    except FileNotFoundError:
+        fail("configured report branding logo is missing from the installed deployment")
+    if (not stat.S_ISREG(metadata.st_mode) or installed.is_symlink()
+            or metadata.st_size < 1 or metadata.st_size > MAX_REPORT_LOGO_BYTES):
+        fail("report branding logo must be a non-symlink regular file no larger than 5 MiB")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(installed, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if ((opened.st_dev, opened.st_ino, opened.st_size)
+                != (metadata.st_dev, metadata.st_ino, metadata.st_size)):
+            fail("report branding logo changed during validation")
+        chunks = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                fail("report branding logo was truncated during validation")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            fail("report branding logo grew during validation")
+    finally:
+        os.close(descriptor)
+    width, height = _report_logo_dimensions(b"".join(chunks))
+    if (width < 1 or height < 1 or width > MAX_REPORT_LOGO_DIMENSION
+            or height > MAX_REPORT_LOGO_DIMENSION
+            or width * height > MAX_REPORT_LOGO_PIXELS):
+        fail("report branding logo dimensions exceed the production rendering limit")
+    return width, height
+
+
 def load_lock(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -95,6 +251,45 @@ def openssl(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["openssl", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
     )
+
+
+def validate_identity_maps(
+    users_file: Path, roles_file: Path,
+) -> tuple[set[str], set[str]]:
+    """Validate named identities and explicit application roles."""
+    users: set[str] = set()
+    for line_no, raw in enumerate(users_file.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not BCRYPT.fullmatch(parts[1]) or parts[0] in users:
+            fail(f"{users_file}:{line_no}: expected unique USER BCRYPT_HASH")
+        if int(parts[1].split("$")[2]) < 12:
+            fail(f"{users_file}:{line_no}: bcrypt cost must be at least 12")
+        if parts[0] in {"clinical", "meld-admin", "meld-auditor"}:
+            fail("shared bring-up role accounts are forbidden at hospital activation")
+        users.add(parts[0])
+    if not users:
+        fail("at least one named institutional identity is required")
+
+    role_text = roles_file.read_text(encoding="utf-8")
+    admin_users: set[str] = set()
+    for user in users:
+        role_match = re.search(rf'(?m)^{re.escape(user)}\s+"([^"]*)"$', role_text)
+        if role_match is None:
+            fail(f"roles.caddy has no explicit role mapping for {user}")
+        roles = set(role_match.group(1).split())
+        if not roles:
+            fail(f"roles.caddy has an empty role mapping for {user}")
+        unknown_roles = roles - {"submitter", "reviewer", "admin", "auditor"}
+        if unknown_roles:
+            fail(f"roles.caddy has an unsupported role for {user}")
+        if "admin" in roles:
+            admin_users.add(user)
+    if not admin_users:
+        fail("cohort building requires at least one named institutional admin identity")
+    return users, admin_users
 
 
 def main() -> int:
@@ -122,7 +317,9 @@ def main() -> int:
     required(postgres, env_dir / "postgres.env", "POSTGRES_PASSWORD",
              "ORTHANC__POSTGRESQL__PASSWORD", "MELD_DB_PASSWORD", "POSTGRES_INITDB_ARGS")
     required(redis, env_dir / "redis.env", "REDIS_PASSWORD")
-    required(orthanc, env_dir / "orthanc.env", "ORTHANC__POSTGRESQL__PASSWORD")
+    required(orthanc, env_dir / "orthanc.env", "ORTHANC__POSTGRESQL__PASSWORD",
+             "ORTHANC__AUTHENTICATION_ENABLED", "ORTHANC__REGISTERED_USERS",
+             "ORTHANC__MAXIMUM_STORAGE_SIZE", "ORTHANC__MAXIMUM_STORAGE_MODE")
     required(harmonization_postgres, env_dir / "harmonization-postgres.env",
              "POSTGRES_PASSWORD", "POSTGRES_USER", "POSTGRES_INITDB_ARGS",
              "ORTHANC__POSTGRESQL__PASSWORD")
@@ -137,6 +334,9 @@ def main() -> int:
              "MELD7T_AUTH_TRUSTED_PROXY_NETWORKS", "MELD7T_RELEASE_MANIFEST_DIGEST",
              "MELD7T_AUDIT_HMAC_KEY", "MELD7T_IMMUDB_ROOT_STATE_PATH",
              "MELD7T_IMMUDB_PUBLIC_KEY_PATH", "MELD7T_ORTHANC_DICOMWEB",
+             "MELD7T_CASE_UPLOAD_ROOT", "MELD7T_CASE_UPLOAD_MAX_BYTES",
+             "MELD7T_CASE_UPLOAD_QUOTA_BYTES", "MELD7T_CASE_UPLOAD_CHUNK_BYTES",
+             "MELD7T_CASE_UPLOAD_EXPIRY_HOURS",
              "MELD7T_HARMONIZATION_EXPECTED_PROFILES",
              "MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED",
              "MELD7T_HARMONIZATION_ORTHANC_DICOMWEB", "MELD7T_HARMONIZATION_UPLOAD_ROOT",
@@ -160,6 +360,9 @@ def main() -> int:
              "MELD7T_GIT_SHA", "MELD7T_OS_CHECKSUM", "MELD7T_IMMUDB_ROOT_STATE_PATH",
              "MELD7T_IMMUDB_PUBLIC_KEY_PATH", "MELD7T_ORTHANC_DICOMWEB",
              "MELD7T_ORTHANC_INNET", "MELD7T_DICOM_MAX_BYTES_PER_RUN",
+             "MELD7T_CASE_UPLOAD_ROOT", "MELD7T_CASE_UPLOAD_MAX_BYTES",
+             "MELD7T_CASE_UPLOAD_MAX_FILES", "MELD7T_CASE_UPLOAD_MAX_EXPANDED_BYTES",
+             "MELD7T_CASE_UPLOAD_MAX_INSTANCE_BYTES",
              "MELD7T_HARMONIZATION_GENERATED_ROOT",
              "MELD7T_STORAGE_MIN_FREE_BYTES", "MELD7T_STORAGE_MIN_FREE_PERCENT",
              "MELD7T_STORAGE_OUTPUT_HEADROOM_BYTES", "MELD7T_WORKER_MAX_JOBS")
@@ -194,6 +397,8 @@ def main() -> int:
         fail("api.env must set MELD7T_DEPLOYMENT_MODE=production")
     if harmonization_builder["MELD7T_DEPLOYMENT_MODE"] != "production":
         fail("harmonization-builder.env must set MELD7T_DEPLOYMENT_MODE=production")
+    validate_branding_tree(root / "branding", root.lstat().st_uid)
+    validate_report_branding(api, worker, root)
     if (harmonization_builder["MELD7T_ORTHANC_DICOMWEB"] != "http://127.0.0.1:9/disabled"
             or harmonization_builder["MELD7T_ORTHANC_INNET"]
             != "http://127.0.0.1:9/disabled"):
@@ -209,7 +414,7 @@ def main() -> int:
     if api.get("MELD7T_AUTO_MIGRATE") != "false":
         fail("production API must never migrate its schema during startup")
     if api.get("MELD7T_HARMONIZATION_REQUIRED") != "true":
-        fail("production must fail closed when harmonization is unavailable")
+        fail("production must keep the harmonization integrity control plane enabled")
     if api["MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED"] not in {"true", "false"}:
         fail("cohort bootstrap authorization must be an explicit boolean")
     signed_bootstrap = release["MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED"]
@@ -287,6 +492,33 @@ def main() -> int:
             or not 1 <= max_jobs <= 8
             or not 1.0 <= free_percent <= 50.0):
         fail("worker storage admission values are outside supported bounds")
+
+    try:
+        api_case_limit = int(api["MELD7T_CASE_UPLOAD_MAX_BYTES"])
+        api_case_quota = int(api["MELD7T_CASE_UPLOAD_QUOTA_BYTES"])
+        api_case_chunk = int(api["MELD7T_CASE_UPLOAD_CHUNK_BYTES"])
+        api_case_expiry = int(api["MELD7T_CASE_UPLOAD_EXPIRY_HOURS"])
+        worker_case_limit = int(worker["MELD7T_CASE_UPLOAD_MAX_BYTES"])
+        worker_case_files = int(worker["MELD7T_CASE_UPLOAD_MAX_FILES"])
+        worker_case_expanded = int(worker["MELD7T_CASE_UPLOAD_MAX_EXPANDED_BYTES"])
+        worker_case_instance = int(worker["MELD7T_CASE_UPLOAD_MAX_INSTANCE_BYTES"])
+    except ValueError as exc:
+        fail(f"routine case upload limits must be numeric: {exc}")
+    api_case_root = Path(api["MELD7T_CASE_UPLOAD_ROOT"])
+    worker_case_root = Path(worker["MELD7T_CASE_UPLOAD_ROOT"])
+    if (api_case_root != Path("/data/case-uploads")
+            or not worker_case_root.is_absolute() or ".." in worker_case_root.parts
+            or worker_case_root.name != "case-uploads"):
+        fail("routine case upload roots do not match the isolated API/host mounts")
+    if (api_case_limit != worker_case_limit
+            or not 1024**2 <= api_case_limit <= 2 * 1024**4
+            or not api_case_limit <= api_case_quota <= 10 * 1024**4
+            or not 1024**2 <= api_case_chunk <= min(api_case_limit, 256 * 1024**2)
+            or not 1 <= api_case_expiry <= 168
+            or not 1 <= worker_case_files <= 1_000_000
+            or not api_case_limit <= worker_case_expanded <= 10 * 1024**4
+            or not 1024**2 <= worker_case_instance <= worker_case_expanded):
+        fail("routine case upload API/worker limits are inconsistent or unsupported")
 
     try:
         api_upload_limit = int(api["MELD7T_HARMONIZATION_MAX_UPLOAD_BYTES"])
@@ -487,6 +719,7 @@ def main() -> int:
 
     if orthanc.get("ORTHANC__AUTHENTICATION_ENABLED") != "true":
         fail("Orthanc internal authentication must be enabled")
+    orthanc_storage_cap(orthanc, "Research Orthanc")
     try:
         orthanc_users = json.loads(orthanc.get("ORTHANC__REGISTERED_USERS", "invalid"))
     except json.JSONDecodeError as exc:
@@ -512,15 +745,7 @@ def main() -> int:
 
     if harmonization_orthanc.get("ORTHANC__AUTHENTICATION_ENABLED") != "true":
         fail("harmonization Orthanc internal authentication must be enabled")
-    try:
-        harmonization_storage_mib = int(
-            harmonization_orthanc["ORTHANC__MAXIMUM_STORAGE_SIZE"])
-    except ValueError as exc:
-        fail(f"harmonization Orthanc storage cap must be numeric: {exc}")
-    if not 102400 <= harmonization_storage_mib <= 10 * 1024 * 1024:
-        fail("harmonization Orthanc storage cap must be between 100 GiB and 10 TiB")
-    if harmonization_orthanc["ORTHANC__MAXIMUM_STORAGE_MODE"] != "Reject":
-        fail("harmonization Orthanc must reject at its cap instead of recycling controls")
+    orthanc_storage_cap(harmonization_orthanc, "harmonization Orthanc")
     try:
         harmonization_users = json.loads(
             harmonization_orthanc.get("ORTHANC__REGISTERED_USERS", "invalid")
@@ -581,47 +806,11 @@ def main() -> int:
         fail("hospital activation requires CADDY_IDENTITY_MODE=institutional-unique")
     users_file = root / "caddy" / "auth" / "users.caddy"
     roles_file = root / "caddy" / "auth" / "roles.caddy"
-    dicom_access_file = root / "caddy" / "auth" / "dicom-access.caddy"
     approval_file = root / "caddy" / "auth" / "identity-approval.txt"
-    for path in (users_file, roles_file, dicom_access_file, approval_file):
+    for path in (users_file, roles_file, approval_file):
         if not path.is_file() or stat.S_IMODE(path.stat().st_mode) & 0o077:
             fail(f"identity file must exist with mode 0600: {path}")
-    users: set[str] = set()
-    for line_no, raw in enumerate(users_file.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) != 2 or not BCRYPT.fullmatch(parts[1]) or parts[0] in users:
-            fail(f"{users_file}:{line_no}: expected unique USER BCRYPT_HASH")
-        if int(parts[1].split("$")[2]) < 12:
-            fail(f"{users_file}:{line_no}: bcrypt cost must be at least 12")
-        if parts[0] in {"clinical", "meld-admin", "meld-auditor"}:
-            fail("shared bring-up role accounts are forbidden at hospital activation")
-        users.add(parts[0])
-    if len(users) < 3:
-        fail("at least three unique institutional identities are required")
-    role_text = roles_file.read_text(encoding="utf-8")
-    access_text = dicom_access_file.read_text(encoding="utf-8")
-    admin_users: set[str] = set()
-    for user in users:
-        role_match = re.search(rf'(?m)^{re.escape(user)}\s+"([^"]+)"$', role_text)
-        if role_match is None:
-            fail(f"roles.caddy has no explicit role mapping for {user}")
-        access_match = re.search(rf'(?m)^{re.escape(user)}\s+"(allow|deny)"$', access_text)
-        if access_match is None:
-            fail(f"dicom-access.caddy has no explicit decision for {user}")
-        roles = set(role_match.group(1).split())
-        unknown_roles = roles - {"submitter", "reviewer", "admin", "auditor"}
-        if unknown_roles:
-            fail(f"roles.caddy has an unsupported role for {user}")
-        if "admin" in roles:
-            admin_users.add(user)
-        expected_access = "allow" if roles.intersection({"reviewer", "admin"}) else "deny"
-        if access_match.group(1) != expected_access:
-            fail(f"DICOM access for {user} is inconsistent with reviewer/admin roles")
-    if len(admin_users) < 3:
-        fail("cohort building requires three distinct institutional admin identities")
+    validate_identity_maps(users_file, roles_file)
     approval_lines = [line.strip() for line in approval_file.read_text(encoding="utf-8").splitlines()
                       if line.strip() and not line.lstrip().startswith("#")]
     if not approval_lines or approval_lines[0] != "INSTITUTIONAL_UNIQUE_IDENTITY_APPROVED":

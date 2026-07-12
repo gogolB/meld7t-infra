@@ -13,6 +13,7 @@ dependencies = [
     "pydicom==3.0.2",
     "requests==2.34.2",
     "immudb-py==1.5.0",
+    "pillow==12.3.0",  # offline, deployment-branded combined PDF rendering
     # `app` package (models/db/config/detectors/audit) is provided on PYTHONPATH from ../api
 ]
 

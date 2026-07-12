@@ -22,6 +22,9 @@
 
   "// durability": "Storage is quiesced and backed up together with its PostgreSQL index.",
   "StorageCompression": true,
+  "StoreMD5ForAttachments": true,
+  "OverwriteInstances": false,
+  "MaximumStorageMode": "Reject",
   "SaveJobs": true,
   "StableAge": 10,
 

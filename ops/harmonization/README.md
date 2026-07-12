@@ -2,7 +2,9 @@
 
 MELD profiles can be estimated from a deidentified control cohort on the air-gapped Bazzite server.
 The workflow is administrative and research-only: it must not ingest from a clinical PACS directly,
-and its outputs are not evidence of diagnostic or scientific validity.
+and its outputs are not evidence of diagnostic or scientific validity. One authenticated
+administrator may operate every state transition; immutable inputs, explicit QC/evidence, and the
+append-only audit trail remain required even though separate administrator identities are not.
 
 The server workflow in this document is a release contract. Enable it only when the installed
 release contains the cohort API/UI, `meld7t-harmonization-builder.service`, its dedicated queue, and
@@ -225,12 +227,13 @@ Rejecting a `qc_review` candidate records the reason, retires the unactivated ca
 and archives the frozen cohort. A corrected attempt requires a new cohort and profile version; the
 system never edits or retries rejected scientific parameters in place.
 
-One administrator approves the frozen cohort and starts the build. A second administrator reviews
-the full QC/evidence package and validates the candidate. A third administrator, independent of
-both the build initiator and validator, performs the explicit activation action. Activation
-rechecks artifact hashes, detector semantics, selector overlap, builder image and adapter identity, cohort
-closure, and QC hashes. All three identities remain visible in the audit trail. Failures, retries,
-cancellations, exclusions, and temporary overrides require a substantive recorded reason.
+An administrator approves/freezes the cohort and starts its build. At `qc_review`, an administrator
+reviews the full QC/evidence package and either rejects it or records validation; activation remains
+a subsequent explicit action. The same administrator may perform all of these actions. Activation
+still rechecks artifact hashes, detector semantics, selector overlap, builder image and adapter
+identity, cohort closure, and QC hashes. Initiator, validator, and activator fields retain the actual
+actor and timestamp at each phase, even when they name one person. Failures, retries, cancellations,
+exclusions, and temporary overrides remain audited.
 
 Activation on the server is a local audited promotion. The generated profile must be linked to its
 active build, declare `parameters.storage_scope` as `generated`, and retain the frozen cohort, QC,
@@ -238,7 +241,7 @@ artifact, and pinned builder-image/adapter hashes. This does not rewrite the sig
 Back up the generated profile and evidence immediately, then export and sign it into the next
 release so it can be reproduced during replacement-host installation or disaster recovery.
 
-Before validation, an independent scientific review must produce a minimized, restricted-access
+Before validation, the scientific evidence review must produce a minimized, restricted-access
 `validation-report.json`. It binds the exact profile code/version/detector, acquisition
 fingerprints, QC inclusion/exclusion counts, positive/negative/control holdouts, immutable build
 images, methodology/metric/golden-case evidence hashes, approval ID, reviewer, and timestamp. The
@@ -308,7 +311,7 @@ the upstream reference is [MELD Graph’s installation guide](https://meld-graph
 ## MAP normative profile
 
 MAP is not yet an on-server cohort-builder method. It will implement the same frozen-cohort,
-dedicated-queue, QC, evidence, versioning, and independent-approval contract only after its
+dedicated-queue, QC, evidence, versioning, and recorded-approval contract only after its
 estimation procedure and acceptance metrics receive scientific review. Do not route a MAP cohort
 to the MELD Distributed ComBat adapter.
 
@@ -402,7 +405,7 @@ python ops/harmonization/manage.py expected-inventory \
 Install the minified JSON array as `MELD7T_HARMONIZATION_EXPECTED_PROFILES`. Readiness requires every
 release-provided active profile to match that inventory exactly and verifies the complete artifact
 closure in the background. It may additionally accept a locally generated active profile only when
-that profile satisfies the linked-build, three-administrator, frozen-input, QC/artifact-hash,
+that profile satisfies the linked-build, recorded-approval, frozen-input, QC/artifact-hash,
 builder-image/adapter, and `storage_scope=generated` contract above. An ad hoc profile row, unlinked
 artifact, or partially approved candidate keeps readiness red.
 
@@ -421,11 +424,15 @@ flag only when the bundle contains zero profile documents and the expected inven
 `[]`; it signs `MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED=true` into `release.env`. Verification
 and installation derive the API setting from that signed value, so do not edit the production API
 environment to enable it. API readiness then permits cohort administration and building with zero
-active profiles, while normal case recipes remain fail-closed because
-`MELD7T_HARMONIZATION_REQUIRED=true`. After the first generated profile is backed up and promoted,
-the next signed release must carry a non-empty inventory and the authorization returns to `false`.
-The importer rejects an empty bootstrap once any signed release profile has existed, even if that
-profile was later retired, so bootstrap cannot downgrade an established inventory.
+active profiles. `MELD7T_HARMONIZATION_REQUIRED=true` makes routine recipe construction require an
+explicit choice: assign a matching profile or confirm **Include runnable detectors without a
+matching harmonization profile**. The latter creates an unharmonized execution contract and
+prominent warnings in the plan, queue/status, Review Study, derived DICOM provenance, and every
+combined PDF; it does not silently imply harmonization. After the first generated profile is backed
+up and promoted, the next signed release must carry a non-empty inventory and the authorization
+returns to `false`. The importer rejects an empty bootstrap once any signed release profile has
+existed, even if that profile was later retired, so bootstrap cannot downgrade an established
+inventory.
 
 The signed air-gap exporter repeats this verification. Include cohort manifests and scientific
 approval evidence in the release attestations. Every new release must carry artifacts for all
@@ -439,7 +446,7 @@ identity check before applying it.
 
 For a development-mode server only, create a draft row from the final JSON using an administrator
 identity. Research and production modes reject these generic mutation endpoints and require either
-signed inventory import or the linked three-administrator cohort-build workflow. The JSON is already
+signed inventory import or the linked audited cohort-build workflow. The JSON is already
 the body expected by the development API:
 
 ```bash
@@ -451,21 +458,24 @@ curl --fail --cacert /trusted/hospital-ca.pem --user "$MELD7T_ADMIN_USER" \
   --data-binary "@$PROFILE" "$BASE/api/harmonization/profiles"
 ```
 
-A different administrator must call `POST /api/harmonization/profiles/{id}/validate`; this verifies
-the artifacts, detector-specific contract, and signed scientific-validation summary. The validating
-administrator cannot activate it. A second administrator then calls
-`POST /api/harmonization/profiles/{id}/activate`. In each case, confirm series roles, review the
+A (not necessarily different) administrator calls `POST /api/harmonization/profiles/{id}/validate`;
+this verifies the artifacts, detector-specific contract, and scientific-validation summary. That
+administrator may then call `POST /api/harmonization/profiles/{id}/activate`. For routine cases,
+confirm series roles, review the
 ranked candidates under **Harmonization**, and explicitly assign a profile for every MELD/MAP
-source before building the recipe. The case stays partial until every current target is assigned.
+source that will be harmonized before building the recipe. A user may instead confirm an
+unharmonized detector entry; this is an explicit, visible processing mode rather than a profile
+assignment.
 
 The supported Bazzite production path permits only the explicit signed empty-inventory bootstrap
 described above; it never permits ad hoc active profiles. During the backup-gated migration job,
 `app.profile_import` validates the signed expected inventory,
-profile documents, complete artifact closure, and embedded independent-review evidence, then
+profile documents, complete artifact closure, and embedded scientific-review evidence, then
 activates exactly that set and appends one release-bound audit event. Release approval is the second
 approval boundary. Any database document mismatch, retired-version reactivation, missing artifact,
 or API-env/inventory mismatch aborts migration before normal activation.
 
-Selector mismatches and unharmonized server runs are administrator-only overrides and require a
-substantive reason. Selector-override runs remain visible for research review but are excluded from
-cross-detector concordance.
+Selector mismatches remain administrator-only overrides and require a substantive reason. A case
+creator/assignee may confirm unharmonized runs without an administrator. Selector-override and
+unharmonized runs remain visible for research review, carry their distinct provenance/warnings, and
+are excluded from cross-detector concordance.

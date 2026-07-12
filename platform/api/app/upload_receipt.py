@@ -95,24 +95,39 @@ def load_receipt(path: Path) -> tuple[
 
 
 def expected_header(*, upload_sha256: str, instance_manifest_sha256: str,
-                    instance_count: int) -> dict[str, Any]:
-    return {
+                    instance_count: int,
+                    study_instance_uid: str | None = None) -> dict[str, Any]:
+    header: dict[str, Any] = {
         "event": "header", "schema_version": 1,
         "upload_sha256": upload_sha256,
         "instance_manifest_sha256": instance_manifest_sha256,
         "instance_count": instance_count,
     }
+    if study_instance_uid is not None:
+        if (len(study_instance_uid) > 64
+                or re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", study_instance_uid) is None):
+            raise RuntimeError("harmonization_upload_receipt_contract_invalid")
+        # Routine-case imports use this durable marker to prove that the target Study UID was
+        # absent before their first Orthanc mutation. Harmonization receipts omit it and retain
+        # their existing schema-1 document exactly.
+        header["orthanc_study_preflight"] = {
+            "study_instance_uid": study_instance_uid,
+            "status": "absent",
+        }
+    return header
 
 
 def validate_header(header: dict[str, Any] | None, *, upload_sha256: str,
                     instance_manifest_sha256: str | None,
-                    instance_count: int | None) -> dict[str, Any]:
+                    instance_count: int | None,
+                    study_instance_uid: str | None = None) -> dict[str, Any]:
     if instance_manifest_sha256 is None or instance_count is None:
         raise RuntimeError("harmonization_upload_receipt_contract_missing")
     expected = expected_header(
         upload_sha256=upload_sha256,
         instance_manifest_sha256=instance_manifest_sha256,
         instance_count=instance_count,
+        study_instance_uid=study_instance_uid,
     )
     if header != expected:
         raise RuntimeError("harmonization_upload_receipt_header_mismatch")

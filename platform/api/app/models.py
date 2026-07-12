@@ -136,6 +136,28 @@ class HarmonizationUploadStatus(str, Enum):
     failed = "failed"
 
 
+class CaseUploadStatus(str, Enum):
+    """Durable browser-to-Orthanc intake state for one routine research study."""
+
+    receiving = "receiving"
+    staged = "staged"
+    importing = "importing"
+    ready = "ready"                 # imported; awaiting human series-role confirmation
+    failed = "failed"
+
+
+class CaseReportKind(str, Enum):
+    preliminary = "preliminary"
+    final = "final"
+
+
+class CaseReportStatus(str, Enum):
+    queued = "queued"
+    generating = "generating"
+    ready = "ready"
+    failed = "failed"
+
+
 class OutboxStatus(str, Enum):
     pending = "pending"
     publishing = "publishing"
@@ -159,7 +181,7 @@ class HarmonizationProfile(SQLModel, table=True):
         UniqueConstraint("code", "version", name="uq_harmonization_profile_code_version"),
         CheckConstraint("version > 0", name="ck_harmonization_profile_version_positive"),
         # The database, rather than a request-time read, is the final concurrency guard.  Two
-        # administrators may activate different versions of the same code simultaneously.
+        # requests may attempt to activate different versions of the same code simultaneously.
         Index(
             "uq_harmonization_profile_one_active_code",
             "code",
@@ -426,6 +448,77 @@ class Case(SQLModel, table=True):
     harmonization_status: HarmonizationStatus = Field(default=HarmonizationStatus.unassigned)
     created_at: datetime = Field(
         default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+
+
+class CaseUpload(SQLModel, table=True):
+    """Resumable routine DICOM ZIP upload kept separate from cohort-builder controls.
+
+    The workstation filename and DICOM patient identifiers are deliberately not retained.  A
+    successful worker import links the upload to exactly one newly-created ``Case`` and leaves it
+    in ``series_pending`` until the submitter confirms every proposed series role.
+    """
+
+    __tablename__ = "case_uploads"
+    __table_args__ = (
+        CheckConstraint("total_size > 0", name="ck_case_upload_total_size"),
+        CheckConstraint("received_size >= 0", name="ck_case_upload_received_size"),
+        CheckConstraint("received_size <= total_size",
+                        name="ck_case_upload_received_within_total"),
+        UniqueConstraint("case_id", name="uq_case_upload_case_id"),
+        Index("ix_case_upload_status_updated", "status", "updated_at"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    case_id: Optional[str] = Field(default=None, foreign_key="cases.id", index=True)
+    pseudonym: str
+    filename: str
+    content_type: str = "application/zip"
+    storage_key: str = Field(default_factory=_uuid, unique=True)
+    total_size: int = Field(sa_column=Column(BigInteger, nullable=False))
+    received_size: int = Field(
+        default=0, sa_column=Column(BigInteger, nullable=False, default=0))
+    sha256: str
+    status: CaseUploadStatus = Field(default=CaseUploadStatus.receiving, index=True)
+    created_by: str = Field(index=True)
+    last_error: Optional[str] = None
+    import_result: Optional[dict] = Field(default=None, sa_column=_json_col())
+    created_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    updated_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    completed_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    staging_cleaned_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class CaseReport(SQLModel, table=True):
+    """Immutable, versioned combined MAP/MELD/HS report generated from a frozen snapshot."""
+
+    __tablename__ = "case_reports"
+    __table_args__ = (
+        UniqueConstraint("case_id", "kind", "version", name="uq_case_report_kind_version"),
+        CheckConstraint("version > 0", name="ck_case_report_version_positive"),
+        Index("ix_case_report_status_updated", "status", "updated_at"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    case_id: str = Field(foreign_key="cases.id", index=True)
+    recipe_id: str = Field(foreign_key="recipes.id", index=True)
+    kind: CaseReportKind
+    version: int = 1
+    status: CaseReportStatus = Field(default=CaseReportStatus.queued, index=True)
+    snapshot: dict = Field(sa_column=_json_col(nullable=False))
+    snapshot_sha256: str
+    branding: dict = Field(sa_column=_json_col(nullable=False))
+    requested_by: str
+    report_path: Optional[str] = None
+    artifact_manifest: Optional[dict] = Field(default=None, sa_column=_json_col())
+    last_error: Optional[str] = None
+    created_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    updated_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    completed_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
 
 
 class Series(SQLModel, table=True):

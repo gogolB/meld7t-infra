@@ -16,9 +16,11 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import uuid
 from io import BytesIO
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import numpy as np
 import nibabel as nib
@@ -44,6 +46,45 @@ def _uid(seed: str | None, purpose: str) -> str:
 
 class GeometryError(ValueError):
     pass
+
+
+def harmonization_provenance(status, code=None, version=None, method=None):
+    """Build a non-PHI DICOM/manifest harmonization marker."""
+    if status not in {"applied", "unharmonized", "not_applicable"}:
+        raise ValueError("invalid harmonization status")
+    if status == "applied":
+        if not code or version is None or int(version) < 1 or not method:
+            raise ValueError("applied harmonization requires code, version, and method")
+        if (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", str(code)) is None
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", str(method)) is None):
+            raise ValueError("harmonization code/method contains unsafe characters")
+        return {
+            "status": status, "code": str(code), "version": int(version),
+            "method": str(method),
+        }
+    return {"status": status, "code": "none", "version": 0,
+            "method": status}
+
+
+def harmonization_label(provenance):
+    if provenance["status"] == "applied":
+        return f"HARMONIZED {provenance['code']} v{provenance['version']}"
+    if provenance["status"] == "unharmonized":
+        return "UNHARMONIZED RESEARCH RESULT"
+    return "HARMONIZATION NOT APPLICABLE"
+
+
+def mark_harmonization(datasets, provenance):
+    """Put the harmonization state where ordinary DICOM viewers expose it."""
+    label = harmonization_label(provenance)
+    for dataset in datasets:
+        existing = str(getattr(dataset, "DerivationDescription", "") or "")
+        dataset.DerivationDescription = f"{label}; {existing}"[:1024]
+        series = str(getattr(dataset, "SeriesDescription", "") or "Derived result")
+        dataset.SeriesDescription = f"{label} - {series}"[:64]
+        if hasattr(dataset, "ContentDescription"):
+            content = str(getattr(dataset, "ContentDescription", "") or series)
+            dataset.ContentDescription = f"{label} - {content}"[:64]
 
 
 def _canonical(path):
@@ -82,7 +123,15 @@ def validate_nifti_geometry(t1_path, pred_path):
 
 
 def build_t1_series(t1_path, study_uid, patient_id, loaded=None, uid_seed=None,
-                    software_version="unknown"):
+                    software_version="unknown", *, uid_role="t1",
+                    series_description="MELD input T1 (derived)",
+                    derivation_description=None, series_number=1):
+    """Build a deidentified derived MR reference series on an exact NIfTI grid.
+
+    ``uid_role`` is deliberately detector-specific.  A recipe shares one derived study while
+    every run gets unique, deterministic series/SOP UIDs, so two detector runs can safely
+    publish their own native reference geometry into the same review study.
+    """
     data, affine = loaded if loaded is not None else _canonical(t1_path)
     data = np.clip(data, 0, None)
     data = (data / (data.max() or 1) * 4095).astype(np.uint16)
@@ -95,15 +144,18 @@ def build_t1_series(t1_path, study_uid, patient_id, loaded=None, uid_seed=None,
     sp_k = float(np.linalg.norm(R[:, 2]))
     iop = list(RAS_TO_LPS @ ui) + list(RAS_TO_LPS @ uj)
 
-    series_uid = _uid(uid_seed, "t1-series")
-    frame_uid = _uid(uid_seed, "frame-of-reference")
+    series_uid = _uid(uid_seed, f"{uid_role}-series")
+    # Preserve MELD's established frame UID purpose while namespacing newer detector references.
+    frame_purpose = "frame-of-reference" if uid_role == "t1" else f"{uid_role}-frame-of-reference"
+    frame_uid = _uid(uid_seed, frame_purpose)
     datasets = []
     for k in range(nz):
         ipp = list(RAS_TO_LPS @ (affine @ np.array([0, 0, k, 1]))[:3])
         ds = Dataset()
         ds.file_meta = FileMetaDataset()
         ds.file_meta.MediaStorageSOPClassUID = MRImageStorage
-        ds.file_meta.MediaStorageSOPInstanceUID = _uid(uid_seed, f"t1-instance-{k + 1}")
+        ds.file_meta.MediaStorageSOPInstanceUID = _uid(
+            uid_seed, f"{uid_role}-instance-{k + 1}")
         ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
         ds.SOPClassUID = MRImageStorage
         ds.SOPInstanceUID = ds.file_meta.MediaStorageSOPInstanceUID
@@ -112,11 +164,11 @@ def build_t1_series(t1_path, study_uid, patient_id, loaded=None, uid_seed=None,
         ds.FrameOfReferenceUID = frame_uid
         ds.Modality = "MR"
         ds.ImageType = ["DERIVED", "SECONDARY"]
-        ds.DerivationDescription = (
+        ds.DerivationDescription = derivation_description or (
             f"Research-only MELD input T1 derived from the contracted NIfTI; "
             f"release {software_version}")
         ds.PatientID = patient_id
-        ds.PatientName = patient_id
+        ds.PatientName = f"{patient_id}^"
         ds.PatientIdentityRemoved = "YES"
         ds.DeidentificationMethod = "Research pseudonymization; direct identifiers removed"
         ds.BurnedInAnnotation = "NO"
@@ -128,8 +180,8 @@ def build_t1_series(t1_path, study_uid, patient_id, loaded=None, uid_seed=None,
         ds.AccessionNumber = ""
         ds.StudyID = ""
         ds.ReferringPhysicianName = ""
-        ds.SeriesDescription = "MELD input T1 (derived)"
-        ds.SeriesNumber = 1
+        ds.SeriesDescription = series_description
+        ds.SeriesNumber = series_number
         ds.InstanceNumber = k + 1
         ds.ImageOrientationPatient = [f"{v:.6f}" for v in iop]
         ds.ImagePositionPatient = [f"{v:.4f}" for v in ipp]
@@ -150,6 +202,54 @@ def build_t1_series(t1_path, study_uid, patient_id, loaded=None, uid_seed=None,
     return datasets
 
 
+def build_binary_seg(source_datasets, pixel_array, segment_definitions, *, uid_seed=None,
+                     uid_role="seg", series_number=2, software_version="unknown",
+                     algorithm_name="meld7t", algorithm_family="Research image analysis",
+                     series_description="Research-derived segmentation"):
+    """Build a binary SEG from a label map or an overlapping channel-last boolean array.
+
+    ``segment_definitions`` contains ``label``, ``property_code`` and ``property_meaning``.
+    A 4-D boolean array retains overlaps (used for MAP features and the HS atrophy flag).
+    """
+    descriptions = []
+    for segment_number, definition in enumerate(segment_definitions, start=1):
+        descriptions.append(hd.seg.SegmentDescription(
+            segment_number=segment_number,
+            segment_label=definition["label"],
+            segmented_property_category=hd.sr.CodedConcept(
+                definition.get("category_code", "49755003"),
+                definition.get("category_scheme", "SCT"),
+                definition.get("category_meaning", "Morphologically Abnormal Structure"),
+            ),
+            segmented_property_type=hd.sr.CodedConcept(
+                definition["property_code"], definition.get("property_scheme", "99MELD"),
+                definition["property_meaning"],
+            ),
+            algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
+            algorithm_identification=hd.AlgorithmIdentificationSequence(
+                name=algorithm_name, version=software_version, family=hd.sr.CodedConcept(
+                    "123456", "99MELD", algorithm_family),
+            ),
+        ))
+    seg = hd.seg.Segmentation(
+        source_images=source_datasets,
+        pixel_array=np.asarray(pixel_array),
+        segmentation_type=hd.seg.SegmentationTypeValues.BINARY,
+        segment_descriptions=descriptions,
+        series_instance_uid=_uid(uid_seed, f"{uid_role}-series"),
+        series_number=series_number,
+        sop_instance_uid=_uid(uid_seed, f"{uid_role}-instance-1"),
+        instance_number=1,
+        manufacturer="meld7t",
+        manufacturer_model_name="pkg",
+        software_versions=software_version,
+        device_serial_number="meld7t-pkg",
+        omit_empty_frames=False,
+    )
+    seg.SeriesDescription = series_description
+    return seg
+
+
 def build_seg(t1_datasets, pred_path, loaded=None, uid_seed=None,
               software_version="unknown"):
     pred, _ = loaded if loaded is not None else _canonical(pred_path)
@@ -158,38 +258,23 @@ def build_seg(t1_datasets, pred_path, loaded=None, uid_seed=None,
         raise GeometryError(
             f"prediction grid {pred.shape} does not match packaged T1 {expected_shape}")
     labelmap = np.zeros(pred.shape, dtype=np.uint8)
-    descriptions = []
+    definitions = []
     for seg_num, (label, name) in enumerate(SEGMENTS, start=1):
         labelmap[pred == label] = seg_num
-        descriptions.append(hd.seg.SegmentDescription(
-            segment_number=seg_num, segment_label=name,
-            segmented_property_category=hd.sr.CodedConcept(
-                "49755003", "SCT", "Morphologically Abnormal Structure"),
+        definitions.append({
+            "label": name,
             # Do not miscode a research candidate as a clinical mass/diagnosis.
-            segmented_property_type=hd.sr.CodedConcept(
-                "FCD-CANDIDATE", "99MELD", "Research FCD candidate"),
-            algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
-            algorithm_identification=hd.AlgorithmIdentificationSequence(
-                name="MELD-FCD", version=software_version, family=hd.sr.CodedConcept(
-                    "123456", "99MELD", "Cortical-surface GNN"))))
+            "property_code": "FCD-CANDIDATE",
+            "property_meaning": "Research FCD candidate",
+        })
     # frames ordered to match the source datasets (slice order along k, transposed)
     frames = np.stack([labelmap[:, :, k].T for k in range(labelmap.shape[2])])
-    seg = hd.seg.Segmentation(
-        source_images=t1_datasets,
-        pixel_array=frames,
-        segmentation_type=hd.seg.SegmentationTypeValues.BINARY,
-        segment_descriptions=descriptions,
-        series_instance_uid=_uid(uid_seed, "seg-series"),
-        series_number=2,
-        sop_instance_uid=_uid(uid_seed, "seg-instance-1"),
-        instance_number=1,
-        manufacturer="meld7t",
-        manufacturer_model_name="pkg",
-        software_versions=software_version,
-        device_serial_number="meld7t-pkg",
-        omit_empty_frames=False,
+    return build_binary_seg(
+        t1_datasets, frames, definitions, uid_seed=uid_seed, uid_role="seg",
+        series_number=2, software_version=software_version, algorithm_name="MELD-FCD",
+        algorithm_family="Cortical-surface GNN",
+        series_description="MELD FCD candidate segmentation",
     )
-    return seg
 
 
 def stow(url, datasets, timeout_seconds=60.0):
@@ -204,7 +289,19 @@ def stow(url, datasets, timeout_seconds=60.0):
 
     session = InternalSession()
     session.trust_env = False
-    client = DICOMwebClient(url=url, session=session)
+    parts = urlsplit(url)
+    if (parts.scheme not in {"http", "https"} or not parts.hostname
+            or parts.query or parts.fragment):
+        raise ValueError("DICOMweb URL must be an absolute HTTP(S) URL without query/fragment")
+    hostname = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = f"{hostname}:{parts.port}" if parts.port is not None else hostname
+    if parts.username is not None:
+        # Keep credentials out of the request URL so client/HTTP exception messages retained in
+        # package logs cannot disclose them. Requests builds the Basic Authorization header from
+        # this in-memory tuple instead.
+        session.auth = (unquote(parts.username), unquote(parts.password or ""))
+    sanitized_url = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    client = DICOMwebClient(url=sanitized_url, session=session)
     response = client.store_instances(datasets)
     expected = {str(dataset.SOPInstanceUID) for dataset in datasets}
     failed = {
@@ -296,6 +393,19 @@ def _critical_dicom_semantics(dataset):
             "stack_id": value_from(item, "StackID"),
             "in_stack_position_number": value_from(item, "InStackPositionNumber"),
         } for item in sequence(group, "FrameContentSequence")]
+        pixel_value_transforms = [{
+            "rescale_intercept": value_from(item, "RescaleIntercept"),
+            "rescale_slope": value_from(item, "RescaleSlope"),
+            "rescale_type": value_from(item, "RescaleType"),
+        } for item in sequence(group, "PixelValueTransformationSequence")]
+        frame_voi = [{
+            "window_center": values_from(item, "WindowCenter"),
+            "window_width": values_from(item, "WindowWidth"),
+            "voi_lut_function": value_from(item, "VOILUTFunction"),
+        } for item in sequence(group, "FrameVOILUTSequence")]
+        parametric_frame_type = [{
+            "frame_type": values_from(item, "FrameType"),
+        } for item in sequence(group, "ParametricMapFrameTypeSequence")]
         derivations = []
         for derivation in sequence(group, "DerivationImageSequence"):
             sources = []
@@ -323,6 +433,9 @@ def _critical_dicom_semantics(dataset):
             "plane_positions": positions,
             "segment_identification": segment_identification,
             "frame_content": frame_content,
+            "pixel_value_transforms": pixel_value_transforms,
+            "frame_voi": frame_voi,
+            "parametric_frame_type": parametric_frame_type,
             "derivations": derivations,
         }
 
@@ -336,7 +449,14 @@ def _critical_dicom_semantics(dataset):
             "category": value_from(category, "CodeValue"),
             "property": value_from(prop, "CodeValue"),
         })
+    pixel_keyword = "PixelData"
     pixel_data = bytes(getattr(dataset, "PixelData", b"") or b"")
+    if not pixel_data and getattr(dataset, "FloatPixelData", None) is not None:
+        pixel_keyword = "FloatPixelData"
+        pixel_data = bytes(dataset.FloatPixelData)
+    if not pixel_data and getattr(dataset, "DoubleFloatPixelData", None) is not None:
+        pixel_keyword = "DoubleFloatPixelData"
+        pixel_data = bytes(dataset.DoubleFloatPixelData)
     referenced_sops = sorted({
         str(element.value)
         for element in (dataset.iterall() if hasattr(dataset, "iterall") else [])
@@ -349,6 +469,9 @@ def _critical_dicom_semantics(dataset):
         "series_instance_uid": value("SeriesInstanceUID"),
         "frame_of_reference_uid": value("FrameOfReferenceUID"),
         "modality": value("Modality"),
+        "series_description": value("SeriesDescription"),
+        "content_description": value("ContentDescription"),
+        "derivation_description": value("DerivationDescription"),
         "patient_id": value("PatientID"),
         "patient_name": value("PatientName"),
         "patient_identity_removed": value("PatientIdentityRemoved"),
@@ -371,7 +494,25 @@ def _critical_dicom_semantics(dataset):
         "segmentation_type": value("SegmentationType"),
         "maximum_fractional_value": int(
             getattr(dataset, "MaximumFractionalValue", 0) or 0),
+        "pixel_data_keyword": pixel_keyword,
         "pixel_sha256": hashlib.sha256(pixel_data).hexdigest(),
+        "real_world_value_mappings": [{
+            "lut_label": value_from(item, "LUTLabel"),
+            "lut_explanation": value_from(item, "LUTExplanation"),
+            "first_value": value_from(item, "RealWorldValueFirstValueMapped"),
+            "last_value": value_from(item, "RealWorldValueLastValueMapped"),
+            "first_float_value": value_from(item, "DoubleFloatRealWorldValueFirstValueMapped"),
+            "last_float_value": value_from(item, "DoubleFloatRealWorldValueLastValueMapped"),
+            "slope": value_from(item, "RealWorldValueSlope"),
+            "intercept": value_from(item, "RealWorldValueIntercept"),
+            "units": codes(item, "MeasurementUnitsCodeSequence"),
+            "quantity": [{
+                "value_type": value_from(content, "ValueType"),
+                "concept_name": codes(content, "ConceptNameCodeSequence"),
+                "concept_value": codes(content, "ConceptCodeSequence"),
+            } for content in sequence(item, "QuantityDefinitionSequence")],
+        } for group in sequence(dataset, "SharedFunctionalGroupsSequence")
+          for item in sequence(group, "RealWorldValueMappingSequence")],
         "segments": segments,
         "referenced_sop_instance_uids": referenced_sops,
         "shared_functional_groups": [
@@ -421,19 +562,55 @@ def dicom_manifest(datasets):
     return files, hashlib.sha256(canonical).hexdigest()
 
 
-def write_dicom_manifest(path, datasets, files, manifest_sha256):
-    destination = os.path.abspath(path)
-    parent = os.path.dirname(destination)
-    os.makedirs(parent, exist_ok=True)
-    if os.path.islink(destination) or os.path.exists(destination):
-        raise ValueError("DICOM manifest output already exists or is a symlink")
+def derived_series_manifest(datasets, roles_by_series=None, harmonization=None):
+    """Return a viewer/API-neutral manifest of every series in a derived review study."""
+    roles_by_series = roles_by_series or {}
+    grouped = {}
+    for dataset in datasets:
+        uid = str(dataset.SeriesInstanceUID)
+        item = grouped.setdefault(uid, {
+            "series_uid": uid,
+            "role": roles_by_series.get(uid, "derived"),
+            "modality": str(getattr(dataset, "Modality", "") or ""),
+            "description": str(getattr(dataset, "SeriesDescription", "") or ""),
+            "sop_count": 0,
+        })
+        item["sop_count"] += 1
     document = {
+        "schema_version": 1,
+        "study_uid": str(datasets[0].StudyInstanceUID),
+        "series": sorted(grouped.values(), key=lambda item: (item["role"], item["series_uid"])),
+    }
+    if harmonization is not None:
+        document["harmonization"] = harmonization
+    return document
+
+
+def manifest_document(datasets, files, manifest_sha256, roles_by_series=None,
+                      harmonization=None):
+    series = derived_series_manifest(datasets, roles_by_series, harmonization)
+    series_canonical = json.dumps(series, sort_keys=True, separators=(",", ":")).encode()
+    return {
         "schema_version": 1,
         "study_instance_uid": str(datasets[0].StudyInstanceUID),
         "sop_count": len(files),
         "files": files,
         "manifest_sha256": manifest_sha256,
+        "derived_series": series,
+        "derived_series_manifest_sha256": hashlib.sha256(series_canonical).hexdigest(),
     }
+
+
+def write_dicom_manifest(path, datasets, files, manifest_sha256, roles_by_series=None,
+                         harmonization=None):
+    destination = os.path.abspath(path)
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
+    if os.path.islink(destination) or os.path.exists(destination):
+        raise ValueError("DICOM manifest output already exists or is a symlink")
+    document = manifest_document(
+        datasets, files, manifest_sha256, roles_by_series=roles_by_series,
+        harmonization=harmonization)
     temporary = destination + ".tmp"
     with open(temporary, "x", encoding="utf-8") as fh:
         json.dump(document, fh, sort_keys=True, separators=(",", ":"))
@@ -448,9 +625,14 @@ def main():
     ap.add_argument("--t1", required=True)
     ap.add_argument("--pred", required=True)
     ap.add_argument("--pseudonym", required=True)
-    ap.add_argument("--stow", default=None, help="Orthanc DICOMweb URL; if omitted, print UIDs only")
+    ap.add_argument(
+        "--stow", default=os.environ.get("MELD7T_ORTHANC_INNET"),
+        help="Orthanc DICOMweb URL; defaults to the inherited internal environment",
+    )
     ap.add_argument("--http-timeout", type=float, default=60.0)
     ap.add_argument("--study-uid", default=None)
+    ap.add_argument("--study-uid-seed", default=None,
+                    help="stable recipe identifier shared by all detector runs in a review study")
     ap.add_argument("--uid-seed", default=None,
                     help="stable non-PHI run identifier for idempotent derived SOP UIDs")
     ap.add_argument("--software-version", default="unknown",
@@ -458,6 +640,12 @@ def main():
     ap.add_argument("--manifest-output", required=True,
                     help="new JSON path retaining per-SOP encoded hashes")
     ap.add_argument("--expected-clusters", required=True, type=int)
+    ap.add_argument("--harmonization-status",
+                    choices=("applied", "unharmonized", "not_applicable"),
+                    default="unharmonized")
+    ap.add_argument("--harmonization-code", default=None)
+    ap.add_argument("--harmonization-version", type=int, default=None)
+    ap.add_argument("--harmonization-method", default=None)
     a = ap.parse_args()
     if not 1.0 <= a.http_timeout <= 600.0:
         raise ValueError("--http-timeout must be between 1 and 600 seconds")
@@ -465,7 +653,7 @@ def main():
             char in a.software_version for char in "\r\n\0"):
         raise ValueError("--software-version must contain 1-16 safe characters")
 
-    study_uid = a.study_uid or _uid(a.uid_seed, "study")
+    study_uid = a.study_uid or _uid(a.study_uid_seed or a.uid_seed, "study")
     loaded_t1, loaded_pred = validate_nifti_geometry(a.t1, a.pred)
     if a.expected_clusters < 0:
         raise ValueError("--expected-clusters must be non-negative")
@@ -477,8 +665,20 @@ def main():
         a.t1, study_uid, a.pseudonym, loaded_t1, a.uid_seed, a.software_version)
     seg = build_seg(t1, a.pred, loaded_pred, a.uid_seed, a.software_version)
     datasets = [*t1, seg]
+    harmonization = harmonization_provenance(
+        a.harmonization_status, a.harmonization_code, a.harmonization_version,
+        a.harmonization_method)
+    mark_harmonization(datasets, harmonization)
     sops, manifest_sha256 = dicom_manifest(datasets)
-    write_dicom_manifest(a.manifest_output, datasets, sops, manifest_sha256)
+    roles = {
+        str(t1[0].SeriesInstanceUID): "meld_native_t1_reference",
+        str(seg.SeriesInstanceUID): "meld_fcd_segmentation",
+    }
+    write_dicom_manifest(
+        a.manifest_output, datasets, sops, manifest_sha256, roles, harmonization)
+    series_manifest = derived_series_manifest(datasets, roles, harmonization)
+    series_digest = hashlib.sha256(json.dumps(
+        series_manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if a.stow:
         # One STOW transaction plus explicit response/QIDO checks minimizes and detects partial
         # publication. Deterministic SOP UIDs make an identical-contract retry idempotent.
@@ -489,6 +689,9 @@ def main():
     print(f"n_t1_slices={len(t1)}")
     print(f"dicom_sop_count={len(datasets)}")
     print(f"dicom_manifest_sha256={manifest_sha256}")
+    print("derived_series_manifest_json=" + json.dumps(
+        series_manifest, sort_keys=True, separators=(",", ":")))
+    print(f"derived_series_manifest_sha256={series_digest}")
 
 
 if __name__ == "__main__":

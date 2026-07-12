@@ -138,6 +138,22 @@ class Settings(BaseSettings):
     )
     storage_min_free_percent: float = Field(default=10.0, ge=1.0, le=50.0)
 
+    # Routine case intake is intentionally separate from harmonization-control admission.  The
+    # API writes resumable archives here and the bounded worker imports them into the main research
+    # Orthanc before proposing (never confirming) series roles.
+    case_upload_root: str = "/var/lib/meld7t/case-uploads"
+    case_upload_max_bytes: int = Field(
+        default=100 * 1024 * 1024 * 1024, ge=1024 * 1024, le=2 * 1024**4,
+    )
+    case_upload_quota_bytes: int = Field(
+        default=500 * 1024 * 1024 * 1024, ge=1024**3, le=10 * 1024**4,
+    )
+    case_upload_chunk_bytes: int = Field(
+        default=64 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024,
+    )
+    case_upload_expiry_hours: int = Field(default=24, ge=1, le=168)
+    case_report_timeout_minutes: int = Field(default=30, ge=5, le=240)
+
     # Orthanc DICOMweb (same isolated network; QIDO/WADO/STOW).
     orthanc_dicomweb: str = "http://orthanc:8042/dicom-web"
     harmonization_orthanc_dicomweb: str = "http://harmonization-orthanc:8042/dicom-web"
@@ -157,13 +173,34 @@ class Settings(BaseSettings):
     immudb_root_state_path: str | None = None
     immudb_public_key_path: str | None = None
 
-    # Defaults true in server modes and false in development/test.  Research deployments may
-    # explicitly accept degraded operation; production may not.
+    # Defaults true in server modes and false in development/test. This keeps the profile-control
+    # plane, integrity scan, and builder readiness available; a user-confirmed recipe may still
+    # declare an individual detector run unharmonized.
     audit_require_immudb: bool = False
     audit_hmac_key: SecretStr = SecretStr("change-me")
 
     # meld-data root (mounted read-only) — report PDFs + key-frame PNGs.
     meld_data: str = "/data"
+
+    # Deployment-wide white-label identity shared by the SPA and generated reports. The signed
+    # release includes the site-approved Houston Methodist default; deployments may replace the
+    # same-origin runtime asset without rebuilding the SPA.
+    branding_product_name: str = Field(default="MELD 7T", min_length=1, max_length=80)
+    branding_institution_name: str = Field(
+        default="Houston Methodist", min_length=1, max_length=120,
+    )
+    branding_department_name: str = Field(
+        default="Houston Methodist Research Institute", min_length=1, max_length=160,
+    )
+    branding_logo_url: str | None = Field(
+        default="/branding/report-logo.png", max_length=512,
+    )
+    branding_logo_path: str | None = Field(default=None, max_length=1024)
+    branding_primary_color: str = "#124A7E"
+    branding_secondary_color: str = "#749ABB"
+    branding_footer_text: str = Field(
+        default="Houston Methodist Research Institute", min_length=1, max_length=240,
+    )
 
     # Site/scanner/protocol harmonization manifests and reference assets.  Development/test can run
     # without a selected profile by default; server deployments fail closed unless explicitly
@@ -203,12 +240,12 @@ class Settings(BaseSettings):
     # Loaded from the signed runtime-images environment when the API runs in production.
     meld_image: str | None = None
     harmonization_required: bool = False
-    # Permit a fresh site to run only the gated cohort-builder workflow before its first active
-    # profile exists. Normal case recipes still fail closed because harmonization_required stays on.
+    # Permit a fresh site to run the gated cohort-builder workflow before its first active profile
+    # exists. Routine recipes may proceed only through the explicit unharmonized confirmation path.
     harmonization_cohort_bootstrap_allowed: bool = False
     # The exact signed-release set expected to be active.  An empty set is accepted only when the
     # signed release explicitly authorizes first-site cohort bootstrap; generated profiles retain
-    # their separate build/QC/three-administrator proof chain until promoted into a later release.
+    # their separate build/QC/evidence/audit proof chain until promoted into a later release.
     harmonization_expected_profiles: list[ExpectedHarmonizationProfile] = Field(
         default_factory=list
     )
@@ -217,7 +254,7 @@ class Settings(BaseSettings):
     release_manifest_digest: str | None = None
 
     @field_validator(
-        "meld_data", "harmonization_root", "harmonization_generated_root",
+        "meld_data", "case_upload_root", "harmonization_root", "harmonization_generated_root",
         "harmonization_upload_root",
     )
     @classmethod
@@ -235,6 +272,48 @@ class Settings(BaseSettings):
         path = Path(value)
         if not path.is_absolute() or ".." in path.parts:
             raise ValueError("immudb trust-state/key paths must be absolute without '..'")
+        return str(path)
+
+    @field_validator(
+        "branding_product_name", "branding_institution_name", "branding_department_name",
+        "branding_footer_text",
+    )
+    @classmethod
+    def valid_branding_text(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value or any(char in value for char in "\r\n\0"):
+            raise ValueError("branding text must be a single non-empty line")
+        return value
+
+    @field_validator("branding_primary_color", "branding_secondary_color")
+    @classmethod
+    def valid_branding_color(cls, value: str) -> str:
+        value = value.strip().upper()
+        if re.fullmatch(r"#[0-9A-F]{6}", value) is None:
+            raise ValueError("branding colors must use six-digit hexadecimal notation")
+        return value
+
+    @field_validator("branding_logo_url")
+    @classmethod
+    def valid_branding_logo_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        if (re.fullmatch(r"/branding/[A-Za-z0-9][A-Za-z0-9._/-]*", value) is None
+                or any(part in {"", ".", ".."} for part in value.split("/")[2:])):
+            raise ValueError(
+                "branding_logo_url must be a clean same-origin /branding/... asset path"
+            )
+        return value
+
+    @field_validator("branding_logo_path")
+    @classmethod
+    def valid_branding_logo_path(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        path = Path(value.strip())
+        if not path.is_absolute() or ".." in path.parts or "\0" in str(path):
+            raise ValueError("branding_logo_path must be an absolute path without '..'")
         return str(path)
 
     @field_validator("release_manifest_digest")
@@ -312,6 +391,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def secure_deployment_settings(self) -> "Settings":
+        if self.case_upload_chunk_bytes > self.case_upload_max_bytes:
+            raise ValueError("case upload chunk limit cannot exceed the archive limit")
+        if self.case_upload_max_bytes > self.case_upload_quota_bytes:
+            raise ValueError("case upload quota must cover at least one maximum-size archive")
         if "harmonization_required" not in self.model_fields_set:
             self.harmonization_required = self.deployment_mode in {"research", "production"}
         if "audit_require_immudb" not in self.model_fields_set:

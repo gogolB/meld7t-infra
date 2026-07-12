@@ -29,6 +29,7 @@ from .harmonization import (
 )
 from .harmonization_routes import router as harmonization_router
 from .cohort_routes import router as cohort_router
+from .case_upload_routes import router as case_upload_router
 from .models import (
     HarmonizationBuild, HarmonizationBuildStatus, HarmonizationCohort,
     HarmonizationCohortStatus, HarmonizationProfile, HarmonizationProfileStatus,
@@ -39,7 +40,7 @@ from .storage import storage_health
 from .version import API_VERSION
 
 
-EXPECTED_SCHEMA_REVISION = "a3e7c1d9b5f2"
+EXPECTED_SCHEMA_REVISION = "9d2f6a8c4e71"
 _log = logging.getLogger(__name__)
 _reconciler_started_at = datetime.now(timezone.utc)
 _reconciler_state: dict[str, object] = {
@@ -61,6 +62,8 @@ _profile_integrity_state: dict[str, object] = {
 def _reap_stale_runs_off_loop() -> None:
     with Session(engine) as session:
         queue.reap_stale_runs(session)
+        queue.reap_stale_case_uploads(session)
+        queue.reap_stale_case_reports(session)
         queue.reap_stale_harmonization_uploads(session)
         queue.reap_stale_harmonization_builds(session)
 
@@ -76,6 +79,8 @@ async def _outbox_loop() -> None:
             with Session(engine) as session:
                 await queue.dispatch_outbox_events(session)
                 await queue.reconcile_queued_runs(session)
+                await queue.reconcile_case_uploads(session)
+                await queue.reconcile_case_reports(session)
                 await queue.reconcile_harmonization_jobs(session)
             await asyncio.to_thread(_reap_stale_runs_off_loop)
             _reconciler_state.update({
@@ -160,10 +165,12 @@ def _scan_harmonization_profiles_off_loop() -> dict[str, object]:
                 and build is not None
                 and build.builder_image_digest
                 == (profile.parameters.get("build_images") or {}).get("meld")
-                and bool(build.validated_by) and bool(build.activated_by)
-                and len({build.initiated_by, build.validated_by, build.activated_by}) == 3
+                and bool(build.initiated_by) and bool(build.validated_by)
+                and bool(build.activated_by)
+                and cohort is not None and cohort.approved_by == build.initiated_by
+                and profile.validated_by == build.validated_by
                 and isinstance(qc, dict) and qc.get("all_folds_succeeded") is True
-                and cohort is not None and cohort.status == HarmonizationCohortStatus.frozen
+                and cohort.status == HarmonizationCohortStatus.frozen
                 and isinstance(cohort.frozen_manifest, dict)
                 and cohort.frozen_manifest.get("manifest_sha256")
                 == canonical_json_sha256({
@@ -296,6 +303,7 @@ app.middleware("http")(correlation_id_middleware)
 app.include_router(router)
 app.include_router(harmonization_router)
 app.include_router(cohort_router)
+app.include_router(case_upload_router)
 
 
 @app.exception_handler(audit.AuditLedgerError)
@@ -403,6 +411,11 @@ async def readyz() -> dict:
             }
     checks["report_storage"] = storage_health(
         settings.meld_data,
+        minimum_free_bytes=settings.storage_min_free_bytes,
+        minimum_free_percent=settings.storage_min_free_percent,
+    )
+    checks["case_upload_storage"] = storage_health(
+        settings.case_upload_root,
         minimum_free_bytes=settings.storage_min_free_bytes,
         minimum_free_percent=settings.storage_min_free_percent,
     )

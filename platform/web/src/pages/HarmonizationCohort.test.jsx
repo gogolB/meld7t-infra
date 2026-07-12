@@ -154,12 +154,12 @@ describe("HarmonizationCohort", () => {
     fireEvent.change(screen.getByLabelText("Scientific validation report *"), {
       target: { value: JSON.stringify(report) },
     });
-    await user.click(screen.getByRole("button", { name: "Independently validate candidate" }));
+    await user.click(screen.getByRole("button", { name: "Validate candidate" }));
     await waitFor(() => expect(mocks.validateHarmonizationBuild).toHaveBeenCalledWith(
       "build-1", report));
   });
 
-  it("supports cancellation and independent activation lifecycle actions", async () => {
+  it("supports cancellation and single-admin activation lifecycle actions", async () => {
     mocks.getHarmonizationCohort.mockResolvedValue({
       ...draftCohort, status: "frozen", latest_build_id: "build-1",
       builds: [{ id: "build-1", status: "queued" }],
@@ -182,7 +182,7 @@ describe("HarmonizationCohort", () => {
     });
     mocks.getHarmonizationBuildQc.mockResolvedValue({ folds: 5, all_folds_succeeded: true });
     renderPage();
-    expect(await screen.findByText(/third administrator/i)).toBeInTheDocument();
+    expect(await screen.findByText(/authenticated actor and evidence/i)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Activate profile" }));
     await waitFor(() => expect(mocks.activateHarmonizationBuild).toHaveBeenCalledWith("build-2"));
   });

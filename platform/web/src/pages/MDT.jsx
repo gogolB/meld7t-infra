@@ -14,11 +14,15 @@ export default function MDT() {
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
         <h1>MDT summary — {d?.case?.pseudonym || "…"}</h1>
         {d?.case && <Badge status={d.case.status} />}
-        <Link to={`/cases/${id}`} className="muted" style={{ marginLeft: "auto" }}>edit case →</Link>
+        <Link to={`/cases/${id}`} className="muted" style={{ marginLeft: "auto" }}>
+          Processing plan →
+        </Link>
       </div>
       <p className="muted">Workup {d?.case?.workup?.toUpperCase() || "–"} · research conference summary.
         <b> Research use only — not for diagnosis or treatment.</b></p>
       <ErrorBox error={s.error} />
+      {(d?.warnings || []).map((warning) => <div className="warning warning-prominent"
+        key={warning}><strong>Unharmonized result</strong><br />{warning}</div>)}
 
       <h2>Research evidence overlap <span className="muted">(distinct detector families + spatial key)</span></h2>
       <div className="panel">
@@ -67,11 +71,10 @@ export default function MDT() {
             <span className="detector" style={{ fontSize: 15 }}>{rr.run.detector_id}</span>
             <span className="pill">{rr.run.source_role || "–"}</span>
             <Badge status={rr.run.status} />
-            {rr.result?.has_report &&
-              <a className="btn ghost" href={`/api/runs/${rr.run.id}/report`} target="_blank" rel="noreferrer"
-                 style={{ marginLeft: "auto" }}>MELD PDF ↗</a>}
-            <Link className="btn ghost" to={`/runs/${rr.run.id}/review`}>Open in viewer →</Link>
+            <Link className="btn ghost" to={`/cases/${id}/review?run=${rr.run.id}`}>Open in review study →</Link>
           </div>
+          {rr.run.warnings?.map((warning) => <div className="warning" key={warning}
+            style={{ marginTop: 10 }}>{warning}</div>)}
 
           {rr.clusters?.length ? (
             <p className="muted" style={{ margin: "8px 0" }}>

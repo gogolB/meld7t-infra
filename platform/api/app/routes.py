@@ -21,7 +21,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from . import audit, orthanc, queue
@@ -42,11 +42,16 @@ from .harmonization import (
     run_harmonization_contract, runtime_profile_trusted,
 )
 from .models import (
-    Adjudication, Case, CaseStatus, Cluster, HarmonizationAssignment, HarmonizationProfile,
+    Adjudication, Case, CaseReport, CaseReportKind, CaseReportStatus, CaseStatus, Cluster,
+    HarmonizationAssignment, HarmonizationProfile,
     HarmonizationProfileStatus, HarmonizationStatus, Job, OutboxEvent, OutboxStatus, Provenance,
     Recipe, Result, Run, RunStatus, Series, SeriesRole, Workup,
 )
 from .recipe import build_recipe, entry_id, recipe_summary, spec_hash
+from .reporting import (
+    UNHARMONIZED_WARNING, ReportNotReadyError, ensure_case_report, report_public,
+    verified_derived_series,
+)
 from .workflow import (
     RECIPE_MUTABLE_CASE_STATES, assert_case_state, logical_run_key, run_input_contract_hash,
     run_outbox_event,
@@ -145,11 +150,12 @@ class RecipeCreate(BaseModel):
 
     @model_validator(mode="after")
     def reason_for_unharmonized(self):
-        if self.allow_unharmonized and not (
-                self.unharmonized_reason and len(self.unharmonized_reason.strip()) >= 10):
-            raise ValueError("allow_unharmonized requires a substantive reason")
         if self.unharmonized_reason:
             self.unharmonized_reason = self.unharmonized_reason.strip()
+        if self.allow_unharmonized and not self.unharmonized_reason:
+            self.unharmonized_reason = (
+                "explicitly confirmed without a harmonization profile"
+            )
         return self
 
 
@@ -159,6 +165,12 @@ class AdjudicationCreate(BaseModel):
     ground_truth: Optional[str] = PydanticField(default=None, max_length=200)
     notes: Optional[str] = PydanticField(default=None, max_length=4000)
     supersedes: Optional[str] = PydanticField(default=None, max_length=64)
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()).hexdigest()
 
 
 class CaseAssignmentCreate(BaseModel):
@@ -190,16 +202,28 @@ def _get_case_for_update(session: Session, case_id: str) -> Case:
 
 
 def _authorize_case(principal: Principal, case: Case, *, mutate: bool = False) -> None:
+    # Every authenticated hospital research user may review studies and derived output. Mutations
+    # remain limited to the creator/assignee (or an administrator) below.
+    if not mutate:
+        return
     if principal.has_role(Role.admin):
         return
     if case.created_by == principal.actor or case.assigned_to == principal.actor:
         return
-    if not mutate and principal.has_role(Role.reviewer):
-        return
     raise HTTPException(403, "case access denied")
 
 
-def _case_public(case: Case) -> dict:
+def _can_mutate_case(principal: Principal, case: Case) -> bool:
+    """Return the workflow capability consumed by the universal-read case UI."""
+    if principal.has_role(Role.admin):
+        return True
+    return bool(
+        principal.has_role(Role.submitter, admin_override=False)
+        and (case.created_by == principal.actor or case.assigned_to == principal.actor)
+    )
+
+
+def _case_public(case: Case, principal: Principal) -> dict:
     """Minimum-necessary case response: never expose host paths or contraindication details."""
     return {
         "id": case.id, "pseudonym": case.pseudonym,
@@ -209,6 +233,7 @@ def _case_public(case: Case) -> dict:
         "has_assignee": bool(case.assigned_to),
         "has_contraindications": bool(case.contraindications),
         "created_at": case.created_at,
+        "permissions": {"can_mutate": _can_mutate_case(principal, case)},
     }
 
 
@@ -219,6 +244,7 @@ def _series_public(series: Series) -> dict:
         "series_description": series.series_description, "modality": series.modality,
         "proposed_role": series.proposed_role, "confirmed_role": series.confirmed_role,
         "fingerprint": series.fingerprint, "instance_count": series.instance_count,
+        "active": series.active,
     }
 
 
@@ -229,12 +255,25 @@ def _recipe_public(recipe: Recipe) -> dict:
             "entry_id", "detector_id", "detector_label", "source_role",
             "source_series_uid", "status", "note",
         ) if key in raw}
-        harmonization = (raw.get("params") or {}).get("harmonization") or {}
+        params = raw.get("params") or {}
+        harmonization = params.get("harmonization") or {}
+        series_uids = params.get("series_uids") or {}
+        acquisition_manifest = params.get("acquisition_manifest") or {}
+        study_uid = (acquisition_manifest.get("study_uid")
+                     if isinstance(acquisition_manifest, dict) else None)
+        if isinstance(series_uids, dict):
+            entry["inputs"] = [
+                {**({"study_uid": study_uid} if isinstance(study_uid, str) else {}),
+                 "role": role, "series_uid": uid}
+                for role, uid in sorted(series_uids.items())
+            ]
         if harmonization:
             entry["harmonization"] = {
                 key: harmonization.get(key) for key in ("profile_id", "code", "version", "method", "mode")
                 if harmonization.get(key) is not None
             }
+        entry["warnings"] = ([UNHARMONIZED_WARNING]
+                             if harmonization.get("mode") == "unharmonized" else [])
         entries.append(entry)
     return {
         "id": recipe.id, "case_id": recipe.case_id, "workup": recipe.workup,
@@ -245,6 +284,7 @@ def _recipe_public(recipe: Recipe) -> dict:
 
 
 def _run_public(run: Run) -> dict:
+    harmonization = _run_harmonization_public(run)
     return {
         "id": run.id, "case_id": run.case_id, "recipe_id": run.recipe_id,
         "detector_id": run.detector_id, "detector_version": run.detector_version,
@@ -253,6 +293,41 @@ def _run_public(run: Run) -> dict:
         "completed_at": run.completed_at, "adjudicated_at": run.adjudicated_at,
         "created_at": run.created_at,
         "has_status_reason": bool(run.status_reason), "superseded_by": run.superseded_by,
+        "harmonization": harmonization,
+        "warnings": ([harmonization["warning"]] if harmonization.get("warning") else []),
+    }
+
+
+def _run_harmonization_public(run: Run) -> dict:
+    """Expose the scientific mode without leaking profile paths or protected artifacts."""
+    raw = (run.params or {}).get("harmonization") or {}
+    if raw.get("profile_id"):
+        return {
+            "mode": "harmonized",
+            "applied": True,
+            "profile": {
+                "code": raw.get("code"),
+                "version": raw.get("version"),
+                "method": raw.get("method"),
+            },
+            "warning": None,
+        }
+    if raw.get("mode") == "not_applicable":
+        return {
+            "mode": "not_applicable",
+            "applied": False,
+            "profile": None,
+            "warning": None,
+        }
+    return {
+        "mode": "unharmonized",
+        "applied": False,
+        "profile": None,
+        "warning": (
+            "UNHARMONIZED RESEARCH RESULT: no scanner/protocol harmonization profile was "
+            "applied. Findings may reflect acquisition differences and must not be compared "
+            "with harmonized results."
+        ),
     }
 
 
@@ -260,15 +335,23 @@ def _result_public(result: Optional[Result]) -> Optional[dict]:
     if result is None:
         return None
     manifest = result.output_manifest if isinstance(result.output_manifest, dict) else {}
+    derived_series, derived_integrity = verified_derived_series(result)
+    publication_available = derived_integrity != "failed"
     return {
         "id": result.id, "run_id": result.run_id,
-        "orthanc_study_uid": result.orthanc_study_uid,
-        "orthanc_t1_uid": result.orthanc_t1_uid,
-        "orthanc_seg_uid": result.orthanc_seg_uid,
-        "orthanc_probmap_uid": result.orthanc_probmap_uid,
+        "orthanc_study_uid": (result.orthanc_study_uid if publication_available else None),
+        "orthanc_t1_uid": (result.orthanc_t1_uid if publication_available else None),
+        "orthanc_seg_uid": (result.orthanc_seg_uid if publication_available else None),
+        "orthanc_probmap_uid": (result.orthanc_probmap_uid if publication_available else None),
         "harmo_code": result.harmo_code, "n_clusters": result.n_clusters,
         "metric_schema": manifest.get("metric_schema"),
-        "has_report": bool(result.report_path), "created_at": result.created_at,
+        "detector_summary": manifest.get("detector_summary"),
+        "derived_series": derived_series,
+        "derived_series_integrity": derived_integrity,
+        "derived_series_manifest_sha256": manifest.get("derived_series_manifest_sha256"),
+        # Detector-native PDFs remain internal scientific artifacts. Only the controlled,
+        # white-labeled combined case reports are exposed to browser users.
+        "created_at": result.created_at,
     }
 
 
@@ -355,6 +438,20 @@ def whoami(principal: Principal = Depends(get_principal)) -> dict:
             "auth_method": principal.auth_method, "request_id": principal.request_id}
 
 
+@router.get("/branding")
+def deployment_branding(_principal: Principal = Depends(get_principal)) -> dict:
+    """Return the validated deployment identity used by the UI and generated reports."""
+    return {
+        "product_name": settings.branding_product_name,
+        "institution_name": settings.branding_institution_name,
+        "department_name": settings.branding_department_name,
+        "logo_url": settings.branding_logo_url,
+        "primary_color": settings.branding_primary_color,
+        "secondary_color": settings.branding_secondary_color,
+        "footer_text": settings.branding_footer_text,
+    }
+
+
 # ---- cases
 @router.post("/cases", status_code=201)
 def create_case(body: CaseCreate, principal: Principal = Depends(get_principal),
@@ -391,7 +488,7 @@ def create_case(body: CaseCreate, principal: Principal = Depends(get_principal),
     )
     session.commit()
     session.refresh(case)
-    return _case_public(case)
+    return _case_public(case, principal)
 
 
 @router.get("/cases")
@@ -399,15 +496,12 @@ def list_cases(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=
                principal: Principal = Depends(get_principal),
                session: Session = Depends(get_session)) -> list[dict]:
     statement = select(Case).order_by(Case.created_at.desc()).offset(offset).limit(limit)
-    if not (principal.has_role(Role.admin) or principal.has_role(Role.reviewer)):
-        statement = statement.where(or_(Case.created_by == principal.actor,
-                                        Case.assigned_to == principal.actor))
     rows = session.exec(statement).all()
     audit.record_access_coalesced(
         session, principal=principal, entity_type="case_collection",
         entity_id="list", detail={"count": len(rows), "offset": offset})
     session.commit()
-    return [_case_public(case) for case in rows]
+    return [_case_public(case, principal) for case in rows]
 
 
 @router.post("/admin/cases/{case_id}/assign")
@@ -426,7 +520,7 @@ def assign_case(case_id: str, body: CaseAssignmentCreate,
     )
     session.commit()
     session.refresh(case)
-    return _case_public(case)
+    return _case_public(case, principal)
 
 
 @router.post("/admin/cases/{case_id}/unblock")
@@ -462,7 +556,7 @@ def unblock_case(case_id: str, body: CaseUnblock,
     )
     session.commit()
     session.refresh(case)
-    return _case_public(case)
+    return _case_public(case, principal)
 
 
 @router.get("/cases/{case_id}")
@@ -472,7 +566,7 @@ def get_case(case_id: str, principal: Principal = Depends(get_principal),
     _authorize_case(principal, case)
     audit.record_access(session, principal=principal, entity_type="case", entity_id=case_id)
     session.commit()
-    return _case_public(case)
+    return _case_public(case, principal)
 
 
 # ---- series (§16)
@@ -643,9 +737,6 @@ def create_recipe(case_id: str, body: RecipeCreate,
     case = _get_case_for_update(session, case_id)
     _authorize_case(principal, case, mutate=True)
     assert_case_state(case.status, RECIPE_MUTABLE_CASE_STATES, "build recipe")
-    if (body.allow_unharmonized and settings.is_server_mode
-            and not principal.has_role(Role.admin)):
-        raise HTTPException(403, "only an administrator may approve an unharmonized server run")
     if case.contraindications and case.contraindications.get("hard_block") is True:
         case.status = CaseStatus.blocked
         audit.record_authenticated(session, principal=principal, action="case.block",
@@ -918,10 +1009,17 @@ def get_run(run_id: str, principal: Principal = Depends(get_principal),
 def adjudicate(run_id: str, body: AdjudicationCreate,
                principal: Principal = Depends(require_reviewer),
                session: Session = Depends(get_session)) -> Adjudication:
-    run = session.get(Run, run_id)
+    statement = select(Run).where(Run.id == run_id)
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        statement = statement.with_for_update()
+    run = session.exec(statement).first()
     if not run:
         raise HTTPException(404, "run not found")
-    _authorize_case(principal, _get_case(session, run.case_id))
+    # Serialize same-case terminal transitions. Without this lock, two reviewers finishing the
+    # final two runs concurrently can each observe the other run as not yet adjudicated and leave
+    # the case without its automatic final report.
+    case = _get_case_for_update(session, run.case_id)
+    _authorize_case(principal, case)
     if run.status not in {RunStatus.review_ready, RunStatus.adjudicated}:
         raise HTTPException(409, "only a review-ready run can be adjudicated")
     if not session.exec(select(Result).where(Result.run_id == run_id)).first():
@@ -941,7 +1039,6 @@ def adjudicate(run_id: str, body: AdjudicationCreate,
     session.add(adj)
     run.status = RunStatus.adjudicated
     run.adjudicated_at = datetime.now(timezone.utc)
-    case = _get_case(session, run.case_id)
     current_runs = session.exec(select(Run).where(
         Run.recipe_id == run.recipe_id,
         Run.status != RunStatus.pending,
@@ -950,6 +1047,29 @@ def adjudicate(run_id: str, body: AdjudicationCreate,
     if current_runs and all(row.status == RunStatus.adjudicated for row in current_runs):
         case.status = CaseStatus.adjudicated
         session.add(case)
+        recipe = session.get(Recipe, run.recipe_id)
+        if recipe is not None:
+            try:
+                report, created = ensure_case_report(
+                    session, case, recipe, CaseReportKind.final,
+                    requested_by=principal.actor,
+                )
+            except ReportNotReadyError as exc:
+                # Preserve the append-only review even when report branding/evidence requires
+                # operator remediation; a reviewer can retry report generation independently.
+                audit.record_authenticated(
+                    session, principal=principal, action="case_report.defer",
+                    entity_type="case", entity_id=case.id,
+                    payload={"kind": "final", "error_code": type(exc).__name__},
+                )
+            else:
+                if created:
+                    audit.record_authenticated(
+                        session, principal=principal, action="case_report.request",
+                        entity_type="case_report", entity_id=report.id,
+                        payload={"case_id": case.id, "kind": "final", "version": report.version,
+                                 "snapshot_sha256": report.snapshot_sha256},
+                    )
     audit.record_authenticated(
         session, principal=principal, action="adjudication.create",
         entity_type="run", entity_id=run_id,
@@ -1027,24 +1147,6 @@ def _verified_frames(result: Optional[Result]) -> list[str]:
         if not settings.is_server_mode or _artifact_matches_manifest(result, relative, candidate):
             frames.append(candidate.name)
     return frames
-
-
-@router.get("/runs/{run_id}/report")
-def run_report(run_id: str, principal: Principal = Depends(get_principal),
-               session: Session = Depends(get_session)):
-    run = session.get(Run, run_id)
-    if not run:
-        raise HTTPException(404, "run not found")
-    _authorize_case(principal, _get_case(session, run.case_id))
-    result = session.exec(select(Result).where(Result.run_id == run_id)).first()
-    p = _report_abs(result)
-    if not p or not os.path.isfile(p):
-        raise HTTPException(404, "no report")
-    audit.record_access(session, principal=principal, entity_type="run_report", entity_id=run_id,
-                        operation="export")
-    session.commit()
-    return FileResponse(p, media_type="application/pdf",
-                        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/runs/{run_id}/frames")
@@ -1162,9 +1264,10 @@ def concordance(case_id: str, principal: Principal = Depends(get_principal),
 
 
 @router.get("/cases/{case_id}/summary")
+@router.get("/cases/{case_id}/review")
 def case_summary(case_id: str, principal: Principal = Depends(get_principal),
                  session: Session = Depends(get_session)) -> dict:
-    """One aggregate for the MDT screen: runs + results + clusters + adjudications + concordance."""
+    """Case-level review workspace: source scans, every detector result, and review history."""
     case = _get_case(session, case_id)
     _authorize_case(principal, case)
     latest_recipe = session.exec(select(Recipe).where(
@@ -1173,35 +1276,181 @@ def case_summary(case_id: str, principal: Principal = Depends(get_principal),
     runs = (session.exec(select(Run).where(
         Run.recipe_id == latest_recipe.id, Run.superseded_by.is_(None))).all()
         if latest_recipe else [])
-    out_runs, adjudications = [], []
+    # Preserve the complete uploaded inventory in Review Study. A later Orthanc resync may mark a
+    # missing series inactive; it remains visible as historical input instead of disappearing.
+    source_series = session.exec(select(Series).where(
+        Series.case_id == case_id
+    ).order_by(Series.active.desc(), Series.series_description,
+               Series.orthanc_series_uid)).all()
+    out_runs, adjudications, viewer_studies, warnings = [], [], [], []
+    if case.orthanc_study_uid:
+        viewer_studies.append({
+            "study_uid": case.orthanc_study_uid,
+            "kind": "source",
+            "label": "Uploaded source scans",
+            "detector_id": None,
+            "run_id": None,
+        })
     for run in runs:
         result = session.exec(select(Result).where(Result.run_id == run.id)).first()
         clusters = (session.exec(select(Cluster).where(Cluster.result_id == result.id)).all()
                     if result else [])
         frames = _verified_frames(result)
-        out_runs.append({"run": _run_public(run), "result": _result_public(result),
-                         "clusters": clusters, "frames": frames})
-        for a in session.exec(select(Adjudication).where(Adjudication.run_id == run.id)).all():
+        public_run = _run_public(run)
+        if result is None:
+            # Pending recipe slots remain visible, but they are plans rather than detector output.
+            public_run["warnings"] = []
+        run_adjudications = session.exec(select(Adjudication).where(
+            Adjudication.run_id == run.id
+        ).order_by(Adjudication.ts, Adjudication.id)).all()
+        public_result = _result_public(result)
+        out_runs.append({"run": public_run, "result": public_result,
+                         "clusters": clusters, "frames": frames,
+                         "adjudications": run_adjudications})
+        if public_result and public_result["orthanc_study_uid"]:
+            existing_study = next((item for item in viewer_studies
+                                   if item["study_uid"] == public_result["orthanc_study_uid"]), None)
+            if existing_study is None:
+                viewer_studies.append({
+                    "study_uid": public_result["orthanc_study_uid"],
+                    "kind": "derived",
+                    "label": "Combined MAP / MELD / HS derived outputs",
+                    "detector_ids": [run.detector_id.value],
+                    "run_ids": [run.id],
+                })
+            elif existing_study["kind"] == "derived":
+                existing_study["detector_ids"].append(run.detector_id.value)
+                existing_study["run_ids"].append(run.id)
+        warnings.extend(public_run["warnings"])
+        for a in run_adjudications:
             adjudications.append(a)
+    reports = session.exec(select(CaseReport).where(
+        CaseReport.case_id == case_id
+    ).order_by(CaseReport.created_at.desc())).all()
     audit.record_access(session, principal=principal, entity_type="case_summary", entity_id=case_id)
     session.commit()
-    return {"case": _case_public(case), "runs": out_runs, "adjudications": adjudications,
-            "concordance": _concordance(session, case_id)}
+    return {
+        "case": _case_public(case, principal),
+        "recipe": _recipe_public(latest_recipe) if latest_recipe else None,
+        "source_series": [_series_public(row) for row in source_series],
+        "viewer_studies": viewer_studies,
+        "runs": out_runs,
+        "adjudications": adjudications,
+        "warnings": sorted(set(warnings)),
+        "reports": [report_public(report) for report in reports],
+        "concordance": _concordance(session, case_id),
+    }
+
+
+@router.get("/cases/{case_id}/reports")
+def list_case_reports(case_id: str, principal: Principal = Depends(get_principal),
+                      session: Session = Depends(get_session)) -> list[dict]:
+    case = _get_case(session, case_id)
+    _authorize_case(principal, case)
+    rows = session.exec(select(CaseReport).where(
+        CaseReport.case_id == case_id
+    ).order_by(CaseReport.created_at.desc())).all()
+    audit.record_access(session, principal=principal, entity_type="case_reports",
+                        entity_id=case_id, detail={"count": len(rows)})
+    session.commit()
+    return [report_public(row) for row in rows]
+
+
+@router.post("/cases/{case_id}/reports/{kind}", status_code=202)
+async def request_case_report(kind: CaseReportKind, case_id: str,
+                              principal: Principal = Depends(require_reviewer),
+                              session: Session = Depends(get_session)) -> dict:
+    case = _get_case_for_update(session, case_id)
+    _authorize_case(principal, case)
+    recipe = session.exec(select(Recipe).where(
+        Recipe.case_id == case_id, Recipe.confirmed_at.is_not(None)
+    ).order_by(Recipe.version.desc(), Recipe.created_at.desc())).first()
+    if recipe is None:
+        raise HTTPException(409, "case has no confirmed processing plan")
+    try:
+        report, created = ensure_case_report(
+            session, case, recipe, kind, requested_by=principal.actor,
+        )
+    except ReportNotReadyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if created:
+        audit.record_authenticated(
+            session, principal=principal, action="case_report.request",
+            entity_type="case_report", entity_id=report.id,
+            payload={"case_id": case.id, "kind": kind.value, "version": report.version,
+                     "snapshot_sha256": report.snapshot_sha256},
+        )
+    session.commit()
+    await queue.dispatch_outbox_events(session)
+    session.refresh(report)
+    return report_public(report)
+
+
+def _case_report_abs(report: CaseReport) -> Path | None:
+    if report.status != CaseReportStatus.ready or not report.report_path:
+        return None
+    try:
+        relative = Path(report.report_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        root = Path(settings.meld_data).resolve()
+        unresolved = root / relative
+        components = [root / Path(*relative.parts[:index])
+                      for index in range(1, len(relative.parts) + 1)]
+        if any(component.is_symlink() for component in components):
+            return None
+        candidate = unresolved.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate == root or root not in candidate.parents or not candidate.is_file():
+        return None
+    try:
+        manifest = report.artifact_manifest if isinstance(report.artifact_manifest, dict) else {}
+        expected_manifest = dict(manifest)
+        manifest_sha256 = expected_manifest.pop("manifest_sha256", None)
+        if (manifest.get("path") != relative.as_posix()
+                or manifest_sha256 != _canonical_sha256(expected_manifest)
+                or manifest.get("size") != candidate.stat().st_size):
+            return None
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except (OSError, TypeError, ValueError):
+        return None
+    return candidate if digest.hexdigest() == manifest.get("sha256") else None
+
+
+@router.get("/cases/{case_id}/reports/{report_id}/pdf")
+def case_report_pdf(case_id: str, report_id: str,
+                    principal: Principal = Depends(get_principal),
+                    session: Session = Depends(get_session)):
+    case = _get_case(session, case_id)
+    _authorize_case(principal, case)
+    report = session.get(CaseReport, report_id)
+    if report is None or report.case_id != case_id:
+        raise HTTPException(404, "report not found")
+    path = _case_report_abs(report)
+    if path is None:
+        raise HTTPException(404, "report artifact is not ready or failed integrity verification")
+    audit.record_access(session, principal=principal, entity_type="case_report",
+                        entity_id=report.id, operation="export",
+                        detail={"kind": report.kind.value, "version": report.version})
+    session.commit()
+    return FileResponse(
+        path, media_type="application/pdf",
+        filename=f"{case.pseudonym}-{report.kind.value}-v{report.version}.pdf",
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 # ---- system / queue / admin / audit
 @router.get("/system")
 async def system(principal: Principal = Depends(get_principal),
                  session: Session = Depends(get_session)) -> dict:
-    elevated = (principal.has_role(Role.admin) or principal.has_role(Role.reviewer)
-                or principal.has_role(Role.auditor))
+    elevated = True  # every authenticated research user has the same read-only study overview
     status_statement = select(Run.status, func.count(Run.id)).group_by(Run.status)
     case_count_statement = select(func.count(Case.id))
-    if not elevated:
-        status_statement = status_statement.join(Case, Run.case_id == Case.id).where(
-            or_(Case.created_by == principal.actor, Case.assigned_to == principal.actor))
-        case_count_statement = case_count_statement.where(or_(
-            Case.created_by == principal.actor, Case.assigned_to == principal.actor))
     status_rows = session.exec(status_statement).all()
     r = queue.get_redis()
     by_status = {status.value: count for status, count in status_rows}
@@ -1211,14 +1460,6 @@ async def system(principal: Principal = Depends(get_principal),
                                 OutboxStatus.publishing]))).one()
     raw_gpu_owner = await r.get(queue.GPU_INUSE_KEY)
     gpu_owner = _public_gpu_owner(raw_gpu_owner)
-    if gpu_owner and not elevated:
-        authorized_owner = session.exec(select(Run.id).join(
-            Case, Run.case_id == Case.id).where(
-                Run.id == gpu_owner,
-                or_(Case.created_by == principal.actor, Case.assigned_to == principal.actor),
-            )).first()
-        if authorized_owner is None:
-            gpu_owner = None
     response = {
         "cases": session.exec(case_count_statement).one(),
         "runs": {"total": total, "by_status": by_status},
@@ -1240,21 +1481,25 @@ async def queue_view(principal: Principal = Depends(get_principal),
     statement = select(Run).where(
         Run.status.in_([RunStatus.queued, RunStatus.preprocessing, RunStatus.inference,
                         RunStatus.qc_pending, RunStatus.packaging]))
-    if not (principal.has_role(Role.admin) or principal.has_role(Role.reviewer)):
-        owned_cases = select(Case.id).where(or_(
-            Case.created_by == principal.actor, Case.assigned_to == principal.actor))
-        statement = statement.where(Run.case_id.in_(owned_cases))
     active = session.exec(statement).all()
     raw_gpu_owner = await r.get(queue.GPU_INUSE_KEY)
     owner = _public_gpu_owner(raw_gpu_owner)
     if owner not in {run.id for run in active}:
         owner = None
+    active_public = []
+    for row in active:
+        harmonization = _run_harmonization_public(row)
+        active_public.append({
+            "run_id": row.id, "case_id": row.case_id, "detector": row.detector_id.value,
+            "source_role": row.source_role, "status": row.status.value,
+            "harmonization": harmonization,
+            "warnings": [harmonization["warning"]] if harmonization.get("warning") else [],
+        })
     response = {
         "in_use_run": owner,
         "busy": bool(raw_gpu_owner),
         "paused": bool(await r.get(queue.QUEUE_PAUSED_KEY)),
-        "active": [{"run_id": x.id, "case_id": x.case_id, "detector": x.detector_id.value,
-                    "source_role": x.source_role, "status": x.status.value} for x in active],
+        "active": active_public,
     }
     await asyncio.to_thread(
         _record_poll_access, principal, "queue_status", "active", {"count": len(active)})

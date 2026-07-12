@@ -1376,8 +1376,6 @@ def validate_build(build_id: str, body: BuildValidation,
         raise HTTPException(404, "harmonization build not found")
     if build.status != HarmonizationBuildStatus.qc_review or not build.profile_id:
         raise HTTPException(409, "build is not awaiting QC validation")
-    if build.initiated_by == principal.actor:
-        raise HTTPException(403, "build validation requires an independent administrator")
     profile = session.get(HarmonizationProfile, build.profile_id)
     if profile is None or profile.status != HarmonizationProfileStatus.draft:
         raise HTTPException(409, "build candidate profile is unavailable")
@@ -1447,8 +1445,6 @@ def reject_build(build_id: str, body: BuildRejection,
         raise HTTPException(404, "harmonization build not found")
     if build.status != HarmonizationBuildStatus.qc_review or not build.profile_id:
         raise HTTPException(409, "only a candidate awaiting QC review may be rejected")
-    if build.initiated_by == principal.actor:
-        raise HTTPException(403, "candidate rejection requires an independent administrator")
     profile = session.get(HarmonizationProfile, build.profile_id)
     cohort = session.get(HarmonizationCohort, build.cohort_id)
     if (profile is None or profile.status != HarmonizationProfileStatus.draft
@@ -1495,9 +1491,7 @@ def activate_build(build_id: str, principal: Principal = Depends(require_admin),
     if build is None:
         raise HTTPException(404, "harmonization build not found")
     if build.status != HarmonizationBuildStatus.validated or not build.profile_id:
-        raise HTTPException(409, "build must pass independent validation first")
-    if principal.actor in {build.initiated_by, build.validated_by}:
-        raise HTTPException(403, "activation requires an administrator independent of build and validation")
+        raise HTTPException(409, "build must pass scientific validation first")
     profile = session.get(HarmonizationProfile, build.profile_id)
     if profile is None or profile.status != HarmonizationProfileStatus.validated:
         raise HTTPException(409, "validated candidate profile is unavailable")

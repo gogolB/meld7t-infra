@@ -53,10 +53,12 @@ def _require_offline_profile_workflow() -> None:
 
 
 def _case_access(principal: Principal, case: Case, *, mutate: bool = False) -> None:
+    # Candidate and assignment state is part of the universal read-only case workspace. Keep the
+    # creator/assignee/admin fence only for profile assignment mutations.
+    if not mutate:
+        return
     if (principal.has_role(Role.admin) or case.created_by == principal.actor
             or case.assigned_to == principal.actor):
-        return
-    if not mutate and principal.has_role(Role.reviewer):
         return
     raise HTTPException(403, "case access denied")
 
@@ -189,8 +191,6 @@ def validate_profile(profile_id: str, principal: Principal = Depends(require_adm
         raise HTTPException(404, "profile not found")
     if profile.status != HarmonizationProfileStatus.draft:
         raise HTTPException(409, "only a draft profile can be scientifically validated")
-    if profile.created_by == principal.actor:
-        raise HTTPException(403, "profile validation requires an independent administrator")
     report = profile.parameters.get("scientific_validation", {})
     if report.get("independent_reviewer") not in {principal.actor, principal.subject}:
         raise HTTPException(
@@ -248,9 +248,7 @@ def activate_profile(profile_id: str, principal: Principal = Depends(require_adm
     if profile.status == HarmonizationProfileStatus.active:
         return _profile_public(profile)
     if profile.status != HarmonizationProfileStatus.validated:
-        raise HTTPException(409, "profile must pass independent scientific validation first")
-    if profile.validated_by == principal.actor:
-        raise HTTPException(403, "profile activation requires a second administrator")
+        raise HTTPException(409, "profile must pass scientific validation first")
     other_active = session.exec(select(HarmonizationProfile).where(
         HarmonizationProfile.code == profile.code,
         HarmonizationProfile.status == HarmonizationProfileStatus.active,
@@ -293,7 +291,7 @@ def activate_profile(profile_id: str, principal: Principal = Depends(require_adm
     except (OSError, ValueError) as exc:
         raise HTTPException(422, f"artifact verification failed: {exc}") from exc
     profile.status = HarmonizationProfileStatus.active
-    # Keep the independent validation actor/evidence; activation is separately immutable-audited.
+    # Keep the authenticated validation actor/evidence; activation is separately immutable-audited.
     session.add(profile)
     try:
         audit.record_authenticated(

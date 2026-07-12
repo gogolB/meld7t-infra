@@ -47,7 +47,8 @@ def build_recipe(workup: Workup, confirmed_roles: dict[str, str], *,
 
     ``harmonization`` maps ``(detector_id, source_series_uid)`` to a versioned profile contract.
     When harmonization is required, a missing assignment blocks that exact run. Researchers may
-    explicitly allow an unharmonized exploratory run only by supplying a recorded reason.
+    explicitly confirm an unharmonized research run. A standard provenance reason is recorded
+    when the operator does not add a note.
     """
     # invert: role -> [series_uid]
     by_role: dict[str, list[str]] = {}
@@ -84,7 +85,9 @@ def build_recipe(workup: Workup, confirmed_roles: dict[str, str], *,
                         }
                     else:
                         params["harmonization"] = {
-                            "mode": "unharmonized", "reason": unharmonized_reason}
+                            "mode": "unharmonized",
+                            "reason": (unharmonized_reason or
+                                       "explicitly confirmed without a harmonization profile")}
 
                     status = RunStatus.created.value
                     notes = []

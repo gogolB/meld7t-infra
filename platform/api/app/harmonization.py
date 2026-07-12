@@ -291,12 +291,12 @@ def runtime_profile_trusted(session: Any, profile: Any) -> bool:
                              if isinstance(scientific_validation, dict) else {})
     frozen = (cohort.frozen_manifest
               if cohort is not None and isinstance(cohort.frozen_manifest, dict) else {})
-    actors = {build.initiated_by, build.validated_by, build.activated_by}
+    actors = (build.initiated_by, build.validated_by, build.activated_by)
     return bool(
         cohort is not None
         and cohort.status == HarmonizationCohortStatus.frozen
         and cohort.approved_by == build.initiated_by
-        and None not in actors and len(actors) == 3
+        and all(isinstance(actor, str) and actor for actor in actors)
         and profile.validated_by == build.validated_by
         and (profile.code, profile.version)
         == (cohort.profile_code, cohort.profile_version)

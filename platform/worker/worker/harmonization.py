@@ -40,9 +40,9 @@ def resolve_harmonization(raw: Any) -> ResolvedHarmonization | None:
         raise ValueError("run.params.harmonization must be an object")
     if raw.get("mode") in {"unharmonized", "not_applicable"}:
         mode = str(raw["mode"])
-        reason = str(raw.get("reason", "")).strip()
-        if not reason:
-            raise ValueError(f"{mode} research runs require a recorded reason")
+        reason = str(raw.get("reason", "")).strip() or (
+            "explicitly confirmed without a harmonization profile"
+        )
         return ResolvedHarmonization(
             code="none", version=0, method=mode, host_data_root="",
             metadata={"mode": mode, "reason": reason, "applied": False},

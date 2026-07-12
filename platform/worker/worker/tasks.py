@@ -22,18 +22,22 @@ from app import queue as app_queue
 from app.config import settings as app_settings
 from app.db import engine
 from app.models import (
-    Case, CaseStatus, Cluster, Device, Job, Provenance, Recipe, Result, Run, RunStatus, Series,
+    Case, CaseReportKind, CaseStatus, Cluster, Device, Job, Provenance, Recipe, Result, Run,
+    RunStatus, Series,
 )
 from app.recipe import spec_hash
+from app.reporting import ReportNotReadyError, ensure_case_report
 from app.workflow import run_input_contract_hash
 from app.storage import storage_health
 
 from . import dicom, pipeline
+from .case_ingest import ingest_case_upload
 from .config import wsettings
 from .detectors import get_runner
 from .detectors.base import DetectorCompletion
 from .gpu import gpu_lease, wait_if_paused
 from .harmonization import ResolvedHarmonization, resolve_harmonization
+from .report_tasks import generate_case_report
 
 
 _log = logging.getLogger(__name__)
@@ -368,7 +372,7 @@ def _transition(run_id: str, status: RunStatus, claim_token: str) -> None:
         session.commit()
 
 
-def _claim(run_id: str) -> tuple[str, str | None, str, Any, dict, str] | None:
+def _claim(run_id: str) -> tuple[str, str, str | None, str, Any, dict, str] | None:
     """Atomically claim only queued work; duplicate ARQ delivery becomes a no-op."""
     with Session(engine) as session:
         run = session.exec(select(Run).where(Run.id == run_id).with_for_update()).first()
@@ -444,7 +448,8 @@ def _claim(run_id: str) -> tuple[str, str | None, str, Any, dict, str] | None:
                                                 "source_role": _role(run.source_role)
                                                 if run.source_role else None})
         session.commit()
-        return (run.case_id, (_role(run.source_role) if run.source_role else None), detector,
+        return (run.case_id, run.recipe_id,
+                (_role(run.source_role) if run.source_role else None), detector,
                 runner, dict(run.params or {}), claim_token)
 
 
@@ -508,7 +513,7 @@ async def run_detector(ctx, run_id: str) -> dict:
             run = session.get(Run, run_id)
             return {"run_id": run_id, "skipped": "not queued",
                     "status": run.status.value if run else "not_found"}
-    case_id, source_role, detector, runner, params, claim_token = claimed
+    case_id, recipe_id, source_role, detector, runner, params, claim_token = claimed
     workdir = os.path.join(wsettings.meld_data, "work", run_id, claim_token)
     os.makedirs(workdir, exist_ok=True)
     await _push_status(redis, run_id, RunStatus.preprocessing.value)
@@ -581,8 +586,10 @@ async def run_detector(ctx, run_id: str) -> dict:
         if await asyncio.to_thread(_renew_claim, run_id, claim_token) is not True:
             raise RuntimeError("run claim was lost before external publication")
         uids = await runner.package(
-            subject, pseudonym, workdir, run_id,
+            subject, pseudonym, workdir, run_id, recipe_id,
             expected_clusters=len(validated_ingest.clusters),
+            validated_ingest=validated_ingest,
+            harmonization=harmonization,
         )
         if await asyncio.to_thread(_renew_claim, run_id, claim_token) is not True:
             raise RuntimeError("run claim was lost during external publication")
@@ -609,6 +616,11 @@ async def run_detector(ctx, run_id: str) -> dict:
             output_manifest["dicom_manifest_sha256"] = completed.uids[
                 "dicom_manifest_sha256"]
             output_manifest["dicom_sop_count"] = int(completed.uids["dicom_sop_count"])
+        if completed.uids.get("derived_series_manifest"):
+            output_manifest["derived_series_manifest"] = completed.uids[
+                "derived_series_manifest"]
+            output_manifest["derived_series_manifest_sha256"] = completed.uids[
+                "derived_series_manifest_sha256"]
 
         with Session(engine) as session:
             run = session.exec(select(Run).where(Run.id == run_id).with_for_update()).one()
@@ -625,6 +637,7 @@ async def run_detector(ctx, run_id: str) -> dict:
                 orthanc_study_uid=completed.uids.get("study_uid"),
                 orthanc_t1_uid=completed.uids.get("t1_series_uid"),
                 orthanc_seg_uid=completed.uids.get("seg_series_uid"),
+                orthanc_probmap_uid=completed.uids.get("probmap_series_uid"),
                 report_path=rf.get("report_path"),
                 n_clusters=rf["n_clusters"],
                 output_manifest=output_manifest,
@@ -656,6 +669,9 @@ async def run_detector(ctx, run_id: str) -> dict:
             if output_manifest.get("dicom_manifest_sha256"):
                 provenance.output_hashes["dicom_manifest"] = output_manifest[
                     "dicom_manifest_sha256"]
+            if output_manifest.get("derived_series_manifest_sha256"):
+                provenance.output_hashes["derived_series_manifest"] = output_manifest[
+                    "derived_series_manifest_sha256"]
             provenance.release_manifest_digest = wsettings.release_manifest_digest
             provenance_contract = {
                 "os_checksum": provenance.os_checksum,
@@ -709,6 +725,9 @@ async def run_detector(ctx, run_id: str) -> dict:
                                                         "record_contract_sha256"],
                                                     "dicom_manifest_sha256": output_manifest.get(
                                                         "dicom_manifest_sha256"),
+                                                    "derived_series_manifest_sha256": (
+                                                        output_manifest.get(
+                                                            "derived_series_manifest_sha256")),
                                                     "completion_bundle_sha256": (
                                                         completion_bundle_digest),
                                                     "release_manifest_digest": (
@@ -790,6 +809,15 @@ async def _fail(redis, run_id: str, status: RunStatus, workdir: str, msg: str,
 
 def _maybe_finish_case(session: Session, case_id: str) -> None:
     """Update the parent only when every runnable child is terminal; failures never become ready."""
+    # Detector transactions lock their own Run first. Serialize the shared parent transition next
+    # so concurrent final children cannot both observe the other's uncommitted active state and
+    # leave a terminal case stranded in ``running`` without its preliminary report.
+    case_statement = select(Case).where(Case.id == case_id)
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        case_statement = case_statement.with_for_update()
+    case = session.exec(case_statement).first()
+    if not case or case.status not in {CaseStatus.queued, CaseStatus.running}:
+        return
     recipe = session.exec(select(Recipe).where(
         Recipe.case_id == case_id, Recipe.confirmed_at.is_not(None)
     ).order_by(Recipe.version.desc(), Recipe.created_at.desc())).first()
@@ -803,18 +831,38 @@ def _maybe_finish_case(session: Session, case_id: str) -> None:
     }]
     if active:
         return
-    case = session.get(Case, case_id)
-    if not case or case.status not in {CaseStatus.queued, CaseStatus.running}:
-        return
     if any(run.status in {RunStatus.failed, RunStatus.failed_oom, RunStatus.blocked} for run in runs):
         case.status = CaseStatus.failed
     else:
         case.status = CaseStatus.review_ready
     session.add(case)
+    if case.status == CaseStatus.review_ready:
+        try:
+            report, created = ensure_case_report(
+                session, case, recipe, CaseReportKind.preliminary,
+                requested_by="service:worker",
+            )
+        except ReportNotReadyError as exc:
+            # Report configuration/integrity must fail closed for the report without rolling back
+            # an otherwise validated detector result. A reviewer can retry after remediation.
+            audit.record(
+                session, actor="service:worker", action="case_report.defer",
+                entity_type="case", entity_id=case.id,
+                payload={"error_code": type(exc).__name__},
+            )
+            return
+        if created:
+            audit.record(
+                session, actor="service:worker", action="case_report.request",
+                entity_type="case_report", entity_id=report.id,
+                payload={"case_id": case.id, "kind": "preliminary",
+                         "version": report.version,
+                         "snapshot_sha256": report.snapshot_sha256},
+            )
 
 
 class WorkerSettings:
-    functions = [run_detector]
+    functions = [run_detector, ingest_case_upload, generate_case_report]
     redis_settings = RedisSettings.from_dsn(app_settings.redis_url)
     max_jobs = wsettings.worker_max_jobs
     # One coherent deadline includes GPU waiting and every stage. The task's cancellation handler
