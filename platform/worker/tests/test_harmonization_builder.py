@@ -17,6 +17,7 @@ from app.models import (
     HarmonizationCohortStudy,
     HarmonizationUpload,
 )
+from worker import harmonization_builder as builder_module
 from worker.config import wsettings
 from worker.harmonization_builder import (
     BuildAdmissionDeferred,
@@ -98,6 +99,12 @@ def test_build_claim_is_fenced_by_durable_pending_rollback():
 def test_upload_archive_rejects_traversal_and_extracts_regular_entries(tmp_path, monkeypatch):
     monkeypatch.setattr(wsettings, "harmonization_upload_max_files", 10)
     monkeypatch.setattr(wsettings, "harmonization_upload_max_expanded_bytes", 1024 * 1024)
+    capacity_paths = []
+    monkeypatch.setattr(
+        builder_module,
+        "_require_storage_capacity",
+        lambda path, **_kwargs: capacity_paths.append(Path(path)),
+    )
     unsafe = tmp_path / "unsafe.zip"
     with zipfile.ZipFile(unsafe, "w") as archive:
         archive.writestr("../escape.dcm", b"x")
@@ -113,6 +120,7 @@ def test_upload_archive_rejects_traversal_and_extracts_regular_entries(tmp_path,
     paths = _dicom_paths(safe, output)
     assert [path.relative_to(output).as_posix() for path in paths] == ["site/control-01.dcm"]
     assert paths[0].read_bytes() == payload
+    assert capacity_paths == [output]
     assert _expanded_upload_bytes(safe) == len(payload)
 
 

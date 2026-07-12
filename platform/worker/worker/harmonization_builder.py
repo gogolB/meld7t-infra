@@ -78,7 +78,7 @@ class PublicationPending(RuntimeError):
 _log = logging.getLogger(__name__)
 
 
-def _require_storage_capacity(path: str, *, incoming_bytes: int = 0) -> None:
+def _require_storage_capacity(path: str | Path, *, incoming_bytes: int = 0) -> None:
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(root)
@@ -930,7 +930,10 @@ def _dicom_paths(upload: Path, work: Path) -> list[Path]:
                         raise ValueError("archive_entry_size_mismatch")
                     destination.flush()
                     os.fsync(destination.fileno())
-                _require_storage_capacity(wsettings.harmonization_build_root)
+                # Check the filesystem actually receiving this extraction.  Production callers
+                # place ``work`` under harmonization_build_root; tests and recovery tooling may
+                # supply a different bounded scratch root.
+                _require_storage_capacity(work)
                 paths.append(target)
         return paths
     target = work / "upload.dcm"
