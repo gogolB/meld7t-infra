@@ -1,0 +1,22 @@
+MELD7T RESEARCH DEVELOPER COMPONENT RELEASE
+
+This archive set is intended for research software evaluation and development.
+It is not a complete Bazzite deployment, an air-gap production bundle, or a
+clinical/scientific acceptance decision.
+
+It contains the exact committed source, API and worker Python distributions,
+and the built static web application. It intentionally excludes OCI images,
+model/cache assets, DICOM, application data, secrets, release signing keys,
+and harmonization profiles.
+
+The Python distributions are component artifacts, not standalone installers.
+In particular, the worker uses the API's shared app package through the
+repository deployment layout. Use the documented signed air-gap workflow to
+construct a complete server release.
+
+GitHub artifact provenance establishes which workflow and source revision built
+the files. It does not establish clinical validity, scientific validity, or
+operational approval.
+
+No repository-wide LICENSE file was present when this notice was added.
+Publication therefore does not create or imply a license grant.

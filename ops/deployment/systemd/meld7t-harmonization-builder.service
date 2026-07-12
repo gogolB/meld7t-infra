@@ -1,0 +1,52 @@
+[Unit]
+Description=meld7t harmonization builder — isolated single-job cohort estimator
+Wants=postgres.service redis.service harmonization-orthanc.service immudb.service
+After=network-online.target postgres.service redis.service harmonization-orthanc.service immudb.service
+StartLimitIntervalSec=900
+StartLimitBurst=5
+ConditionPathExists=%h/.local/lib/meld7t/current/platform/worker/worker/harmonization_builder.py
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/lib/meld7t/current
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=%h/.config/meld7t/current/env/worker.env
+EnvironmentFile=%h/.config/meld7t/current/env/harmonization-builder.env
+EnvironmentFile=%h/.config/meld7t/current/env/runtime-images.env
+ExecStartPre=/usr/bin/test -x ${MELD7T_WORKER_VENV}/bin/arq
+ExecStart=/usr/bin/env PYTHONPATH=%h/.local/lib/meld7t/current/platform/api:%h/.local/lib/meld7t/current/platform/worker ${MELD7T_WORKER_VENV}/bin/arq worker worker.harmonization_builder:BuilderWorkerSettings
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=120
+TimeoutStopSec=180
+KillMode=mixed
+OOMPolicy=stop
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=%h/meld7t-state/harmonization-uploads %h/meld7t-state/harmonization-builds %h/meld7t-state/harmonization-profiles %h/meld7t-state/audit %h/.local/share/containers -%t/containers -%t/libpod -%t/netns
+ReadOnlyPaths=%h/.local/lib/meld7t/current/harmonization %h/.config/meld7t/current
+InaccessiblePaths=%h/.config/meld7t/current/env %h/meld7t-state/meld-data -/var/mnt/meld7t/raw
+IPAddressDeny=any
+IPAddressAllow=localhost
+TasksMax=2048
+LimitNOFILE=65536
+MemoryHigh=16G
+MemoryMax=32G
+CPUQuota=800%
+CPUWeight=40
+IOWeight=40
+LimitFSIZE=137438953472
+
+[Install]
+WantedBy=default.target

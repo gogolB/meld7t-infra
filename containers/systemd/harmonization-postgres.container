@@ -1,0 +1,39 @@
+[Unit]
+Description=PostgreSQL — isolated harmonization Orthanc index
+After=network-online.target
+
+[Container]
+# install-quadlets.sh resolves this service through the signed postgres image-lock role.
+Image=docker.io/library/postgres@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+Pull=never
+ContainerName=harmonization-postgres
+Network=meld-harmonization-db.network
+Volume=harmonization-postgres-data.volume:/var/lib/postgresql/data
+Volume=%h/.config/meld7t/current/harmonization-postgres/init-database.sh:/docker-entrypoint-initdb.d/10-init-database.sh:ro,z
+EnvironmentFile=%h/.config/meld7t/current/env/harmonization-postgres.env
+HealthCmd=pg_isready -U "$POSTGRES_USER" -d postgres
+HealthInterval=20s
+HealthTimeout=5s
+HealthStartPeriod=60s
+HealthRetries=6
+HealthOnFailure=kill
+Notify=healthy
+NoNewPrivileges=true
+PidsLimit=512
+LogDriver=journald
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=120
+StartLimitIntervalSec=600
+StartLimitBurst=10
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=1024
+CPUWeight=80
+IOWeight=200
+
+[Install]
+WantedBy=default.target

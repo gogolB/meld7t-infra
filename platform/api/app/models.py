@@ -111,6 +111,31 @@ class HarmonizationProfileStatus(str, Enum):
     retired = "retired"
 
 
+class HarmonizationCohortStatus(str, Enum):
+    draft = "draft"
+    cohort_ready = "cohort_ready"
+    frozen = "frozen"
+    archived = "archived"
+
+
+class HarmonizationBuildStatus(str, Enum):
+    queued = "queued"
+    building = "building"
+    qc_review = "qc_review"
+    validated = "validated"
+    active = "active"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class HarmonizationUploadStatus(str, Enum):
+    receiving = "receiving"
+    staged = "staged"
+    importing = "importing"
+    imported = "imported"
+    failed = "failed"
+
+
 class OutboxStatus(str, Enum):
     pending = "pending"
     publishing = "publishing"
@@ -185,6 +210,202 @@ class HarmonizationAssignment(SQLModel, table=True):
         default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
     confirmed_at: Optional[datetime] = Field(
         default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class HarmonizationCohort(SQLModel, table=True):
+    """Frozen, deidentified controls for one site/scanner/protocol profile build."""
+
+    __tablename__ = "harmonization_cohorts"
+    __table_args__ = (
+        UniqueConstraint("profile_code", "profile_version",
+                         name="uq_harmonization_cohort_profile_version"),
+        CheckConstraint("min_controls >= 20", name="ck_harmonization_cohort_min_controls"),
+        CheckConstraint("cv_folds >= 2 AND cv_folds <= 10",
+                        name="ck_harmonization_cohort_cv_folds"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    name: str
+    site_code: str = Field(index=True)
+    profile_code: str = Field(index=True)
+    profile_version: int
+    source_role: SeriesRole
+    selector: dict = Field(sa_column=_json_col(nullable=False))
+    min_controls: int = 20
+    cv_folds: int = 5
+    status: HarmonizationCohortStatus = Field(default=HarmonizationCohortStatus.draft)
+    demographics_manifest: Optional[dict] = Field(default=None, sa_column=_json_col())
+    frozen_manifest: Optional[dict] = Field(default=None, sa_column=_json_col())
+    created_by: str
+    approved_by: Optional[str] = None
+    created_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    frozen_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class HarmonizationCohortStudy(SQLModel, table=True):
+    __tablename__ = "harmonization_cohort_studies"
+    __table_args__ = (
+        UniqueConstraint("cohort_id", "orthanc_study_uid",
+                         name="uq_harmonization_cohort_study_uid"),
+        UniqueConstraint("cohort_id", "subject_key_hmac",
+                         name="uq_harmonization_cohort_subject"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    cohort_id: str = Field(foreign_key="harmonization_cohorts.id", index=True)
+    orthanc_study_uid: str
+    subject_key_hmac: str = Field(index=True)
+    included: bool = True
+    exclusion_reason: Optional[str] = None
+    acquisition_fingerprint: str = Field(index=True)
+    acquisition: dict = Field(sa_column=_json_col(nullable=False))
+    series_manifest: list = Field(default_factory=list, sa_column=_json_col(nullable=False))
+    study_sha256: str
+    imported_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+
+
+class HarmonizationDemographic(SQLModel, table=True):
+    __tablename__ = "harmonization_demographics"
+    __table_args__ = (
+        UniqueConstraint("cohort_id", "subject_key_hmac",
+                         name="uq_harmonization_demographic_subject"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    cohort_id: str = Field(foreign_key="harmonization_cohorts.id", index=True)
+    subject_key_hmac: str = Field(index=True)
+    age: float
+    sex: str
+
+
+class HarmonizationUpload(SQLModel, table=True):
+    __tablename__ = "harmonization_uploads"
+    __table_args__ = (
+        CheckConstraint("total_size > 0", name="ck_harmonization_upload_total_size"),
+        CheckConstraint("received_size >= 0", name="ck_harmonization_upload_received_size"),
+        CheckConstraint("received_size <= total_size",
+                        name="ck_harmonization_upload_received_within_total"),
+        Index("ix_harmonization_upload_status_updated", "status", "updated_at"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    cohort_id: str = Field(foreign_key="harmonization_cohorts.id", index=True)
+    filename: str
+    content_type: str = "application/octet-stream"
+    storage_key: str = Field(default_factory=_uuid, unique=True)
+    # Uploads may legitimately exceed PostgreSQL INTEGER (2 GiB).  Keep the ORM metadata aligned
+    # with the migration so Alembic drift checks also protect this capacity contract.
+    total_size: int = Field(sa_column=Column(BigInteger, nullable=False))
+    received_size: int = Field(
+        default=0, sa_column=Column(BigInteger, nullable=False, default=0))
+    sha256: str
+    status: HarmonizationUploadStatus = Field(default=HarmonizationUploadStatus.receiving)
+    created_by: str
+    last_error: Optional[str] = None
+    import_result: Optional[dict] = Field(default=None, sa_column=_json_col())
+    created_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    updated_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    completed_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    staging_cleaned_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    mapping_redacted_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class HarmonizationBuild(SQLModel, table=True):
+    __tablename__ = "harmonization_builds"
+    __table_args__ = (
+        UniqueConstraint("cohort_id", "attempt", name="uq_harmonization_build_attempt"),
+        CheckConstraint("attempt > 0", name="ck_harmonization_build_attempt"),
+        CheckConstraint("progress >= 0 AND progress <= 100",
+                        name="ck_harmonization_build_progress"),
+        Index("ix_harmonization_build_status_lease", "status", "lease_expires_at"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    cohort_id: str = Field(foreign_key="harmonization_cohorts.id", index=True)
+    attempt: int = 1
+    status: HarmonizationBuildStatus = Field(default=HarmonizationBuildStatus.queued)
+    stage: str = "queued"
+    progress: int = 0
+    builder_image_digest: str
+    builder_adapter_sha256: str
+    acceptance_criteria: dict = Field(default_factory=dict, sa_column=_json_col(nullable=False))
+    cv_plan: Optional[dict] = Field(default=None, sa_column=_json_col())
+    qc_report: Optional[dict] = Field(default=None, sa_column=_json_col())
+    artifact_manifest: Optional[dict] = Field(default=None, sa_column=_json_col())
+    rejection_summary: Optional[dict] = Field(default=None, sa_column=_json_col())
+    profile_id: Optional[str] = Field(default=None, foreign_key="harmonization_profiles.id")
+    error_code: Optional[str] = None
+    initiated_by: str
+    validated_by: Optional[str] = None
+    activated_by: Optional[str] = None
+    created_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    started_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    completed_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    heartbeat_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    lease_expires_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class HarmonizationFoldResult(SQLModel, table=True):
+    __tablename__ = "harmonization_fold_results"
+    __table_args__ = (
+        UniqueConstraint("build_id", "fold_index", name="uq_harmonization_fold_index"),
+        CheckConstraint("fold_index >= 0", name="ck_harmonization_fold_index"),
+        CheckConstraint("train_count > 0", name="ck_harmonization_fold_train_count"),
+        CheckConstraint("holdout_count > 0", name="ck_harmonization_fold_holdout_count"),
+        CheckConstraint("status IN ('passed', 'failed')",
+                        name="ck_harmonization_fold_status"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    build_id: str = Field(foreign_key="harmonization_builds.id", index=True)
+    fold_index: int
+    train_count: int
+    holdout_count: int
+    membership_hmac_sha256: str
+    status: str
+    metrics: dict = Field(default_factory=dict, sa_column=_json_col(nullable=False))
+    resource_usage: dict = Field(default_factory=dict, sa_column=_json_col(nullable=False))
+
+
+# A partial unique index over an always-true expression makes the server-wide live-build slot a
+# database invariant rather than merely an API convention.  SQLite metadata used by unit tests
+# deliberately skips this PostgreSQL-only index.
+_one_live_harmonization_build = Index(
+    "uq_harmonization_build_one_live",
+    HarmonizationBuild.__table__.c.cohort_id.is_not(None),
+    unique=True,
+    postgresql_where=text(
+        "status IN ('queued', 'building', 'qc_review', 'validated')"
+    ),
+)
+_one_live_harmonization_build.ddl_if(dialect="postgresql")
+
+
+class AcquisitionObservation(SQLModel, table=True):
+    __tablename__ = "acquisition_observations"
+    __table_args__ = (
+        UniqueConstraint("detector_id", "source_role", "acquisition_fingerprint",
+                         name="uq_acquisition_observation_contract"),
+    )
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    detector_id: DetectorId
+    source_role: SeriesRole
+    acquisition_fingerprint: str = Field(index=True)
+    acquisition: dict = Field(sa_column=_json_col(nullable=False))
+    case_count: int = 0
+    coverage_status: str = "uncovered"
+    profile_id: Optional[str] = Field(default=None, foreign_key="harmonization_profiles.id")
+    first_seen_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    last_seen_at: datetime = Field(
+        default_factory=_now, sa_column=Column(DateTime(timezone=True), nullable=False))
 
 class Case(SQLModel, table=True):
     __tablename__ = "cases"

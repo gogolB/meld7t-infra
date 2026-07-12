@@ -16,7 +16,9 @@ staged_config="$config_root/releases/$release_id"
 "$release/ops/deployment/verify-backup.sh" "$backup_dir" "$trusted_backup_key"
 [[ -f $backup_dir/COMPLETE ]] || { printf 'verified backup lacks COMPLETE marker\n' >&2; exit 1; }
 field() { sed -n "s/^$1=//p" "$backup_dir/backup.env"; }
-[[ $(field MELD7T_BACKUP_FORMAT) == 2 ]] || { printf 'unsupported backup format\n' >&2; exit 1; }
+backup_format=$(field MELD7T_BACKUP_FORMAT)
+[[ $backup_format == 2 || $backup_format == 3 ]] \
+  || { printf 'unsupported backup format\n' >&2; exit 1; }
 backup_timestamp=$(field MELD7T_BACKUP_TIMESTAMP)
 [[ $(<"$backup_dir/COMPLETE") == "$backup_timestamp" ]] \
   || { printf 'backup completion marker does not match signed timestamp\n' >&2; exit 1; }
@@ -36,6 +38,8 @@ expected_release=$(readlink -f "${MELD7T_RELEASE_ROOT:-$HOME/.local/lib/meld7t}/
 [[ $(field MELD7T_BACKUP_RELEASE) == "$expected_release" ]] \
   || { printf 'backup does not bind the current host release\n' >&2; exit 1; }
 systemctl --user stop caddy.service api.service meld7t-worker.service
+# This unit is absent while upgrading a pre-builder release.
+systemctl --user stop meld7t-harmonization-builder.service 2>/dev/null || true
 api_image=$("$release/ops/release/image-lock.sh" --lock "$release/release-receipt/images.lock" get api)
 podman run --rm --pull=never --name meld7t-schema-migration \
   --network meld-data-net \

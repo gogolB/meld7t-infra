@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir --no-index --require-hashes \
  && rm -rf /opt/meld7t/wheelhouse
 COPY app ./app
 COPY alembic ./alembic
-COPY alembic.ini entrypoint.sh ./
+COPY alembic.ini entrypoint.sh pyproject.toml ./
 RUN chmod 0555 entrypoint.sh \
  && chown -R root:root /app
 

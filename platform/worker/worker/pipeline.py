@@ -104,7 +104,7 @@ async def run_meld(subject: str, workdir: str,
 async def run_package(subject: str, pseudonym: str, workdir: str,
                       uid_seed: str, expected_clusters: int) -> tuple[int, dict]:
     """Package MELD outputs → T1 DICOM series + DICOM-SEG, STOW to Orthanc (§17). Runs on
-    meld-net (needs Orthanc); parses the printed UIDs from stdout."""
+    meld-compute-net (needs Orthanc); parses the printed UIDs from stdout."""
     cmd = [
         "podman", "run", "--rm", "--name", f"meld7t-package-{subject}",
         "--network", wsettings.podman_data_network,

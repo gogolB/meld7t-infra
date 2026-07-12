@@ -1,12 +1,13 @@
 [Unit]
 Description=MELD 7T local production health gate
-After=caddy.service api.service meld7t-worker.service
+After=caddy.service api.service meld7t-worker.service meld7t-harmonization-builder.service
 
 [Service]
 Type=oneshot
 ExecStart=%h/.local/lib/meld7t/current/ops/deployment/healthcheck.sh
 Environment=MELD7T_STATE_ROOT=%h/meld7t-state
 Environment=MELD7T_CONFIG_ROOT=%h/.config/meld7t/current
+Environment=MELD7T_HARMONIZATION_ORTHANC_MAX_USED_PERCENT=85
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

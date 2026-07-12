@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,21 +19,27 @@ from .auth import correlation_id_middleware
 from .config import settings
 from .db import engine
 from .harmonization import (
+    canonical_json_sha256,
     profile_document_sha256,
+    profile_artifact_root,
     profile_integrity_generation,
     selectors_may_overlap,
     validate_profile_semantics,
     verify_artifact_manifest,
 )
 from .harmonization_routes import router as harmonization_router
+from .cohort_routes import router as cohort_router
 from .models import (
-    HarmonizationProfile, HarmonizationProfileStatus, OutboxEvent, OutboxStatus,
+    HarmonizationBuild, HarmonizationBuildStatus, HarmonizationCohort,
+    HarmonizationCohortStatus, HarmonizationProfile, HarmonizationProfileStatus,
+    OutboxEvent, OutboxStatus,
 )
 from .routes import router
 from .storage import storage_health
+from .version import API_VERSION
 
 
-EXPECTED_SCHEMA_REVISION = "f9c5d2e8a3b7"
+EXPECTED_SCHEMA_REVISION = "a3e7c1d9b5f2"
 _log = logging.getLogger(__name__)
 _reconciler_started_at = datetime.now(timezone.utc)
 _reconciler_state: dict[str, object] = {
@@ -54,6 +61,8 @@ _profile_integrity_state: dict[str, object] = {
 def _reap_stale_runs_off_loop() -> None:
     with Session(engine) as session:
         queue.reap_stale_runs(session)
+        queue.reap_stale_harmonization_uploads(session)
+        queue.reap_stale_harmonization_builds(session)
 
 
 async def _outbox_loop() -> None:
@@ -67,6 +76,7 @@ async def _outbox_loop() -> None:
             with Session(engine) as session:
                 await queue.dispatch_outbox_events(session)
                 await queue.reconcile_queued_runs(session)
+                await queue.reconcile_harmonization_jobs(session)
             await asyncio.to_thread(_reap_stale_runs_off_loop)
             _reconciler_state.update({
                 "last_success": datetime.now(timezone.utc),
@@ -92,12 +102,28 @@ def _scan_harmonization_profiles_off_loop() -> dict[str, object]:
             profiles = session.exec(select(HarmonizationProfile).where(
                 HarmonizationProfile.status == HarmonizationProfileStatus.active
             )).all()
+            generated_builds = session.exec(select(HarmonizationBuild).where(
+                HarmonizationBuild.status == HarmonizationBuildStatus.active
+            )).all()
+            build_cohorts = {
+                build.id: session.get(HarmonizationCohort, build.cohort_id)
+                for build in generated_builds
+            }
         expected = {
             (item.code, item.version): item
             for item in settings.harmonization_expected_profiles
         }
         active = {(profile.code, profile.version): profile for profile in profiles}
-        if not expected:
+        generated_by_profile = {
+            build.profile_id: build for build in generated_builds if build.profile_id
+        }
+        generated_profiles = {
+            profile.id for profile in profiles
+            if isinstance(profile.parameters, dict)
+            and profile.parameters.get("storage_scope") == "generated"
+        }
+        if (not expected and not generated_profiles
+                and not settings.harmonization_cohort_bootstrap_allowed):
             failures.append({"error": "signed_expected_inventory_missing"})
         for key, item in expected.items():
             profile = active.get(key)
@@ -120,9 +146,57 @@ def _scan_harmonization_profiles_off_loop() -> dict[str, object]:
                     "error": "profile_document_mismatch",
                 })
         for key in sorted(set(active) - set(expected)):
-            failures.append({
-                "code": key[0], "version": key[1], "error": "unexpected_active_profile",
-            })
+            profile = active[key]
+            build = generated_by_profile.get(profile.id)
+            cohort = build_cohorts.get(build.id) if build else None
+            qc = build.qc_report if build else None
+            artifact_manifest = build.artifact_manifest if build else None
+            scientific_validation = (
+                profile.parameters.get("scientific_validation")
+                if isinstance(profile.parameters, dict) else None
+            )
+            generated_valid = (
+                profile.id in generated_profiles
+                and build is not None
+                and build.builder_image_digest
+                == (profile.parameters.get("build_images") or {}).get("meld")
+                and bool(build.validated_by) and bool(build.activated_by)
+                and len({build.initiated_by, build.validated_by, build.activated_by}) == 3
+                and isinstance(qc, dict) and qc.get("all_folds_succeeded") is True
+                and cohort is not None and cohort.status == HarmonizationCohortStatus.frozen
+                and isinstance(cohort.frozen_manifest, dict)
+                and cohort.frozen_manifest.get("manifest_sha256")
+                == canonical_json_sha256({
+                    name: value for name, value in cohort.frozen_manifest.items()
+                    if name != "manifest_sha256"
+                })
+                and profile.parameters.get("cohort_manifest_sha256")
+                == cohort.frozen_manifest.get("manifest_sha256")
+                and qc.get("report_sha256") == canonical_json_sha256({
+                    name: value for name, value in qc.items() if name != "report_sha256"
+                })
+                and profile.parameters.get("internal_cv_report_sha256")
+                == qc.get("report_sha256")
+                and profile.artifact_manifest == build.artifact_manifest
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(build.builder_adapter_sha256 or "")
+                )
+                is not None
+                and qc.get("builder_adapter_sha256") == build.builder_adapter_sha256
+                and isinstance(artifact_manifest, dict)
+                and artifact_manifest.get("builder_adapter_sha256")
+                == build.builder_adapter_sha256
+                and profile.parameters.get("builder_adapter_sha256")
+                == build.builder_adapter_sha256
+                and isinstance(scientific_validation, dict)
+                and scientific_validation.get("builder_adapter_sha256")
+                == build.builder_adapter_sha256
+            )
+            if not generated_valid:
+                failures.append({
+                    "code": key[0], "version": key[1],
+                    "error": "unexpected_or_unproven_generated_profile",
+                })
         # Concurrent activation of different profile codes cannot be represented by a simple
         # database uniqueness constraint.  Recheck the conservative selector-disjointness rule
         # during every integrity scan so an ambiguous active set can never remain ready.
@@ -151,7 +225,7 @@ def _scan_harmonization_profiles_off_loop() -> dict[str, object]:
         for profile in profiles:
             try:
                 verified = verify_artifact_manifest(
-                    profile.artifact_manifest, settings.harmonization_root
+                    profile.artifact_manifest, profile_artifact_root(profile)
                 )
                 validate_profile_semantics(profile, verified)
                 verified_count += 1
@@ -208,9 +282,11 @@ async def lifespan(_app: FastAPI):
 
 
 server_mode = getattr(settings, "is_server_mode", True)
+if server_mode:
+    settings.require_harmonization_orthanc_credentials()
 app = FastAPI(
     title="MELD 7T Research Platform API",
-    version="0.2.0",
+    version=API_VERSION,
     docs_url=None if server_mode else "/docs",
     redoc_url=None if server_mode else "/redoc",
     openapi_url=None if server_mode else "/openapi.json",
@@ -219,6 +295,7 @@ app = FastAPI(
 app.middleware("http")(correlation_id_middleware)
 app.include_router(router)
 app.include_router(harmonization_router)
+app.include_router(cohort_router)
 
 
 @app.exception_handler(audit.AuditLedgerError)
@@ -306,10 +383,22 @@ async def readyz() -> dict:
             checks["worker_consumer"] = queue.verify_worker_heartbeat(
                 await redis.get(settings.worker_heartbeat_key)
             )
+        if settings.harmonization_required:
+            checks["harmonization_builder"] = queue.verify_worker_heartbeat(
+                await redis.get(settings.harmonization_builder_heartbeat_key),
+                max_age_s=settings.harmonization_builder_heartbeat_max_age_s,
+                expected_capacity_kind="harmonization-builder",
+                expected_images={"meld": settings.meld_image},
+                expected_adapter_sha256=settings.harmonization_builder_adapter_sha256,
+            )
     except Exception as exc:
         checks["redis"] = f"failed:{type(exc).__name__}"
         if settings.worker_heartbeat_required:
             checks["worker_consumer"] = {
+                "ready": False, "status": "broker_unavailable",
+            }
+        if settings.harmonization_required:
+            checks["harmonization_builder"] = {
                 "ready": False, "status": "broker_unavailable",
             }
     checks["report_storage"] = storage_health(
@@ -337,6 +426,13 @@ async def readyz() -> dict:
     if settings.harmonization_required:
         checks["harmonization_storage"] = (
             "ok" if Path(settings.harmonization_root).is_dir() else "missing")
+        checks["harmonization_upload_storage"] = storage_health(
+            settings.harmonization_upload_root,
+            minimum_free_bytes=settings.storage_min_free_bytes,
+            minimum_free_percent=settings.storage_min_free_percent,
+        )
+        checks["harmonization_generated_storage"] = (
+            "ok" if Path(settings.harmonization_generated_root).is_dir() else "missing")
         integrity = dict(_profile_integrity_state)
         scan_at = integrity.pop("last_scan", None)
         scan_age = ((now - scan_at).total_seconds()

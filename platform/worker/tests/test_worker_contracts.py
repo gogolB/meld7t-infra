@@ -384,6 +384,13 @@ def test_server_worker_rejects_mutable_images_and_incomplete_provenance():
         hippunfold_image=immutable, map_image=immutable,
     )
     assert settings.release_manifest_digest == "a" * 64
+    with pytest.raises(ValueError, match="configured together"):
+        WorkerSettings(
+            _env_file=None, **common,
+            pkg_image=immutable, meld_image=immutable,
+            hippunfold_image=immutable, map_image=immutable,
+            harmonization_builder_adapter="/opt/meld7t/bin/adapter",
+        )
 
 
 def test_map_rejects_runtime_script_drift(tmp_path, monkeypatch):

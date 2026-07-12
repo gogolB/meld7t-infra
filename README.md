@@ -39,16 +39,19 @@ After `just dev`, keep all source, dependency, test, build, and release work ins
 |---|---|
 | Caddy | Institutional TLS and authenticated edge on `:9443`; OHIF origin on `:9444` |
 | FastAPI | Case/workflow authority; read-only container filesystem and read-only result/profile mounts |
-| Host worker | ARQ consumer that launches digest-pinned sibling containers; two slots, one Redis-fenced GPU job |
+| Host worker | ARQ consumer that launches digest-pinned sibling containers; two case slots, one Redis-fenced GPU job |
+| Harmonization builder | Admin-only worker and queue for offline cohort estimation; isolated from routine case admission |
 | PostgreSQL | Authoritative workflow, provenance, result, and transactional audit mirror |
 | Redis | Password-protected persistent broker, status cache, worker heartbeat, and GPU lease |
-| Orthanc | Dedicated research-cohort DICOM store; never a general clinical PACS |
+| Research Orthanc | DICOM store for submitted research cases; never a general clinical PACS |
+| Harmonization Orthanc | Separately credentialed DICOM store and volume for deidentified profile-building controls |
 | immudb | Independently verified append-only audit copy with persistent client trust roots |
 
-The production Quadlets separate `meld-edge`, `meld-data-net`, `meld-net`, and
-`meld-registry-net`. Only Caddy publishes the browser ports. PostgreSQL, Redis, Orthanc, immudb,
-and the optional registry also bind loopback ports because the host worker needs them. Orthanc
-uses a separate internal credential; browser identities never receive it.
+The production Quadlets separate `meld-edge`, `meld-data-net`, `meld-compute-net`, and
+`meld-registry-net`. Only Caddy publishes the browser ports. PostgreSQL, Redis, the two Orthanc
+instances, immudb, and the optional registry also bind only the interfaces required by their host
+workers. Research and harmonization Orthanc use different credentials, databases, volumes, backup
+and retention policies. Browser identities never receive either internal Orthanc credential.
 
 Active compute state lives on encrypted local NVMe under `~/meld7t-state`. Durable import and
 backup storage lives under `/var/mnt/meld7t`; production NFS defaults to `sec=krb5p`. The local
@@ -131,15 +134,138 @@ Example selector:
 }
 ```
 
-Profile construction requires at least 20 controls, normalized demographic variation, a
-release-workstation-only cohort HMAC key, exact build images, and a signed scientific-validation
-summary with QC/exclusions and positive/negative/control holdout evidence. One administrator may
-validate a draft; a different administrator activates it. Production migration can perform the
-equivalent controlled activation only for documents named by the signed expected-active inventory.
-Release export/import rejects a profile whose build images differ from the signed detector image
-lock, and the worker repeats that comparison before execution.
-Readiness periodically re-hashes the complete active artifact closure and fails when the cached
-scan is stale or differs from that inventory.
+Profile construction requires at least 20 eligible deidentified controls from one site,
+scanner/software version, and protocol, normalized demographic variation, exact build images, and
+a signed scientific-validation summary with QC/exclusions and positive/negative/control holdout
+evidence. In research/production mode the generic profile create/validate/activate endpoints are
+disabled: profiles are installed from the signed expected-active inventory or follow the linked
+cohort build's three-administrator workflow. Release export/import rejects a profile whose build images
+differ from the signed detector image lock, and the worker repeats that comparison before execution.
+Readiness periodically re-hashes the complete active artifact closure. Signed release profiles must
+still match the expected-active inventory. A locally generated profile is an additional permitted
+class only when it is linked to an active on-server build, records its frozen cohort, QC, artifact,
+and pinned builder-image hashes, completed independent validation/activation, and declares
+`parameters.storage_scope` as `generated`. Generated profiles additionally bind the SHA-256 of the
+reviewed builder adapter across the build row, worker heartbeat, request, QC report, artifact
+manifest, scientific-validation report, profile, audit events, and release export. An ad hoc
+database profile never satisfies readiness.
+For a first-site installation with no profile, export an exactly empty expected inventory with
+`--allow-empty-harmonization-bootstrap`. The exporter signs
+`MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED=true` into `release.env`; the production installer
+propagates that value and does not accept a site-local override. This permits only the cohort-builder
+control plane; normal case recipes remain blocked by required harmonization. The next signed release
+must include the accepted profile and return the authorization to `false`. An empty-bootstrap
+import is rejected once the database contains any signed release-profile history, so it cannot be
+used to retire or downgrade an established release inventory.
+
+### On-server MELD cohort builder
+
+The administrative cohort-builder workflow is designed for roughly 20–40 controls per
+site/scanner/protocol (20 is the hard minimum, not a scientific guarantee). Controls live in the
+separate harmonization Orthanc and never enter the research-case store. Administrators can ingest
+them by controlled DICOM transfer/filesystem import or a resumable browser upload, then reconcile a
+constrained demographics file keyed by the pseudonymous DICOM PatientID. C-STORE enters Orthanc
+quarantine immediately; a completed browser upload first becomes `staged` and reaches quarantine only
+after its asynchronous `importing` step succeeds. Neither path creates a cohort member until the
+audited admission step selects one MR source series, verifies required geometry, and hashes the
+exact Part-10 bytes for every selected SOP
+instance. The demographics/cohort subject key must match the PatientID parsed from those bytes.
+Scanner/protocol fingerprint inputs and modality are parsed from those same exact bytes;
+an earlier Orthanc index response is never their trust root. Admission also requires
+`PatientIdentityRemoved=YES`, a declared deidentification method,
+`BurnedInAnnotation=NO`, no prohibited direct identifiers, and only exact site-approved private
+tags. Duplicate subjects/SOPs, inconsistent acquisitions, protocol outliers, incomplete
+demographics, and quota violations fail closed.
+
+Large source hashing is prepared outside a database transaction, then the exact selected byte
+closure is re-downloaded and compared while holding the same transaction-scoped mutation fence as
+all rollback deletion. Membership and its audit event commit before that fence is released. Thus a
+rollback either observes the admitted SOP references and preserves them, or finishes first and
+causes admission's final closure check to fail; it cannot leave a manifest pointing at deleted
+objects.
+
+Browser ingestion uses an append-only canonical receipt. Its header binds the upload SHA-256,
+canonical instance-manifest SHA-256, and instance count; intent records bind SOP UID, byte count,
+and file SHA-256; stored records bind the Orthanc instance ID and whether the worker proved
+ownership. A canonical digest of that evidence is retained with a rollback failure. The worker
+automatically deletes only proven-owned instances. An `AlreadyStored` object is explicitly
+pre-existing and is never selected by a later exact-delete approval. An intent-only exact object
+whose store response was lost may instead have arrived by C-STORE, so it remains quarantined for
+audited resolution. The admin UI verifies and displays the protected receipt before resolution.
+`Preserve` requires the digest of the site's external ownership/reference attestation and closes
+the gate; `exact delete` requires the canonical receipt digest, no cohort reference or
+receipt-integrity failure, and keeps the gate closed until the builder re-verifies it. Any unresolved
+rollback globally fences application-controlled upload ingestion, cohort admission, build
+admission, and readiness—not just the originating cohort.
+
+The server orchestration is implemented, but DICOM-to-MELD scientific preparation is a
+site-accepted adapter rather than guessed application logic. Set
+`MELD7T_HARMONIZATION_BUILDER_ADAPTER` and
+`MELD7T_HARMONIZATION_BUILDER_ADAPTER_SHA256` together only after that executable passes
+golden-cohort validation. Deployment requires a regular non-symlink executable, hashes its actual
+bytes, and stamps the same digest into the API environment so admission and the worker agree.
+Without both, build admission fails closed while ingestion and cohort preparation remain available.
+
+After the cohort is ready, an administrator explicitly freezes it before submitting a build. The
+freeze binds the selected-source Part-10 byte closure, keyed study/subject identities, demographics
+hash, selector, and configuration. Build creation also binds its builder image and reviewed adapter
+digests. Build admission requires a fresh, release-matching builder heartbeat. The worker re-downloads the frozen
+instance closure and compares every byte count/hash
+before producing a private snapshot. The digest-bound adapter reads only that snapshot and receives
+no Orthanc credentials. A dedicated queue and worker run with explicit CPU/GPU, memory, disk,
+timeout, and concurrency limits; the default is one cohort build at a time, and it shares the
+fenced GPU lease with case inference. A separate ingestion slot keeps verified uploads moving
+without permitting a second live build. Every transition, exclusion, retry, cancellation, artifact,
+and approval is audited.
+
+MELD candidates use deterministic five-fold internal cross-validation when the eligible cohort can
+support it. Each fold estimates on its training controls and evaluates only its held-out controls.
+Every fold must return the configured nonempty, finite metric set and pass its versioned gates.
+The final candidate is then fit again using every eligible control and must pass a separate final-fit
+metric gate. Cross-validation measures internal stability; it is not independent scientific
+validation and does not replace site holdouts, golden cases, or expert review. Successful raw
+snapshots/workspaces are removed after QC; failed or interrupted raw workspaces are removed
+immediately when safe and never retained beyond the configured 24-hour ceiling unless an atomic
+artifact rename has already made publication durable. A `building/publishing` workspace is then
+retained beyond the ordinary reaper cutoff, cancellation is refused, and deterministic recovery
+must finish the profile/SQL/audit transaction before the build reaches `qc_review`.
+
+Uploads progress through `receiving`, `staged`, `importing`, and `imported`, with `failed` terminal.
+Host-level serialization prevents two worker processes from importing or rolling back the same
+Orthanc object concurrently, while the second worker slot remains available beside one live build.
+Successful uploads expose their StudyUID/pseudonymous-PatientID admission mapping to admins under a
+retention setting hard-capped at 24 hours, then redact the plaintext pseudonym on the next
+reconciliation cycle. Original workstation filenames and paths are never retained; the server
+stores an opaque upload ID and validated format suffix. Upload status/audit errors are bounded
+machine codes; uploader-controlled exception text and filesystem paths are not persisted or shown.
+
+Cohorts progress through `draft`, `cohort_ready`, `frozen`, and `archived`. Their builds progress
+through `queued`, `building`, `qc_review`, `validated`, and `active`, with terminal `failed` and
+`cancelled` outcomes; profiles may later be `retired`. Cohorts and active profiles are immutable.
+Adding data or changing a scanner, protocol, selector, method, artifact, or software version creates
+a new candidate version. The build initiator, validator, and activator must be three different
+administrators. MAP will use the same builder contract only after its estimation and
+scientific-validation method is implemented; the current MAP packaging workflow remains an
+external governed process.
+
+Rejecting a candidate during QC archives that frozen cohort. Correct the data or methodology in a
+new cohort and use a new profile version; rejected parameters are never revised or activated.
+
+On-server activation is a local audited promotion, not a modification of the signed release
+inventory. Include the generated artifacts, manifests, QC/evidence, and audit records in backup
+immediately. For the next release, an administrator/auditor uses
+`GET /api/harmonization/builds/{id}/release-export` to obtain the full profile document, exact
+expected-inventory entry, and hash-bound artifact copy plan. Copy those bytes into release staging
+and sign them through the normal offline release workflow; the endpoint response is preparation,
+not a trust root. The only permitted document change is
+`parameters.storage_scope: generated → release`. During installation, the signed profile importer
+recognizes that exact transformation and promotes the existing active database row; any other
+document or artifact change fails closed.
+
+Availability is release-specific. An installed release supports this workflow only when its
+cohort API/UI, dedicated builder worker/queue, and harmonization Orthanc Quadlets are all present
+and have passed site acceptance. Until then, use the controlled offline CLI procedure documented
+below; do not approximate the storage boundary with labels in the research Orthanc.
 
 See [ops/harmonization/README.md](ops/harmonization/README.md) for exact MELD and MAP commands,
 validation-report schema, inventory generation, verification, release, and assignment procedures.
@@ -162,8 +288,12 @@ uv run --locked pytest
 cd ../../containers/pkg
 python3 -m unittest discover -s tests -v
 
+cd ../../ops/release
+python3 -m unittest discover -s tests -v
+
 cd ../../platform/web
 npm ci --ignore-scripts --no-audit --no-fund
+npm test
 npm run build
 ```
 
@@ -171,6 +301,53 @@ npm run build
 skipped in the service-free unit suite. It requires approved deidentified DICOM, local services,
 licenses, signed assets, and the exact detector images. It is an engineering test, not the site
 scientific acceptance suite.
+
+## GitHub developer releases
+
+[The developer release workflow](.github/workflows/developer-release.yml) runs a read-only package
+preflight for pull requests and pushes to `main`. Pushing a new stable SemVer tag such as `v0.2.0`
+runs that same path and enables publication. A release accepts only an exact tagged commit reachable
+from `origin/main`, checks that API, worker, web, and lock metadata all equal the tag version, rejects
+tracked secret/database/medical-image paths, and runs the complete service-free test suite. It then
+publishes a GitHub prerelease containing:
+
+- the exact committed source archive;
+- API and worker wheels and source distributions;
+- the static web distribution with its source commit marker;
+- deterministic metadata, a scope/license notice, and `SHA256SUMS`.
+
+Every action is pinned by full commit SHA. Separate jobs attest with no repository-write permission
+and publish with no identity-token/attestation permission. The publishing job receives only the
+downloaded build artifact—not a source checkout—rechecks that the tag still resolves to the event
+commit, refuses to replace an existing release, and creates a draft first. It compares every uploaded
+asset's GitHub SHA-256 digest before making that draft public. Configure a repository ruleset that
+prevents update/deletion of `v*` tags and protect the `developer-release` environment before issuing
+the first tag.
+
+After merging a versioned change to `main`, create the tag with the repository owner's configured
+SSH or GPG signing key and push it once:
+
+```bash
+git switch main
+git pull --ff-only
+git tag -s v0.2.0 -m "MELD7T 0.2.0 research developer packages"
+git push origin v0.2.0
+```
+
+Do not move or reuse a release tag. The local packager also requires `vVERSION` to resolve exactly to
+the clean checked-out commit. To exercise it inside `meld-dev` after creating that local tag:
+
+```bash
+just developer-release-check 0.2.0
+just developer-release-kit 0.2.0 /tmp/meld7t-developer-release-0.2.0
+```
+
+Verify downloaded assets with `sha256sum --check SHA256SUMS` and
+`gh attestation verify <asset> --repo <owner/repository>`. These are developer component packages,
+not the complete Bazzite/OCI/model release and not a production authorization. The repository does
+not currently contain a repository-wide `LICENSE`; publishing a source archive does not imply a
+license grant. Select and add an appropriate license before inviting redistribution or external
+contributions.
 
 ## Signed air-gap release
 
@@ -280,12 +457,18 @@ the documented database restore.
 ## Operations
 
 - `meld7t-health.timer` runs [ops/deployment/healthcheck.sh](ops/deployment/healthcheck.sh) each
-  minute. Forward its JSON failure result and persistent user journal to hospital monitoring.
-- Alert on service/readiness, worker heartbeat/release mismatch, backup age, local/NFS capacity,
-  PostgreSQL, Orthanc, immudb, Redis, GPU/CDI, certificate expiry, clock drift, UPS, and RAID.
-- Backups are streaming, encrypted, signed, and include databases, Orthanc, immudb server/client
-  trust state, Redis, configuration/TLS/secrets, model cache, and results. `restore-drill` validates
-  crypto/catalog/archive readability; it is not a full application restore.
+  minute. Forward its JSON failure result and persistent user journal to hospital monitoring. It
+  alerts when harmonization Orthanc reaches 85% of its independent hard quota; tune the explicit
+  `MELD7T_HARMONIZATION_ORTHANC_MAX_USED_PERCENT` service setting only with an approved retention
+  and capacity plan.
+- Alert on service/readiness, case and harmonization-builder heartbeat/queue health, release mismatch,
+  backup age, local/NFS capacity, PostgreSQL, both Orthanc stores, immudb, Redis, GPU/CDI,
+  certificate expiry, clock drift, UPS, and RAID.
+- Backup format 3 is streaming, encrypted, signed, and includes databases, both Orthanc stores,
+  immutable harmonization build evidence/artifacts, immudb server/client trust state, Redis,
+  configuration/TLS/secrets, model cache, and results. `restore-drill` validates
+  crypto/catalog/archive readability; it is not a full application restore. Migration remains
+  able to consume format 2 backups during upgrades, but new backups use format 3.
 - Automatic Bazzite updates remain disabled. Every approved offline OS/NVIDIA/firmware update
   requires reboot, approved ostree checksum, regenerated CDI, `just gpu-check`, readiness, and
   golden-case reacceptance.
@@ -303,6 +486,9 @@ formally accepted with an owner and expiry:
 - Real-detector site golden cases, negative controls, scientific holdouts, protocol suitability/QC,
   MP2RAGE scaling/background behavior, MELD profile A/B behavior, and human SEG geometry review are
   external acceptance evidence. Engineering checks are not scientific validation.
+- The queue, cohort, QC, and publication orchestration is implemented, but this repository does not
+  supply the site-specific DICOM-to-MELD harmonization adapter. Build admission remains fail-closed
+  until a reviewed absolute executable and SHA-256 pass the site's golden-cohort acceptance.
 - MELD invocation proves the requested code/mount, but upstream output does not yet prove internally
   that it consumed those exact ComBat bytes. MELD classifier/model assets need a proven signed
   offline packaging and preflight path.
@@ -321,8 +507,9 @@ formally accepted with an owner and expiry:
 - `python-ecdsa` has an unresolved timing advisory and `rsa` is archived transitively through
   `immudb-py`. Current use is public verification, but deployment requires a scoped expiring waiver
   or replacement SDK.
-- Caddy Basic Auth is not IAM/MFA and DICOM authorization is cohort-wide for reviewers/admins.
-  Orthanc must contain only the approved research cohort.
+- Caddy Basic Auth is not IAM/MFA. Research Orthanc authorization remains cohort-wide for
+  reviewers/admins and must contain only approved research cases; harmonization Orthanc must be
+  restricted to administrators and the builder service.
 - Loopback services, release secrets, and rootless Podman share one Unix-account trust boundary.
   Run no unrelated process as that account; a stronger multi-account boundary needs separate design.
 - Full-disk encryption, outbound-deny validation, NFS/NAS encryption, firewall overlap tests,

@@ -39,7 +39,7 @@ from .db import engine, get_session
 from .detectors import REGISTRY
 from .harmonization import (
     canonical_acquisition, case_harmonization_coverage, match_selector, profile_document_sha256,
-    run_harmonization_contract,
+    run_harmonization_contract, runtime_profile_trusted,
 )
 from .models import (
     Adjudication, Case, CaseStatus, Cluster, HarmonizationAssignment, HarmonizationProfile,
@@ -334,6 +334,8 @@ def _validate_recipe_harmonization_contract(
             or source.fingerprint != assignment.acquisition_fingerprint
             or bool(assignment.override_reason) != bool(contract.get("selector_override"))
             or profile.status != HarmonizationProfileStatus.active
+            or (settings.is_server_mode
+                and not runtime_profile_trusted(session, profile))
             or profile.code != contract.get("code")
             or profile.version != contract.get("version")
             or profile.method != contract.get("method")
@@ -669,7 +671,9 @@ def create_recipe(case_id: str, body: RecipeCreate,
         source = series_by_uid.get(assignment.source_series_uid)
         profile = session.get(HarmonizationProfile, assignment.profile_id)
         if (not source or not profile or profile.status.value != "active"
-                or source.fingerprint != assignment.acquisition_fingerprint):
+                or source.fingerprint != assignment.acquisition_fingerprint
+                or (settings.is_server_mode
+                    and not runtime_profile_trusted(session, profile))):
             continue
         contracts[(assignment.detector_id.value, assignment.source_series_uid)] = (
             run_harmonization_contract(profile, assignment))

@@ -1,0 +1,5 @@
+[Unit]
+Description=Harmonization control-cohort DICOM storage
+
+[Volume]
+VolumeName=harmonization-orthanc-storage

@@ -1,0 +1,47 @@
+{
+  "Name": "meld7t-harmonization-orthanc",
+
+  "// isolation": "Deidentified control cohorts only. No Caddy route and no clinical-case data.",
+  "StorageDirectory": "/var/lib/orthanc/db",
+  "IndexDirectory": "/var/lib/orthanc/db",
+
+  "HttpPort": 8042,
+  "HttpTimeout": 120,
+  "HttpDescribeErrors": false,
+  "HttpCompressionEnabled": true,
+  "KeepAlive": true,
+
+  "// access": "Only the API and dedicated builder principals are registered through the env file.",
+  "RemoteAccessAllowed": true,
+  "AuthenticationEnabled": true,
+  "SslEnabled": false,
+
+  "// ingestion": "C-STORE is loopback-only by default; browser/API ingestion uses authenticated HTTP.",
+  "DicomServerEnabled": true,
+  "DicomAet": "MELD7T_HARMONIZATION",
+  "DicomPort": 4242,
+  "CheckCalledAet": true,
+
+  "StorageCompression": true,
+  "StoreMD5ForAttachments": true,
+  "OverwriteInstances": false,
+  "MaximumStorageMode": "Reject",
+  "SaveJobs": true,
+  "StableAge": 10,
+
+  "PostgreSQL": {
+    "EnableIndex": true,
+    "EnableStorage": false,
+    "Host": "harmonization-postgres",
+    "Port": 5432,
+    "Database": "harmonization_orthanc",
+    "Username": "orthanc"
+  },
+
+  "DicomWeb": {
+    "Enable": true,
+    "Root": "/dicom-web/",
+    "EnableWado": true,
+    "WadoRoot": "/wado"
+  }
+}

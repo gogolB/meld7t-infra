@@ -8,6 +8,7 @@ import CaseView from "./pages/CaseView.jsx";
 import Review from "./pages/Review.jsx";
 import MDT from "./pages/MDT.jsx";
 import Admin from "./pages/Admin.jsx";
+import HarmonizationCohort from "./pages/HarmonizationCohort.jsx";
 import { api } from "./api.js";
 
 function Shell() {
@@ -36,6 +37,8 @@ function Shell() {
           <Route path="/runs/:runId/review" element={<Review />} />
           <Route path="/admin" element={isAdmin ? <Admin /> :
             (me ? <Navigate to="/dashboard" replace /> : null)} />
+          <Route path="/admin/harmonization/cohorts/:id" element={isAdmin ?
+            <HarmonizationCohort /> : (me ? <Navigate to="/dashboard" replace /> : null)} />
         </Routes>
       </main>
     </HashRouter>

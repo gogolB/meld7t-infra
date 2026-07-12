@@ -1,12 +1,14 @@
 import React from "react";
 import { api } from "../api.js";
 import { useAsync, ErrorBox } from "../components.jsx";
+import HarmonizationCohorts from "./HarmonizationCohorts.jsx";
 
 export default function Admin() {
   const sys = useAsync(() => api.system(), [], 15000);
   const q = useAsync(() => api.queue(), [], 15000);
   const audit = useAsync(() => api.auditVerify(), []);
   const profiles = useAsync(() => api.harmonizationProfiles(""), []);
+  const coverage = useAsync(() => api.harmonizationCoverage(), [], 30000);
 
   const detectors = sys.data?.detectors || {};
   const byStatus = sys.data?.runs?.by_status || {};
@@ -61,26 +63,51 @@ export default function Admin() {
       </div>
 
       <div className="panel">
+        <h2>Scanner/protocol coverage</h2>
+        <p className="muted">Minimized acquisition fingerprints are compared with active MELD
+          profiles. Uncovered or ambiguous protocols remain gated at recipe creation.</p>
+        <ErrorBox error={coverage.error} />
+        <div className="tiles">
+          {Object.entries(coverage.data?.summary || {}).map(([status, count]) =>
+            <div className="tile" key={status}><b>{count}</b>{status}</div>)}
+        </div>
+        <div className="table-scroll"><table>
+          <thead><tr><th>Status</th><th>Role</th><th>Scanner/protocol</th><th>Cases</th><th>Profile</th><th>Last seen</th></tr></thead>
+          <tbody>{(coverage.data?.observations || []).map((item) => <tr key={item.id}>
+            <td><span className="pill">{item.status}</span></td><td>{item.source_role}</td>
+            <td>{item.acquisition?.manufacturer || "–"} {item.acquisition?.model || ""}<br />
+              <span className="muted">{item.acquisition?.protocol_name || "unnamed protocol"}</span></td>
+            <td>{item.case_count}</td><td className="digest">{item.profile_id || "–"}</td>
+            <td>{item.last_seen_at || "–"}</td>
+          </tr>)}
+          {!coverage.data?.observations?.length && <tr><td colSpan="6" className="muted">
+            No confirmed acquisitions observed.</td></tr>}
+          </tbody>
+        </table></div>
+      </div>
+
+      <div className="panel">
         <h2>Harmonization profiles</h2>
-        <p className="muted">Profile artifacts are created and transferred through the signed
-          offline release workflow. One administrator independently validates the signed scientific
-          evidence and hashes; a second administrator activates the profile.</p>
+        <p className="muted">Profiles come from the signed offline release or an audited local
+          cohort build. Generated candidates are validated and activated from their cohort page;
+          signed-release profiles are immutable here and are installed by the release importer.</p>
         <ErrorBox error={profiles.error} />
         <table>
           <thead><tr><th>Code</th><th>Version</th><th>Detector</th><th>Method</th><th>Status</th><th></th></tr></thead>
           <tbody>{(profiles.data || []).map((p) => (
             <tr key={p.id}><td>{p.code}</td><td>{p.version}</td><td>{p.detector_id || "generic"}</td>
               <td>{p.method}</td><td><span className="pill">{p.status}</span></td>
-              <td>{p.status === "draft" ? <button className="btn ghost"
-                onClick={() => api.validateHarmonizationProfile(p.id).then(profiles.reload)}>Independently validate</button>
-                : p.status === "validated" ? <button className="btn ghost"
-                  onClick={() => api.activateHarmonizationProfile(p.id).then(profiles.reload)}>Activate (second admin)</button>
+              <td>{p.generated && p.status === "active" ? <button className="btn ghost"
+                onClick={() => api.retireHarmonizationProfile(p.id).then(profiles.reload)}>Retire</button>
+                : p.generated ? <span className="muted">Managed by cohort build</span>
                 : p.status === "active" ? <button className="btn ghost"
                   onClick={() => api.retireHarmonizationProfile(p.id).then(profiles.reload)}>Retire</button> : null}</td>
             </tr>
           ))}</tbody>
         </table>
       </div>
+
+      <HarmonizationCohorts />
     </div>
   );
 }

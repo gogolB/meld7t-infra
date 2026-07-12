@@ -20,7 +20,10 @@ from .harmonization import (
     canonical_acquisition,
     mark_profile_integrity_dirty,
     match_selector,
+    lock_profile_activation,
+    profile_artifact_root,
     rank_profiles,
+    runtime_profile_trusted,
     selectors_may_overlap,
     validate_profile_semantics,
     validate_selector,
@@ -39,6 +42,14 @@ from .models import (
 
 
 router = APIRouter(prefix="/api", tags=["harmonization"])
+
+
+def _require_offline_profile_workflow() -> None:
+    if settings.is_server_mode:
+        raise HTTPException(
+            403,
+            "server profiles must come from signed release import or the linked cohort builder",
+        )
 
 
 def _case_access(principal: Principal, case: Case, *, mutate: bool = False) -> None:
@@ -86,6 +97,7 @@ def _profile_public(profile: HarmonizationProfile) -> dict[str, Any]:
         "name": profile.name, "method": profile.method,
         "detector_id": profile.detector_id,
         "status": profile.status,
+        "generated": (profile.parameters or {}).get("storage_scope") == "generated",
         "validation_summary": ({
             "manifest_sha256": artifact_validation.get("manifest_sha256"),
             "artifact_count": len(artifact_validation.get("files", [])),
@@ -132,6 +144,7 @@ def list_profiles(status: Optional[HarmonizationProfileStatus] = None,
 @router.post("/harmonization/profiles", status_code=201)
 def create_profile(body: ProfileCreate, principal: Principal = Depends(require_admin),
                    session: Session = Depends(get_session)) -> dict[str, Any]:
+    _require_offline_profile_workflow()
     exists = session.exec(select(HarmonizationProfile).where(
         HarmonizationProfile.code == body.code,
         HarmonizationProfile.version == body.version,
@@ -167,6 +180,7 @@ def create_profile(body: ProfileCreate, principal: Principal = Depends(require_a
 @router.post("/harmonization/profiles/{profile_id}/validate")
 def validate_profile(profile_id: str, principal: Principal = Depends(require_admin),
                      session: Session = Depends(get_session)) -> dict[str, Any]:
+    _require_offline_profile_workflow()
     statement = select(HarmonizationProfile).where(HarmonizationProfile.id == profile_id)
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         statement = statement.with_for_update()
@@ -184,7 +198,7 @@ def validate_profile(profile_id: str, principal: Principal = Depends(require_adm
         )
     try:
         verified = verify_artifact_manifest(
-            profile.artifact_manifest, settings.harmonization_root
+            profile.artifact_manifest, profile_artifact_root(profile)
         )
         validate_profile_semantics(profile, verified)
     except (OSError, ValueError) as exc:
@@ -221,6 +235,8 @@ def validate_profile(profile_id: str, principal: Principal = Depends(require_adm
 @router.post("/harmonization/profiles/{profile_id}/activate")
 def activate_profile(profile_id: str, principal: Principal = Depends(require_admin),
                      session: Session = Depends(get_session)) -> dict[str, Any]:
+    _require_offline_profile_workflow()
+    lock_profile_activation(session)
     statement = select(HarmonizationProfile).where(HarmonizationProfile.id == profile_id)
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         statement = statement.with_for_update()
@@ -272,7 +288,7 @@ def activate_profile(profile_id: str, principal: Principal = Depends(require_adm
             verified = {"files": [], "manifest_sha256": None}
         else:
             verified = verify_artifact_manifest(profile.artifact_manifest,
-                                                settings.harmonization_root)
+                                                profile_artifact_root(profile))
             validate_profile_semantics(profile, verified)
     except (OSError, ValueError) as exc:
         raise HTTPException(422, f"artifact verification failed: {exc}") from exc
@@ -325,6 +341,9 @@ def harmonization_candidates(case_id: str, principal: Principal = Depends(get_pr
     _case_access(principal, case)
     profiles = session.exec(select(HarmonizationProfile).where(
         HarmonizationProfile.status == HarmonizationProfileStatus.active)).all()
+    if settings.is_server_mode:
+        profiles = [profile for profile in profiles
+                    if runtime_profile_trusted(session, profile)]
     assignments = session.exec(select(HarmonizationAssignment).where(
         HarmonizationAssignment.case_id == case_id)).all()
     assignment_by_target = {(a.detector_id.value, a.source_series_uid): a for a in assignments}
@@ -426,6 +445,9 @@ def assign_profile(case_id: str, body: AssignmentCreate,
     profile = session.get(HarmonizationProfile, body.profile_id)
     if not profile or profile.status != HarmonizationProfileStatus.active:
         raise HTTPException(409, "harmonization profile is not active")
+    if settings.is_server_mode and not runtime_profile_trusted(session, profile):
+        raise HTTPException(
+            409, "harmonization profile lacks signed-release or cohort-build trust evidence")
     if profile.detector_id is not None and profile.detector_id != body.detector_id:
         raise HTTPException(409, "profile is for a different detector")
     required_method = PROFILE_METHOD_BY_DETECTOR.get(body.detector_id.value)

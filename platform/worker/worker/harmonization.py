@@ -109,7 +109,12 @@ def resolve_harmonization(raw: Any) -> ResolvedHarmonization | None:
         raise ValueError("applied harmonization profiles require pinned artifacts")
 
     try:
-        root = Path(wsettings.harmonization_root).resolve(strict=True)
+        scope = parameters.get("storage_scope")
+        if scope not in {None, "release", "generated"}:
+            raise ValueError("unknown harmonization artifact storage scope")
+        configured_root = (wsettings.harmonization_generated_root
+                           if scope == "generated" else wsettings.harmonization_root)
+        root = Path(configured_root).resolve(strict=True)
     except OSError as exc:
         raise ValueError(f"harmonization root is unavailable: {exc}") from exc
     verified: list[dict[str, Any]] = []

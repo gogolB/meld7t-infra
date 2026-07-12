@@ -20,5 +20,6 @@ atomic_link "$target" "$release_root/current"
 atomic_link "$config_target" "$config_root/current"
 atomic_link "$config_target/quadlets" "$quadlet_root/meld7t-current"
 systemctl --user daemon-reload
-systemctl --user start postgres.service redis.service immudb.service orthanc.service
+systemctl --user start postgres.service redis.service immudb.service orthanc.service \
+  harmonization-postgres.service harmonization-orthanc.service
 printf 'first-install data tier started; create the non-admin immudb runtime user, then take the signed baseline backup\n'

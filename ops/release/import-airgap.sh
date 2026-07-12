@@ -77,6 +77,9 @@ printf 'MELD7T_HIPPUNFOLD_CACHE_SHA256=%s\n' "$MELD7T_HIPPUNFOLD_CACHE_SHA256" \
 printf 'MELD7T_HARMONIZATION_INVENTORY_SHA256=%s\n' \
   "$MELD7T_HARMONIZATION_INVENTORY_SHA256" \
   >>"$target_partial/release-receipt/runtime-images.env"
+printf 'MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED=%s\n' \
+  "$MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED" \
+  >>"$target_partial/release-receipt/runtime-images.env"
 
 cache_digest=$(sha256sum "$bundle/assets/hippunfold-cache-files.sha256" | awk '{print $1}')
 [[ $cache_digest == "$MELD7T_HIPPUNFOLD_CACHE_SHA256" ]] \

@@ -25,6 +25,11 @@ openssl dgst -sha256 -verify "$trusted_key" -signature "$bundle/SHA256SUMS.sig" 
 source "$bundle/release.env"
 [[ ${MELD7T_RELEASE_FORMAT:-} == 1 ]] || die "unsupported release format"
 [[ ${MELD7T_RELEASE_ID:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "invalid release ID"
+[[ ${MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED:-} == true \
+   || ${MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED:-} == false ]] \
+  || die "signed cohort bootstrap authorization must be true or false"
+[[ ${MELD7T_HARMONIZATION_PROFILES:-} =~ ^[0-9]+$ ]] \
+  || die "signed harmonization profile count is malformed"
 actual_signer=$(openssl pkey -pubin -in "$trusted_key" -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
 [[ $actual_signer == "${MELD7T_SIGNER_SHA256:-}" ]] || die "trusted key fingerprint mismatch"
 [[ ${MELD7T_GIT_SHA:-} =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ \
@@ -102,7 +107,11 @@ python3 "$script_dir/../harmonization/manage.py" verify-expected-inventory \
   || die "expected active profile inventory digest differs from release metadata"
 [[ $profile_count == "${MELD7T_HARMONIZATION_PROFILES:-0}" ]] \
   || die "harmonization profile count differs from signed manifest"
-((profile_count > 0)) || die "production release contains no signed harmonization profile"
+python3 "$script_dir/harmonization_release_policy.py" \
+  --inventory "$harmonization_tmp/expected-active-profiles.json" \
+  --profile-count "$profile_count" \
+  --bootstrap-allowed "$MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED" \
+  || die "signed harmonization release policy is invalid"
 rm -rf -- "$harmonization_tmp"
 trap - EXIT
 printf 'verified release %s (%s)\n' "$MELD7T_RELEASE_ID" "${MELD7T_GIT_SHA:-unknown}"

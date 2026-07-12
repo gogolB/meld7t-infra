@@ -19,6 +19,9 @@
     backup_root: "{{ durable_mount_point }}/backups"
     dicom_import_root: "{{ durable_mount_point }}/raw"
     harmonization_root: "{{ release_root }}/current/harmonization"
+    harmonization_upload_dir: "{{ state_root }}/harmonization-uploads"
+    harmonization_build_dir: "{{ state_root }}/harmonization-builds"
+    harmonization_profile_dir: "{{ state_root }}/harmonization-profiles"
     production_secret_dir: "{{ home_dir }}/meld7t-secrets/production"
     svc_config_root: "{{ home_dir }}/.config/meld7t"
     svc_config_dir: "{{ svc_config_root }}/releases/{{ release_id }}"
@@ -47,6 +50,9 @@
       - postgres.env
       - redis.env
       - orthanc.env
+      - harmonization-postgres.env
+      - harmonization-orthanc.env
+      - harmonization-builder.env
       - immudb.env
       - api.env
       - caddy.env
@@ -248,6 +254,16 @@
       changed_when: false
       register: release_map_script_sha_cmd
 
+    - name: Read signed harmonization cohort bootstrap authorization
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sed -n 's/^MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED=//p' \
+          {{ (release_receipt_dir + '/release.env') | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: release_harmonization_bootstrap_cmd
+
     - name: Compute signed release manifest digest
       ansible.builtin.command:
         argv: [sha256sum, "{{ release_receipt_dir }}/SHA256SUMS"]
@@ -272,6 +288,8 @@
         os_checksum: "{{ os_checksum_cmd.stdout | trim }}"
         release_git_sha: "{{ release_git_sha_cmd.stdout | trim }}"
         release_map_script_sha: "{{ release_map_script_sha_cmd.stdout | trim }}"
+        harmonization_cohort_bootstrap_allowed: >-
+          {{ release_harmonization_bootstrap_cmd.stdout | trim }}
 
     - name: Assert release identity is safe
       ansible.builtin.assert:
@@ -282,6 +300,7 @@
           - os_checksum == approved_os_checksum
           - release_git_sha is match('^[0-9a-f]{40}$|^[0-9a-f]{64}$')
           - release_map_script_sha is match('^[0-9a-f]{64}$')
+          - harmonization_cohort_bootstrap_allowed in ['true', 'false']
 
     - name: Verify the signed MAP script digest against staged source
       ansible.builtin.command:
@@ -324,6 +343,9 @@
         - { path: "{{ state_root }}", mode: "0700" }
         - { path: "{{ meld_data_dir }}", mode: "0700" }
         - { path: "{{ dicom_staging_dir }}", mode: "0700" }
+        - { path: "{{ harmonization_upload_dir }}", mode: "0700" }
+        - { path: "{{ harmonization_build_dir }}", mode: "0700" }
+        - { path: "{{ harmonization_profile_dir }}", mode: "0700" }
         - { path: "{{ svc_config_root }}", mode: "0700" }
         - { path: "{{ svc_config_root }}/releases", mode: "0700" }
         - { path: "{{ svc_config_dir }}", mode: "0700" }
@@ -335,6 +357,8 @@
         - { path: "{{ svc_config_dir }}/postgres", mode: "0700" }
         - { path: "{{ svc_config_dir }}/redis", mode: "0700" }
         - { path: "{{ svc_config_dir }}/orthanc", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/harmonization-orthanc", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/harmonization-postgres", mode: "0700" }
         - { path: "{{ svc_config_dir }}/ohif", mode: "0700" }
         - { path: "{{ svc_config_dir }}/trust", mode: "0700" }
         - { path: "{{ svc_config_dir }}/systemd", mode: "0700" }
@@ -383,6 +407,36 @@
             assert free>=required, f'compute storage has {free} bytes free; {required} required'
           - "{{ production_secret_dir }}/worker.env"
           - "{{ state_root }}"
+      changed_when: false
+
+    - name: Require the configured worst-case harmonization storage reserve
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import os,shutil,sys;
+            values=dict(line.split('=',1) for line in open(sys.argv[1], encoding='utf-8')
+            if line.strip() and not line.lstrip().startswith(('#',';')) and '=' in line);
+            number=lambda key,default:int(values.get(key,default));
+            floor=number('MELD7T_STORAGE_MIN_FREE_BYTES',107374182400);
+            upload=number('MELD7T_HARMONIZATION_MAX_UPLOAD_BYTES',107374182400);
+            expanded=number('MELD7T_HARMONIZATION_UPLOAD_MAX_EXPANDED_BYTES',536870912000);
+            build=number('MELD7T_HARMONIZATION_BUILD_MAX_BYTES',1099511627776);
+            state_required=floor+upload+expanded+build;
+            orthanc_required=floor+upload;
+            state_path,podman_path=sys.argv[2],sys.argv[3];
+            same_device=os.stat(state_path).st_dev==os.stat(podman_path).st_dev;
+            checks=[(state_path,state_required+upload)] if same_device else
+            [(state_path,state_required),(podman_path,orthanc_required)];
+            observed=[(path,required,shutil.disk_usage(path).free)
+            for path,required in checks];
+            failed=next((row for row in observed if row[2]<row[1]),None);
+            assert failed is None,
+            f'{failed[0]} has {failed[2]} bytes free; {failed[1]} required'
+          - "{{ production_secret_dir }}/harmonization-builder.env"
+          - "{{ state_root }}"
+          - "{{ home_dir }}/.local/share/containers"
       changed_when: false
 
     - name: Compute durable NFS mount unit name
@@ -475,6 +529,8 @@
         - postgres-data
         - redis-data
         - orthanc-storage
+        - harmonization-postgres-data
+        - harmonization-orthanc-storage
         - immudb-data
         - api-immudb-state
         - caddy-data
@@ -528,7 +584,8 @@
         src: "{{ production_secret_dir }}/{{ item }}.env"
         dest: "{{ svc_config_dir }}/env/{{ item }}.env"
         mode: "0600"
-      loop: [postgres, redis, orthanc, immudb, api, caddy, worker]
+      loop: [postgres, redis, orthanc, harmonization-postgres, harmonization-orthanc,
+        immudb, api, caddy, worker, harmonization-builder]
       no_log: true
 
     - name: Install release-derived runtime image environment
@@ -537,6 +594,21 @@
         dest: "{{ svc_config_dir }}/env/runtime-images.env"
         mode: "0600"
 
+    - name: Read the reviewed harmonization builder adapter digest
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import sys;
+            values=dict(line.strip().split('=',1) for line in open(sys.argv[1], encoding='utf-8')
+            if line.strip() and not line.lstrip().startswith(('#',';')) and '=' in line);
+            print(values.get('MELD7T_HARMONIZATION_BUILDER_ADAPTER_SHA256',''))
+          - "{{ svc_config_dir }}/env/harmonization-builder.env"
+      changed_when: false
+      register: harmonization_builder_adapter_sha256
+      no_log: true
+
     - name: Read the signed expected-active harmonization inventory as compact JSON
       ansible.builtin.command:
         argv:
@@ -544,9 +616,11 @@
           - -c
           - >-
             import json,sys; value=json.load(open(sys.argv[1], encoding='utf-8'));
-            assert isinstance(value,list) and value;
+            assert isinstance(value,list);
+            assert (value == []) == (sys.argv[2] == 'true');
             print(json.dumps(value, separators=(',',':'), sort_keys=True))
           - "{{ repo_dir }}/harmonization/expected-active-profiles.json"
+          - "{{ harmonization_cohort_bootstrap_allowed }}"
       changed_when: false
       register: harmonization_expected_profiles_json
 
@@ -573,6 +647,18 @@
       loop:
         - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
         - { key: MELD7T_HARMONIZATION_EXPECTED_PROFILES, value: "{{ harmonization_expected_profiles_json.stdout }}" }
+        - { key: MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED, value: "{{ harmonization_cohort_bootstrap_allowed }}" }
+      no_log: true
+
+    - name: Bind API build admission to the reviewed builder adapter
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/api.env"
+        regexp: '^MELD7T_HARMONIZATION_BUILDER_ADAPTER_SHA256='
+        line: >-
+          MELD7T_HARMONIZATION_BUILDER_ADAPTER_SHA256={{ harmonization_builder_adapter_sha256.stdout | trim }}
+        state: >-
+          {{ ((harmonization_builder_adapter_sha256.stdout | trim | length) > 0)
+             | ternary('present', 'absent') }}
       no_log: true
 
     - name: Stamp release-derived paths and provenance into worker environment
@@ -586,6 +672,7 @@
         - { key: MELD7T_DICOM_STAGING, value: "{{ dicom_staging_dir }}" }
         - { key: MELD7T_DICOM_IMPORT_ROOT, value: "{{ dicom_import_root }}" }
         - { key: MELD7T_HARMONIZATION_ROOT, value: "{{ harmonization_root }}" }
+        - { key: MELD7T_HARMONIZATION_GENERATED_ROOT, value: "{{ harmonization_profile_dir }}" }
         - { key: MELD7T_FS_LICENSE, value: "{{ svc_config_dir }}/licenses/freesurfer.txt" }
         - { key: MELD7T_MELD_LICENSE, value: "{{ svc_config_dir }}/licenses/meld.txt" }
         - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
@@ -596,11 +683,26 @@
         - { key: MELD7T_IMMUDB_PUBLIC_KEY_PATH, value: "{{ svc_config_dir }}/trust/immudb-signing-public.pem" }
       no_log: true
 
-    - name: Stamp release provenance into runtime images environment
+    - name: Stamp isolated harmonization builder paths
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/harmonization-builder.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: MELD7T_HARMONIZATION_UPLOAD_ROOT, value: "{{ harmonization_upload_dir }}" }
+        - { key: MELD7T_HARMONIZATION_BUILD_ROOT, value: "{{ harmonization_build_dir }}" }
+        - { key: MELD7T_HARMONIZATION_GENERATED_ROOT, value: "{{ harmonization_profile_dir }}" }
+        - { key: MELD7T_IMMUDB_ROOT_STATE_PATH, value: "{{ state_root }}/audit/harmonization-builder.root" }
+      no_log: true
+
+    - name: Stamp release provenance and harmonization authorization into runtime environment
       ansible.builtin.lineinfile:
         path: "{{ svc_config_dir }}/env/runtime-images.env"
-        regexp: '^MELD7T_RELEASE_MANIFEST_DIGEST='
-        line: "MELD7T_RELEASE_MANIFEST_DIGEST={{ release_manifest_digest }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
+        - { key: MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED, value: "{{ harmonization_cohort_bootstrap_allowed }}" }
 
     - name: Install private configs, TLS, and licenses
       ansible.builtin.copy:
@@ -630,7 +732,9 @@
       loop:
         - { src: "{{ repo_dir }}/containers/config/caddy/Caddyfile", dest: "{{ svc_config_dir }}/caddy/Caddyfile", mode: "0644" }
         - { src: "{{ repo_dir }}/containers/config/orthanc/orthanc.json", dest: "{{ svc_config_dir }}/orthanc/orthanc.json", mode: "0644" }
+        - { src: "{{ repo_dir }}/containers/config/orthanc/harmonization.json", dest: "{{ svc_config_dir }}/harmonization-orthanc/orthanc.json", mode: "0644" }
         - { src: "{{ repo_dir }}/containers/config/postgres/init-databases.sh", dest: "{{ svc_config_dir }}/postgres/init-databases.sh", mode: "0755" }
+        - { src: "{{ repo_dir }}/containers/config/postgres/init-harmonization-database.sh", dest: "{{ svc_config_dir }}/harmonization-postgres/init-database.sh", mode: "0755" }
         - { src: "{{ repo_dir }}/containers/config/ohif/app-config.js", dest: "{{ svc_config_dir }}/ohif/app-config.js", mode: "0644" }
 
     - name: Validate secret relationships, TLS, paths, and locked worker images
@@ -640,6 +744,7 @@
           - "{{ repo_dir }}/ops/deployment/validate-production-config.py"
           - "{{ svc_config_dir }}"
           - "{{ release_image_lock }}"
+          - "{{ release_receipt_dir }}/release.env"
       changed_when: false
       no_log: true
 
@@ -664,6 +769,7 @@
       ansible.builtin.shell: |
         set -euo pipefail
         root={{ (repo_dir + '/harmonization') | quote }}
+        bootstrap={{ harmonization_cohort_bootstrap_allowed | quote }}
         count=0
         if [[ -d "$root/profiles" ]]; then
           while IFS= read -r -d '' profile; do
@@ -675,7 +781,9 @@
             ((count += 1))
           done < <(find "$root/profiles" -maxdepth 1 -type f -name '*.json' -print0 | sort -z)
         fi
-        ((count > 0)) || { echo "production requires at least one approved profile" >&2; exit 1; }
+        python3 {{ (repo_dir + '/ops/release/harmonization_release_policy.py') | quote }} \
+          --inventory "$root/expected-active-profiles.json" \
+          --profile-count "$count" --bootstrap-allowed "$bootstrap"
         python3 {{ (repo_dir + '/ops/harmonization/manage.py') | quote }} \
           verify-expected-inventory \
           --inventory "$root/expected-active-profiles.json" --profiles "$root/profiles"
@@ -747,6 +855,12 @@
       ansible.builtin.copy:
         src: "{{ repo_dir }}/platform/worker/meld7t-worker.service"
         dest: "{{ svc_config_dir }}/systemd/meld7t-worker.service"
+        mode: "0644"
+
+    - name: Stage isolated harmonization builder service
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/ops/deployment/systemd/meld7t-harmonization-builder.service"
+        dest: "{{ svc_config_dir }}/systemd/meld7t-harmonization-builder.service"
         mode: "0644"
 
     - name: Stage local monitoring service and timer
