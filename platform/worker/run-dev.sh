@@ -22,6 +22,12 @@ meld_data=${MELD7T_MELD_DATA:-$repo/meld-data}
 staging=${MELD7T_DICOM_STAGING:-$meld_data/staging}
 venv=${MELD7T_WORKER_VENV:-$here/.venv}
 
+# The API container sees the logo at /run/branding; a host development worker needs the tracked
+# source path instead. Production remains entirely controlled by its validated split environment.
+if [[ $mode == development && -z ${MELD7T_BRANDING_LOGO_PATH:-} ]]; then
+  export MELD7T_BRANDING_LOGO_PATH="$repo/containers/config/branding/report-logo.png"
+fi
+
 mkdir -p "$meld_data" "$staging"
 chmod 0700 "$meld_data" "$staging"
 fstype=$(findmnt -T "$staging" -n -o FSTYPE 2>/dev/null || true)

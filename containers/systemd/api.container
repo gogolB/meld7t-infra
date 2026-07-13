@@ -1,20 +1,30 @@
 [Unit]
 Description=meld7t API — authenticated orchestration and durable outbox
-Wants=postgres.service redis.service orthanc.service immudb.service
-After=network-online.target postgres.service redis.service orthanc.service immudb.service
+Wants=postgres.service redis.service orthanc.service harmonization-orthanc.service immudb.service
+After=network-online.target postgres.service redis.service orthanc.service harmonization-orthanc.service immudb.service
 
 [Container]
 # Production installation replaces this source-build tag with the signed digest from images.lock.
 Image=localhost/meld7t/api:0.2.0
 Pull=never
 ContainerName=api
+# Map the rootless service account to the image's fixed non-root UID. This lets UID 10001 traverse
+# the service-owned mode-0700 bind mounts while the host builder continues to use the same files;
+# never replace this with broad group/world permissions or recursive chown into the subuid range.
+UserNS=keep-id:uid=10001,gid=10001
 Network=meld-edge.network
 Network=meld-data.network
+Network=meld-harmonization.network
 Volume=%h/meld7t-state/meld-data:/data:ro,z
 Volume=%h/.local/lib/meld7t/current/harmonization:/data/harmonization:ro,z
+Volume=%h/meld7t-state/harmonization-uploads:/data/harmonization-uploads:rw,z
+Volume=%h/meld7t-state/case-uploads:/data/case-uploads:rw,z
+Volume=%h/meld7t-state/harmonization-profiles:/data/generated-harmonization:ro,z
 Volume=api-immudb-state.volume:/var/lib/meld7t/immudb-state:U
 Volume=%h/.config/meld7t/current/trust/immudb-signing-public.pem:/run/secrets/immudb-public-key.pem:ro,z
+Volume=%h/.config/meld7t/current/branding:/run/branding:ro,z
 EnvironmentFile=%h/.config/meld7t/current/env/api.env
+EnvironmentFile=%h/.config/meld7t/current/env/runtime-images.env
 ReadOnly=true
 Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m
 NoNewPrivileges=true

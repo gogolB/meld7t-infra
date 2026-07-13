@@ -19,5 +19,5 @@ export function useAsync(fn, deps = [], pollMs = 0) {
 }
 
 export function ErrorBox({ error }) {
-  return error ? <div className="err">{error}</div> : null;
+  return error ? <div className="err" role="alert">{error}</div> : null;
 }

@@ -12,6 +12,10 @@ http://:9443 {
 	handle /api/* {
 		reverse_proxy api:8000
 	}
+	handle_path /branding/* {
+		root * /srv/branding
+		file_server
+	}
 	handle {
 		root * /srv/spa
 		try_files {path} /index.html

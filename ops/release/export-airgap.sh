@@ -8,7 +8,7 @@ repo_dir="$(cd "$script_dir/../.." && pwd)"
 lock_file="$repo_dir/containers/images.lock"
 output= signing_key= attestations= web_dist= worker_artifacts= api_artifacts=
 host_artifacts= release_id= include_build=false hippunfold_volume=hippunfold-cache
-harmonization=
+harmonization= allow_empty_harmonization_bootstrap=false
 
 die() { printf 'export-airgap: %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -16,7 +16,8 @@ usage() {
 usage: export-airgap.sh --output DIR --release-id ID --signing-key PRIVATE_PEM
        --attestations DIR --web-dist DIR --api-artifacts DIR --worker-artifacts DIR
        [--host-artifacts DIR] [--include-build-images]
-       [--harmonization DIR] [--hippunfold-volume NAME] [--lock FILE]
+       [--harmonization DIR] [--allow-empty-harmonization-bootstrap]
+       [--hippunfold-volume NAME] [--lock FILE]
 
 The git worktree must be committed and clean.  PRIVATE_PEM is never copied into the bundle.
 The corresponding public key must be provisioned independently on the air-gapped server.
@@ -34,6 +35,7 @@ while (($#)); do
     --api-artifacts) api_artifacts=${2:-}; shift 2 ;;
     --host-artifacts) host_artifacts=${2:-}; shift 2 ;;
     --harmonization) harmonization=${2:-}; shift 2 ;;
+    --allow-empty-harmonization-bootstrap) allow_empty_harmonization_bootstrap=true; shift ;;
     --hippunfold-volume) hippunfold_volume=${2:-}; shift 2 ;;
     --include-build-images) include_build=true; shift ;;
     --lock) lock_file=${2:-}; shift 2 ;;
@@ -67,7 +69,8 @@ exception_expiry=$(sed -n 's/^EXPIRES=//p' "$attestations/vulnerability-exceptio
 [[ -f $api_artifacts/requirements.lock && -d $api_artifacts/wheelhouse \
    && -f $api_artifacts/SHA256SUMS ]] || die "API artifacts are incomplete"
 [[ -z $host_artifacts || -d $host_artifacts ]] || die "host artifacts are not a directory"
-[[ -z $harmonization || -d $harmonization ]] || die "harmonization root is not a directory"
+[[ -n $harmonization ]] || die "--harmonization DIR is required for every production release"
+[[ -d $harmonization ]] || die "harmonization root is not a directory"
 [[ ! -e $output ]] || die "refusing to replace existing output: $output"
 command -v openssl >/dev/null || die "openssl is required"
 command -v podman >/dev/null || die "podman is required"
@@ -120,33 +123,33 @@ if [[ -n $host_artifacts ]]; then
     -C "$host_artifacts" -cf - . | gzip -n >"$partial/host-artifacts.tar.gz"
 fi
 profile_count=0
-if [[ -n $harmonization ]]; then
-  if find "$harmonization" -type l -print -quit | grep -q .; then
-    die "harmonization bundle must not contain symlinks"
-  fi
-  if [[ -d $harmonization/profiles ]]; then
-    while IFS= read -r -d '' profile; do
-      python3 "$repo_dir/ops/harmonization/manage.py" verify \
-        --profile "$profile" --harmonization-root "$harmonization" >/dev/null \
-        || die "harmonization profile verification failed: $profile"
-      python3 "$repo_dir/ops/harmonization/manage.py" verify-runtime-images \
-        --profile "$profile" --image-lock "$lock_file" >/dev/null \
-        || die "harmonization profile build images differ from release: $profile"
-      ((profile_count += 1))
-    done < <(find "$harmonization/profiles" -maxdepth 1 -type f -name '*.json' -print0 | sort -z)
-  fi
-  [[ -s $harmonization/expected-active-profiles.json ]] \
-    || die "harmonization/expected-active-profiles.json is required"
-  python3 "$repo_dir/ops/harmonization/manage.py" verify-expected-inventory \
-    --inventory "$harmonization/expected-active-profiles.json" \
-    --profiles "$harmonization/profiles" >/dev/null \
-    || die "expected active harmonization inventory is invalid"
-  tar --sort=name --mtime="@$source_epoch" --owner=0 --group=0 --numeric-owner \
-    -C "$harmonization" -cf - . | gzip -n >"$partial/assets/harmonization.tar.gz"
-else
-  tar -cf - --files-from /dev/null | gzip -n >"$partial/assets/harmonization.tar.gz"
+if find "$harmonization" -type l -print -quit | grep -q .; then
+  die "harmonization bundle must not contain symlinks"
 fi
-((profile_count > 0)) || die "production release requires at least one signed harmonization profile"
+if [[ -d $harmonization/profiles ]]; then
+  while IFS= read -r -d '' profile; do
+    python3 "$repo_dir/ops/harmonization/manage.py" verify \
+      --profile "$profile" --harmonization-root "$harmonization" >/dev/null \
+      || die "harmonization profile verification failed: $profile"
+    python3 "$repo_dir/ops/harmonization/manage.py" verify-runtime-images \
+      --profile "$profile" --image-lock "$lock_file" >/dev/null \
+      || die "harmonization profile build images differ from release: $profile"
+    ((profile_count += 1))
+  done < <(find "$harmonization/profiles" -maxdepth 1 -type f -name '*.json' -print0 | sort -z)
+fi
+[[ -s $harmonization/expected-active-profiles.json ]] \
+  || die "harmonization/expected-active-profiles.json is required"
+python3 "$repo_dir/ops/harmonization/manage.py" verify-expected-inventory \
+  --inventory "$harmonization/expected-active-profiles.json" \
+  --profiles "$harmonization/profiles" >/dev/null \
+  || die "expected active harmonization inventory is invalid"
+tar --sort=name --mtime="@$source_epoch" --owner=0 --group=0 --numeric-owner \
+  -C "$harmonization" -cf - . | gzip -n >"$partial/assets/harmonization.tar.gz"
+python3 "$script_dir/harmonization_release_policy.py" \
+  --inventory "$harmonization/expected-active-profiles.json" \
+  --profile-count "$profile_count" \
+  --bootstrap-allowed "$allow_empty_harmonization_bootstrap" \
+  || die "harmonization release policy validation failed"
 
 if podman volume exists "$hippunfold_volume"; then
   podman volume export --output "$partial/assets/hippunfold-cache.tar" "$hippunfold_volume"
@@ -177,6 +180,7 @@ MELD7T_SIGNER_SHA256=$signer_sha256
 MELD7T_IMAGE_SCOPE=$scope
 MELD7T_HOST_ARTIFACTS=$([[ -n $host_artifacts ]] && printf included || printf external-prerequisite)
 MELD7T_HARMONIZATION_PROFILES=$profile_count
+MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED=$allow_empty_harmonization_bootstrap
 EOF
 
 (cd "$partial" && find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.sig -print0 \

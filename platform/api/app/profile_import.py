@@ -30,12 +30,34 @@ def _load_json(path: Path):
     return value
 
 
+def _release_promotion_sha256(profile: HarmonizationProfile) -> str | None:
+    """Digest the only permitted generated→signed transformation: its artifact trust root."""
+    if (not isinstance(profile.parameters, dict)
+            or profile.parameters.get("storage_scope") != "generated"):
+        return None
+    return profile_document_sha256({
+        "code": profile.code, "version": profile.version, "name": profile.name,
+        "method": profile.method,
+        "detector_id": getattr(profile.detector_id, "value", profile.detector_id),
+        "selector": profile.selector, "artifact_manifest": profile.artifact_manifest,
+        "parameters": {**profile.parameters, "storage_scope": "release"},
+    })
+
+
 def import_expected_profiles() -> dict[str, int]:
     root = Path(settings.harmonization_root).resolve(strict=True)
     inventory_path = root / "expected-active-profiles.json"
     raw_inventory = _load_json(inventory_path)
-    if not isinstance(raw_inventory, list) or not raw_inventory:
-        raise ValueError("signed expected-active-profiles.json must be a non-empty array")
+    if not isinstance(raw_inventory, list):
+        raise ValueError("signed expected-active-profiles.json must be an array")
+    if not raw_inventory and not settings.harmonization_cohort_bootstrap_allowed:
+        raise ValueError(
+            "empty expected profile inventory requires explicit cohort bootstrap authorization"
+        )
+    if raw_inventory and settings.harmonization_cohort_bootstrap_allowed:
+        raise ValueError(
+            "cohort bootstrap authorization is valid only for an empty profile inventory"
+        )
     inventory = [ExpectedHarmonizationProfile.model_validate(item) for item in raw_inventory]
     expected_keys = [(item.code, item.version) for item in inventory]
     if len(expected_keys) != len(set(expected_keys)) or len({item.code for item in inventory}) != len(
@@ -100,13 +122,42 @@ def import_expected_profiles() -> dict[str, int]:
                     f"{left.get('detector_id')}: {left.get('code')} and {right.get('code')}"
                 )
 
-    created = activated = retired = 0
+    created = activated = retired = promoted = 0
     with Session(engine) as session:
         rows = session.exec(select(HarmonizationProfile)).all()
+        if not inventory and any(
+                (isinstance(row.parameters, dict)
+                 and row.parameters.get("storage_scope") == "release")
+                or str(row.created_by).startswith("release:")
+                for row in rows):
+            raise ValueError(
+                "empty cohort bootstrap cannot replace established signed profile history"
+            )
         by_key = {(row.code, row.version): row for row in rows}
+        generated_active = [
+            row for row in rows
+            if row.status == HarmonizationProfileStatus.active
+            and isinstance(row.parameters, dict)
+            and row.parameters.get("storage_scope") == "generated"
+        ]
+        for item in inventory:
+            document = documents[(item.code, item.version)]
+            for generated in generated_active:
+                if ((generated.code, generated.version) == (item.code, item.version)
+                        and _release_promotion_sha256(generated) == item.document_sha256):
+                    continue
+                generated_detector = getattr(generated.detector_id, "value", generated.detector_id)
+                if (generated_detector == item.detector_id
+                        and selectors_may_overlap(generated.selector, document["selector"])):
+                    raise ValueError(
+                        "signed release profile overlaps an active locally generated profile; "
+                        "retire or promote it deliberately before migration"
+                    )
         for row in rows:
             if (row.status == HarmonizationProfileStatus.active
-                    and (row.code, row.version) not in set(expected_keys)):
+                    and (row.code, row.version) not in set(expected_keys)
+                    and not (isinstance(row.parameters, dict)
+                             and row.parameters.get("storage_scope") == "generated")):
                 row.status = HarmonizationProfileStatus.retired
                 session.add(row)
                 retired += 1
@@ -117,7 +168,17 @@ def import_expected_profiles() -> dict[str, int]:
             row = by_key.get(key)
             if row is not None:
                 if profile_document_sha256(row) != item.document_sha256:
-                    raise ValueError(f"database profile differs from signed release: {item.code}")
+                    if _release_promotion_sha256(row) == item.document_sha256:
+                        row.name = document["name"]
+                        row.method = document["method"]
+                        row.detector_id = DetectorId(item.detector_id)
+                        row.selector = document["selector"]
+                        row.artifact_manifest = document["artifact_manifest"]
+                        row.parameters = document["parameters"]
+                        promoted += 1
+                    else:
+                        raise ValueError(
+                            f"database profile differs from signed release: {item.code}")
                 if row.status == HarmonizationProfileStatus.retired:
                     raise ValueError(
                         f"retired profile cannot be reactivated; increment version for {item.code}"
@@ -143,6 +204,8 @@ def import_expected_profiles() -> dict[str, int]:
                     "approved_at": report["approved_at"],
                     "methodology_sha256": report["methodology_sha256"],
                     "golden_case_evidence_sha256": report["golden_case_evidence_sha256"],
+                    **({"builder_adapter_sha256": report["builder_adapter_sha256"]}
+                       if "builder_adapter_sha256" in report else {}),
                 },
             }
             session.add(row)
@@ -161,10 +224,12 @@ def import_expected_profiles() -> dict[str, int]:
                     "document_sha256": item.document_sha256,
                 } for item in inventory],
                 "created": created, "activated": activated, "retired": retired,
+                "promoted": promoted,
             },
         )
         session.commit()
-    return {"created": created, "activated": activated, "retired": retired}
+    return {"created": created, "activated": activated, "retired": retired,
+            "promoted": promoted}
 
 
 def main() -> None:

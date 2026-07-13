@@ -101,14 +101,57 @@ async def run_meld(subject: str, workdir: str,
     return await _run(cmd, os.path.join(workdir, "meld.log"))
 
 
+_PACKAGE_SCALAR_KEYS = {
+    "study_uid", "t1_series_uid", "seg_series_uid", "probmap_series_uid", "n_t1_slices",
+    "dicom_sop_count", "dicom_manifest_sha256", "derived_series_manifest_sha256",
+}
+_PACKAGE_JSON_KEYS = {"derived_series_manifest_json", "probmap_series_uids_json"}
+
+
+def _package_uids(stdout: bytes) -> dict:
+    uids = {}
+    for line in stdout.decode(errors="strict").splitlines():
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key in _PACKAGE_SCALAR_KEYS:
+            uids[key] = value
+        elif key in _PACKAGE_JSON_KEYS:
+            import json
+            uids[key.removesuffix("_json")] = json.loads(value)
+    return uids
+
+
+def _package_manifest_relative(workdir: str) -> str:
+    return Path(workdir, "dicom-manifest.json").resolve().relative_to(
+        Path(wsettings.meld_data).resolve()).as_posix()
+
+
+def _harmonization_cli(profile: ResolvedHarmonization | None) -> list[str]:
+    if profile is not None and profile.applied:
+        return [
+            "--harmonization-status", "applied",
+            "--harmonization-code", profile.code,
+            "--harmonization-version", str(profile.version),
+            "--harmonization-method", profile.method,
+        ]
+    status = (profile.method if profile is not None else "unharmonized")
+    if status not in {"unharmonized", "not_applicable"}:
+        raise ValueError(f"invalid non-applied harmonization status {status!r}")
+    return ["--harmonization-status", status]
+
+
 async def run_package(subject: str, pseudonym: str, workdir: str,
-                      uid_seed: str, expected_clusters: int) -> tuple[int, dict]:
+                      uid_seed: str, study_uid_seed: str,
+                      expected_clusters: int,
+                      harmonization: ResolvedHarmonization | None = None) -> tuple[int, dict]:
     """Package MELD outputs → T1 DICOM series + DICOM-SEG, STOW to Orthanc (§17). Runs on
-    meld-net (needs Orthanc); parses the printed UIDs from stdout."""
+    meld-compute-net (needs Orthanc); parses the printed UIDs from stdout."""
     cmd = [
         "podman", "run", "--rm", "--name", f"meld7t-package-{subject}",
         "--network", wsettings.podman_data_network,
         "--security-opt=no-new-privileges", "--cap-drop=all",
+        "-e", "MELD7T_ORTHANC_INNET",
         "-v", f"{wsettings.meld_data}:/data:ro,z",
         "-v", f"{workdir}:/work:rw,z",
         wsettings.pkg_image,
@@ -119,28 +162,89 @@ async def run_package(subject: str, pseudonym: str, workdir: str,
         # Retry attempts use isolated output subjects but retain identical DICOM UIDs under the
         # same immutable run/release contract.
         "--uid-seed", uid_seed,
+        "--study-uid-seed", study_uid_seed,
         "--software-version", (wsettings.release_manifest_digest or "development")[:16],
         "--manifest-output", "/work/dicom-manifest.json",
         "--expected-clusters", str(expected_clusters),
-        "--stow", wsettings.orthanc_innet,
+        *_harmonization_cli(harmonization),
     ]
     log_path = os.path.join(workdir, "package.log")
     display_cmd = list(cmd)
     display_cmd[display_cmd.index("--pseudonym") + 1] = "<redacted>"
-    display_cmd[display_cmd.index("--stow") + 1] = "<internal-dicomweb-url-redacted>"
-    result = await run_process(cmd, log_path, capture_stdout=True, display_cmd=display_cmd)
-    uids = {}
-    for line in result.stdout.decode(errors="strict").splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            if k.strip() in {"study_uid", "t1_series_uid", "seg_series_uid", "n_t1_slices",
-                              "dicom_sop_count", "dicom_manifest_sha256"}:
-                uids[k.strip()] = v.strip()
+    result = await run_process(
+        cmd, log_path, capture_stdout=True, display_cmd=display_cmd,
+        env={"MELD7T_ORTHANC_INNET": wsettings.orthanc_innet},
+    )
+    uids = _package_uids(result.stdout)
     if result.returncode == 0:
-        uids["dicom_manifest_path"] = Path(
-            workdir, "dicom-manifest.json").resolve().relative_to(
-                Path(wsettings.meld_data).resolve()).as_posix()
+        uids["dicom_manifest_path"] = _package_manifest_relative(workdir)
     return result.returncode, uids
+
+
+async def _run_derived_package(subject: str, workdir: str, detector: str,
+                               arguments: list[str]) -> tuple[int, dict]:
+    cmd = [
+        "podman", "run", "--rm", "--name", f"meld7t-package-{detector}-{subject}",
+        "--network", wsettings.podman_data_network,
+        "--security-opt=no-new-privileges", "--cap-drop=all",
+        "-e", "MELD7T_ORTHANC_INNET",
+        "-v", f"{wsettings.meld_data}:/data:ro,z",
+        "-v", f"{workdir}:/work:rw,z",
+        wsettings.pkg_image,
+        "python3", "/opt/pkg/package_derived_dicom.py", detector,
+        *arguments,
+        "--software-version", (wsettings.release_manifest_digest or "development")[:16],
+        "--manifest-output", "/work/dicom-manifest.json",
+    ]
+    display_cmd = list(cmd)
+    display_cmd[display_cmd.index("--pseudonym") + 1] = "<redacted>"
+    result = await run_process(
+        cmd, os.path.join(workdir, f"package-{detector}.log"), capture_stdout=True,
+        display_cmd=display_cmd,
+        env={"MELD7T_ORTHANC_INNET": wsettings.orthanc_innet},
+    )
+    uids = _package_uids(result.stdout)
+    if result.returncode == 0:
+        uids["dicom_manifest_path"] = _package_manifest_relative(workdir)
+    return result.returncode, uids
+
+
+async def run_map_package(subject: str, pseudonym: str, workdir: str, uid_seed: str,
+                          study_uid_seed: str, expected_clusters: int,
+                          harmonization: ResolvedHarmonization | None = None) -> tuple[int, dict]:
+    root = f"/data/output/map/{subject}"
+    return await _run_derived_package(subject, workdir, "map", [
+        "--t1", f"/data/input/{subject}/anat/{subject}_T1w.nii.gz",
+        "--inverse-deformation", f"{root}/iy_T1.nii",
+        "--junction-threshold", f"{root}/junction_threshold.nii.gz",
+        "--junction-z", f"{root}/junction_z.nii.gz",
+        "--extension-threshold", f"{root}/extension_threshold.nii.gz",
+        "--extension-z", f"{root}/extension_z.nii.gz",
+        "--pseudonym", pseudonym or subject,
+        "--uid-seed", uid_seed,
+        "--study-uid-seed", study_uid_seed,
+        "--expected-clusters", str(expected_clusters),
+        *_harmonization_cli(harmonization),
+    ])
+
+
+async def run_hippunfold_package(subject: str, pseudonym: str, workdir: str, uid_seed: str,
+                                 study_uid_seed: str, expected_clusters: int,
+                                 left_dseg: str, right_dseg: str,
+                                 flagged_side: str,
+                                 harmonization: ResolvedHarmonization | None = None
+                                 ) -> tuple[int, dict]:
+    return await _run_derived_package(subject, workdir, "hippunfold", [
+        "--t2", f"/data/input/{subject}/anat/{subject}_T2w.nii.gz",
+        "--left-dseg", f"/data/{left_dseg}",
+        "--right-dseg", f"/data/{right_dseg}",
+        "--flagged-side", flagged_side,
+        "--pseudonym", pseudonym or subject,
+        "--uid-seed", uid_seed,
+        "--study-uid-seed", study_uid_seed,
+        "--expected-clusters", str(expected_clusters),
+        *_harmonization_cli(harmonization),
+    ])
 
 
 def is_oom(log_path: str) -> bool:

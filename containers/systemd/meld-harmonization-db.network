@@ -1,0 +1,12 @@
+[Unit]
+Description=meld-harmonization-db — Orthanc index backend only
+
+[Network]
+NetworkName=meld-harmonization-db-net
+Driver=bridge
+Internal=true
+Subnet=10.89.60.0/24
+Options=isolate=true
+
+[Install]
+WantedBy=default.target

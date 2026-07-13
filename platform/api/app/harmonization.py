@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from sqlalchemy import text
+
 from .config import settings
 
 
@@ -61,6 +63,17 @@ FINGERPRINT_KEYS = (
     "bits_stored",
     "pixel_representation",
 )
+
+_PROFILE_ACTIVATION_LOCK_KEY = 0x6D656C6468  # "meldh"
+
+
+def lock_profile_activation(session: Any) -> None:
+    """Serialize selector-overlap checks and activation across all API processes."""
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"),
+            {"key": _PROFILE_ACTIVATION_LOCK_KEY},
+        )
 FINGERPRINT_SCHEMA_VERSION = 2
 
 SERIES_ROLES = frozenset({
@@ -95,7 +108,13 @@ def case_harmonization_coverage(session: Any, case_id: str) -> dict[str, Any]:
     from sqlmodel import select
 
     from .detectors import REGISTRY
-    from .models import HarmonizationAssignment, HarmonizationStatus, Series
+    from .models import (
+        HarmonizationAssignment,
+        HarmonizationProfile,
+        HarmonizationProfileStatus,
+        HarmonizationStatus,
+        Series,
+    )
 
     rows = session.exec(select(Series).where(
         Series.case_id == case_id, Series.active.is_(True)
@@ -122,11 +141,17 @@ def case_harmonization_coverage(session: Any, case_id: str) -> dict[str, Any]:
     for target in targets:
         assignment = assignment_by_target.get(target)
         source = by_uid.get(target[1])
+        profile = (session.get(HarmonizationProfile, assignment.profile_id)
+                   if assignment is not None else None)
         current = bool(
             assignment is not None and source is not None
             and assignment.status == HarmonizationStatus.confirmed
             and source.fingerprint
             and assignment.acquisition_fingerprint == source.fingerprint
+            and (not settings.is_server_mode
+                 or (profile is not None
+                     and profile.status == HarmonizationProfileStatus.active
+                     and runtime_profile_trusted(session, profile)))
         )
         if current:
             confirmed += 1
@@ -221,6 +246,87 @@ def profile_document_sha256(profile: Any) -> str:
     })
 
 
+def runtime_profile_trusted(session: Any, profile: Any) -> bool:
+    """Require a signed release identity or the complete local activation proof chain.
+
+    Readiness reports profile-integrity failures, but request paths cannot depend on an operator
+    noticing a red health check.  This inexpensive database proof keeps an unexpected legacy row
+    out of candidate ranking, assignment, recipe creation, and final recipe confirmation.
+    Artifact bytes are independently re-hashed by readiness and again by the execution worker.
+    """
+    from sqlmodel import select
+
+    from .models import (
+        HarmonizationBuild,
+        HarmonizationBuildStatus,
+        HarmonizationCohort,
+        HarmonizationCohortStatus,
+        HarmonizationProfileStatus,
+    )
+
+    if profile is None or profile.status != HarmonizationProfileStatus.active:
+        return False
+    detector = getattr(profile.detector_id, "value", profile.detector_id)
+    for expected in settings.harmonization_expected_profiles:
+        if ((profile.code, profile.version) == (expected.code, expected.version)
+                and detector == expected.detector_id
+                and profile_document_sha256(profile) == expected.document_sha256):
+            return True
+
+    parameters = profile.parameters if isinstance(profile.parameters, dict) else {}
+    if parameters.get("storage_scope") != "generated":
+        return False
+    build = session.exec(select(HarmonizationBuild).where(
+        HarmonizationBuild.profile_id == profile.id,
+        HarmonizationBuild.status == HarmonizationBuildStatus.active,
+    )).first()
+    if build is None:
+        return False
+    cohort = session.get(HarmonizationCohort, build.cohort_id)
+    qc = build.qc_report if isinstance(build.qc_report, dict) else {}
+    artifact_manifest = (build.artifact_manifest
+                         if isinstance(build.artifact_manifest, dict) else {})
+    scientific_validation = parameters.get("scientific_validation")
+    scientific_validation = (scientific_validation
+                             if isinstance(scientific_validation, dict) else {})
+    frozen = (cohort.frozen_manifest
+              if cohort is not None and isinstance(cohort.frozen_manifest, dict) else {})
+    actors = (build.initiated_by, build.validated_by, build.activated_by)
+    return bool(
+        cohort is not None
+        and cohort.status == HarmonizationCohortStatus.frozen
+        and cohort.approved_by == build.initiated_by
+        and all(isinstance(actor, str) and actor for actor in actors)
+        and profile.validated_by == build.validated_by
+        and (profile.code, profile.version)
+        == (cohort.profile_code, cohort.profile_version)
+        and profile.selector == cohort.selector
+        and build.artifact_manifest == profile.artifact_manifest
+        and qc.get("all_folds_succeeded") is True
+        and qc.get("report_sha256") == canonical_json_sha256({
+            key: value for key, value in qc.items() if key != "report_sha256"
+        })
+        and frozen.get("manifest_sha256") == canonical_json_sha256({
+            key: value for key, value in frozen.items() if key != "manifest_sha256"
+        })
+        and qc.get("cohort_manifest_sha256") == frozen.get("manifest_sha256")
+        and parameters.get("cohort_manifest_sha256") == frozen.get("manifest_sha256")
+        and parameters.get("internal_cv_report_sha256") == qc.get("report_sha256")
+        and (parameters.get("build_images") or {}).get("meld")
+        == build.builder_image_digest
+        and qc.get("builder_image_digest") == build.builder_image_digest
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(build.builder_adapter_sha256 or "")
+        ) is not None
+        and qc.get("builder_adapter_sha256") == build.builder_adapter_sha256
+        and artifact_manifest.get("builder_adapter_sha256")
+        == build.builder_adapter_sha256
+        and parameters.get("builder_adapter_sha256") == build.builder_adapter_sha256
+        and scientific_validation.get("builder_adapter_sha256")
+        == build.builder_adapter_sha256
+    )
+
+
 def validate_scientific_validation(profile: Any) -> None:
     """Validate the signed, profile-bound site acceptance summary.
 
@@ -232,6 +338,27 @@ def validate_scientific_validation(profile: Any) -> None:
     if not isinstance(report, dict) or report.get("schema_version") != 1:
         raise ValueError("profile lacks a schema-v1 scientific validation summary")
     detector = getattr(profile.detector_id, "value", profile.detector_id)
+    artifact_manifest = (profile.artifact_manifest
+                         if isinstance(profile.artifact_manifest, dict) else {})
+    adapter_bound = detector == "meld_fcd" and (
+        parameters.get("storage_scope") == "generated"
+        or "builder_adapter_sha256" in parameters
+        or "builder_adapter_sha256" in artifact_manifest
+        or "builder_adapter_sha256" in report
+    )
+    expected_report_fields = {
+        "schema_version", "profile", "approval_id", "independent_reviewer", "approved_at",
+        "acquisition_fingerprints", "qc", "holdout", "metrics_sha256",
+        "golden_case_evidence_sha256", "methodology_sha256", "image_digests",
+    }
+    if adapter_bound:
+        if "builder_adapter_sha256" not in report:
+            raise ValueError(
+                "scientific validation lacks the builder adapter digest"
+            )
+        expected_report_fields.add("builder_adapter_sha256")
+    if set(report) != expected_report_fields:
+        raise ValueError("scientific validation summary must use the exact minimized schema")
     binding = report.get("profile")
     if binding != {
         "code": profile.code, "version": profile.version, "detector_id": detector,
@@ -255,6 +382,7 @@ def validate_scientific_validation(profile: Any) -> None:
         raise ValueError("scientific validation needs unique acquisition fingerprints")
     qc = report.get("qc")
     if (not isinstance(qc, dict)
+            or set(qc) != {"included", "excluded"}
             or isinstance(qc.get("included"), bool) or not isinstance(qc.get("included"), int)
             or qc["included"] < 20
             or isinstance(qc.get("excluded"), bool) or not isinstance(qc.get("excluded"), int)
@@ -263,6 +391,7 @@ def validate_scientific_validation(profile: Any) -> None:
     holdout = report.get("holdout")
     counts = ("positive_cases", "negative_cases", "control_cases")
     if (not isinstance(holdout, dict)
+            or set(holdout) != {"case_count", *counts}
             or any(isinstance(holdout.get(key), bool) or not isinstance(holdout.get(key), int)
                    or holdout[key] < 1 for key in counts)
             or holdout.get("case_count") != sum(holdout[key] for key in counts)):
@@ -276,6 +405,13 @@ def validate_scientific_validation(profile: Any) -> None:
             or any(re.search(r"@sha256:[0-9a-f]{64}$", str(value)) is None
                    for value in images.values())):
         raise ValueError("scientific validation build images do not match the profile")
+    if adapter_bound:
+        adapter_sha256 = str(parameters.get("builder_adapter_sha256", "")).lower()
+        if (re.fullmatch(r"[0-9a-f]{64}", adapter_sha256) is None
+                or report.get("builder_adapter_sha256") != adapter_sha256):
+            raise ValueError(
+                "scientific validation builder adapter does not match the profile"
+            )
 
 
 def validate_selector(selector: dict[str, Any]) -> None:
@@ -508,6 +644,18 @@ def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def profile_artifact_root(profile: Any) -> str:
+    """Select the immutable signed-release or locally generated artifact trust root."""
+    parameters = (profile.get("parameters", {}) if isinstance(profile, dict)
+                  else getattr(profile, "parameters", {}))
+    scope = parameters.get("storage_scope") if isinstance(parameters, dict) else None
+    if scope == "generated":
+        return settings.harmonization_generated_root
+    if scope not in {None, "release"}:
+        raise ValueError("unknown harmonization artifact storage scope")
+    return settings.harmonization_root
+
+
 def verify_artifact_manifest(manifest: dict[str, Any], root: str | Path) -> dict[str, Any]:
     """Verify a profile's local artifact manifest and return a resolved immutable contract."""
     root_path = Path(root).resolve(strict=True)
@@ -609,6 +757,24 @@ def validate_profile_semantics(profile: Any, verified_manifest: dict[str, Any]) 
         if (not isinstance(images, dict) or set(images) != {"meld"}
                 or re.search(r"@sha256:[0-9a-f]{64}$", str(images.get("meld"))) is None):
             raise ValueError("MELD profile requires its immutable build image")
+        report = parameters.get("scientific_validation")
+        report = report if isinstance(report, dict) else {}
+        manifest = (profile.artifact_manifest
+                    if isinstance(profile.artifact_manifest, dict) else {})
+        adapter_bound = (
+            parameters.get("storage_scope") == "generated"
+            or "builder_adapter_sha256" in parameters
+            or "builder_adapter_sha256" in manifest
+            or "builder_adapter_sha256" in report
+        )
+        if adapter_bound:
+            adapter_sha256 = str(parameters.get("builder_adapter_sha256", ""))
+            if (re.fullmatch(r"[0-9a-f]{64}", adapter_sha256) is None
+                    or manifest.get("builder_adapter_sha256") != adapter_sha256
+                    or report.get("builder_adapter_sha256") != adapter_sha256):
+                raise ValueError(
+                    "MELD profile builder adapter digest is missing or inconsistent"
+                )
         if parameters.get("selector_canonical_sha256") != canonical_json_sha256(profile.selector):
             raise ValueError("MELD profile selector differs from its cohort preparation contract")
         cohort_hash = str(parameters.get("cohort_manifest_sha256", "")).lower()

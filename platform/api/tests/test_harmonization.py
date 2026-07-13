@@ -19,8 +19,8 @@ from app.models import Workup
 from app.recipe import build_recipe, spec_hash
 
 
-def _validation(code, version, detector, images):
-    return {
+def _validation(code, version, detector, images, adapter_sha256=None):
+    report = {
         "schema_version": 1,
         "profile": {"code": code, "version": version, "detector_id": detector},
         "approval_id": "SITE-VALIDATION-001",
@@ -37,6 +37,9 @@ def _validation(code, version, detector, images):
         "methodology_sha256": "2" * 64,
         "image_digests": images,
     }
+    if adapter_sha256 is not None:
+        report["builder_adapter_sha256"] = adapter_sha256
+    return report
 
 
 def test_fingerprint_is_stable_normalized_and_excludes_direct_patient_tags():
@@ -83,6 +86,21 @@ def test_selector_ranking_supports_scanner_protocol_ranges():
     assert [m.profile_id for m in matches] == ["exact", "generic"]
     assert all(m.matched for m in matches)
     assert not match_selector("bad", exact.selector, acquisition, role="flair").matched
+
+
+def test_selector_exactly_matches_multivalued_dicom_fields():
+    acquisition = {
+        "software_versions": ["XA60"],
+        "scanning_sequence": ["GR", "IR"],
+    }
+    selector = {"acquisition": {
+        "software_versions": {"eq": ["xa60"]},
+        "scanning_sequence": {"eq": ["IR", "GR"]},
+    }}
+    assert match_selector("exact-multivalue", selector, acquisition).matched
+    assert not match_selector(
+        "wrong-shape", {"acquisition": {"software_versions": "XA60"}}, acquisition
+    ).matched
 
 
 def test_selector_validation_rejects_unknown_or_ambiguous_rules():
@@ -181,6 +199,16 @@ def test_profile_activation_semantics_are_detector_specific():
     )
     validate_profile_semantics(
         meld, {"files": [{"path": "MELD_H7Tcombat_parameters.hdf5"}]})
+    meld.parameters["scientific_validation"]["patient_name"] = "must-not-be-retained"
+    with pytest.raises(ValueError, match="exact minimized schema"):
+        validate_profile_semantics(
+            meld, {"files": [{"path": "MELD_H7Tcombat_parameters.hdf5"}]})
+    del meld.parameters["scientific_validation"]["patient_name"]
+    meld.parameters["storage_scope"] = "generated"
+    with pytest.raises(ValueError, match="builder adapter"):
+        validate_profile_semantics(
+            meld, {"files": [{"path": "MELD_H7Tcombat_parameters.hdf5"}]})
+    del meld.parameters["storage_scope"]
     meld.parameters["activation_eligible"] = False
     with pytest.raises(ValueError, match="not marked activation-eligible"):
         validate_profile_semantics(meld, {"files": [{"path": "MELD_H7Tcombat_parameters.hdf5"}]})

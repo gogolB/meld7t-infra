@@ -22,9 +22,17 @@ decrypt "$backup/orthanc-index.pgdump.cms" \
   | podman run --rm --pull=never --network=none --entrypoint pg_restore -i "$postgres_image" --list \
     >/dev/null
 decrypt "$backup/postgres-globals.sql.cms" | grep -qE '^(CREATE|ALTER) ROLE'
-for archive in orthanc-storage immudb-data api-immudb-state redis-data caddy-data hippunfold-cache \
-  meld-data audit-state configuration; do
+archives=(orthanc-storage immudb-data api-immudb-state redis-data caddy-data hippunfold-cache \
+  meld-data audit-state configuration)
+if [[ -f $backup/harmonization-orthanc-index.pgdump.cms ]]; then
+  decrypt "$backup/harmonization-orthanc-index.pgdump.cms" \
+    | podman run --rm --pull=never --network=none --entrypoint pg_restore -i "$postgres_image" \
+      --list >/dev/null
+  decrypt "$backup/harmonization-postgres-globals.sql.cms" | grep -qE '^(CREATE|ALTER) ROLE'
+  archives+=(harmonization-orthanc-storage harmonization-state)
+fi
+for archive in "${archives[@]}"; do
   decrypt "$backup/$archive.tar.cms" | tar -tf - >/dev/null
 done
-printf 'non-destructive restore drill passed: crypto, both PostgreSQL catalogs, and all archives\n'
+printf 'non-destructive restore drill passed: crypto, PostgreSQL catalogs, and all archives\n'
 printf 'next required step: restore this backup on an isolated acceptance host and run research workflow smoke tests\n'

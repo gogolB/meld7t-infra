@@ -5,11 +5,17 @@ overrides (propose-then-confirm, never silent-auto). Same patterns as containers
 """
 from __future__ import annotations
 
+import hashlib
 import re
+import tempfile
+from pathlib import Path
+from urllib.parse import quote
 
 from .config import settings
+from .dicom_policy import validate_deidentified_part10
 from .harmonization import acquisition_fingerprint, canonical_acquisition
 from .models import SeriesRole
+from .storage import storage_health
 
 # ordered: first match wins. inv1/inv2 before uni so "sag t1 inv1" doesn't match a bare 'uni' rule.
 _ROLE_PATTERNS: list[tuple[SeriesRole, str]] = [
@@ -30,7 +36,7 @@ def propose_role(series_description: str | None) -> SeriesRole:
     return SeriesRole.unknown
 
 
-def dicomweb_client():
+def dicomweb_client(url: str | None = None):
     from dicomweb_client.api import DICOMwebClient
     import requests
 
@@ -43,7 +49,13 @@ def dicomweb_client():
     session = InternalSession()
     # Never leak internal DICOM requests through workstation proxy environment variables.
     session.trust_env = False
-    return DICOMwebClient(url=settings.orthanc_dicomweb, session=session)
+    target = url or settings.orthanc_dicomweb
+    if target == settings.harmonization_orthanc_dicomweb:
+        session.auth = (
+            settings.harmonization_orthanc_user,
+            settings.harmonization_orthanc_password.get_secret_value(),
+        )
+    return DICOMwebClient(url=target, session=session)
 
 
 def _tag(ds: dict, tag: str, default=None):
@@ -91,10 +103,9 @@ _SERIES_FIELDS = [
     "00080008", "00281053", "00281052", "00280101", "00280103",
 ]
 
-
-def get_study_series(study_uid: str) -> list[dict]:
+def get_study_series(study_uid: str, *, dicomweb_url: str | None = None) -> list[dict]:
     """Return [{series_uid, description, modality, number, instances}] for a study."""
-    client = dicomweb_client()
+    client = dicomweb_client(dicomweb_url)
     out = []
     for ds in client.search_for_series(study_instance_uid=study_uid, fields=_SERIES_FIELDS):
         acquisition = {
@@ -153,3 +164,102 @@ def get_study_series(study_uid: str) -> list[dict]:
             "fingerprint": acquisition_fingerprint(acquisition) if canonical else None,
         })
     return out
+
+
+def get_series_instance_manifest(
+        study_uid: str, series_uid: str, *, dicomweb_url: str | None = None) -> dict:
+    """Hash the exact Part-10 byte closure for one selected source series.
+
+    Orthanc is the controlled transport store, not the immutable build input.  The admission
+    manifest is re-downloaded and hash-checked into a private worker snapshot before estimation,
+    so adding, deleting, or replacing an instance after cohort admission fails the build closed.
+    """
+    client = dicomweb_client(dicomweb_url)
+    target = (dicomweb_url or settings.orthanc_dicomweb).rstrip("/")
+    datasets = client.search_for_instances(
+        study_instance_uid=study_uid,
+        series_instance_uid=series_uid,
+        fields=["00080018"],
+        get_remaining=True,
+    )
+    sop_uids = [_tag(ds, "00080018") for ds in datasets]
+    if (not sop_uids or any(
+            not isinstance(uid, str)
+            or re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", uid) is None for uid in sop_uids)
+            or len(sop_uids) != len(set(sop_uids))):
+        raise ValueError("source series has a missing, invalid, or duplicate SOP Instance UID")
+
+    manifest: list[dict] = []
+    exact_series: dict | None = None
+    total = 0
+    for sop_uid in sorted(sop_uids):
+        url = (
+            f"{target}/studies/{quote(study_uid, safe='')}/series/"
+            f"{quote(series_uid, safe='')}/instances/{quote(sop_uid, safe='')}"
+        )
+        scratch = Path(settings.harmonization_upload_root)
+        scratch.mkdir(parents=True, exist_ok=True)
+        capacity = storage_health(
+            str(scratch),
+            minimum_free_bytes=(settings.storage_min_free_bytes
+                                + settings.harmonization_max_instance_bytes),
+            minimum_free_percent=settings.storage_min_free_percent,
+        )
+        if not capacity["ready"]:
+            raise OSError("harmonization admission scratch is below its storage watermark")
+        with tempfile.TemporaryFile(dir=scratch) as exact_bytes:
+            with client._session.get(  # dicomweb-client owns the hardened authenticated session.
+                    url, headers={"Accept": "application/dicom"}, stream=True,
+                    timeout=settings.dicomweb_timeout_seconds, allow_redirects=False) as response:
+                response.raise_for_status()
+                digest = hashlib.sha256()
+                size = 0
+                prefix = bytearray()
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    if len(prefix) < 132:
+                        prefix.extend(chunk[:132 - len(prefix)])
+                    size += len(chunk)
+                    total += len(chunk)
+                    if size > settings.harmonization_max_instance_bytes:
+                        raise ValueError("DICOM instance exceeds the configured byte limit")
+                    if total > settings.harmonization_max_upload_bytes:
+                        raise ValueError("source series exceeds the configured admission byte limit")
+                    digest.update(chunk)
+                    exact_bytes.write(chunk)
+            exact_bytes.flush()
+            exact_bytes.seek(0)
+            identity = validate_deidentified_part10(
+                exact_bytes,
+                allowed_transfer_syntaxes=settings.harmonization_allowed_transfer_syntaxes,
+                allowed_private_tags=settings.harmonization_allowed_private_tags,
+            )
+        if (identity["sop_instance_uid"] != sop_uid
+                or identity["series_instance_uid"] != series_uid
+                or identity["study_instance_uid"] != study_uid):
+            raise ValueError("DICOM instance identity differs from the requested source")
+        if size < 132 or bytes(prefix[128:132]) != b"DICM":
+            raise ValueError("DICOM instance is not a Part-10 object")
+        exact_acquisition = canonical_acquisition(identity["acquisition"])
+        current_series = {
+            "modality": str(identity.get("modality") or "").upper(),
+            "description": identity.get("series_description"),
+            "patient_id": identity["patient_id"],
+            "acquisition": exact_acquisition,
+            "fingerprint": acquisition_fingerprint(exact_acquisition),
+        }
+        if exact_series is None:
+            exact_series = current_series
+        elif current_series != exact_series:
+            raise ValueError(
+                "source series has inconsistent exact-byte acquisition metadata"
+            )
+        manifest.append({
+            "sop_instance_uid": sop_uid,
+            "sha256": digest.hexdigest(),
+            "size": size,
+        })
+    if exact_series is None:
+        raise ValueError("source series contains no exact-byte acquisition evidence")
+    return {"instances": manifest, "series": exact_series}

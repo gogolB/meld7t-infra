@@ -1,0 +1,5 @@
+[Unit]
+Description=Harmonization Orthanc PostgreSQL data
+
+[Volume]
+VolumeName=harmonization-postgres-data

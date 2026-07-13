@@ -2,11 +2,12 @@
 
 CPU-only, T1-only. compute runs SPM12 Standalone's unified segmentation (stock spmcentral/spm image
 + our segment.m); ingest computes the junction/extension feature maps + single-subject z-scores in
-the pkg container (map_morphometry.py) and emits candidate clusters. No viewer overlay yet — the
-feature maps live in MNI space; warping thresholded clusters back to the T1 frame for a DICOM-SEG
-is a follow-up (findings already render in the MDT/concordance view). A versioned ``map_normative``
+the pkg container (map_morphometry.py) and emits candidate clusters. Packaging uses SPM's iy_T1
+inverse deformation to publish native-T1 DICOM SEG and quantitative Parametric Maps. A versioned
+``map_normative``
 profile supplies the scanner/protocol-specific control mean and standard-deviation maps. An
-explicitly approved development override may run without one; production fails closed.
+explicitly confirmed unharmonized contract may run without one and remains visibly warned in every
+published surface.
 """
 from __future__ import annotations
 
@@ -20,10 +21,11 @@ from typing import Optional
 
 from app.models import RunStatus
 
+from .. import pipeline
 from ..config import wsettings
 from ..harmonization import ResolvedHarmonization
 from ..process import run_process
-from .base import CompletionValidationError, DetectorRunner, run_cmd
+from .base import CompletionValidationError, DetectorCompletion, DetectorRunner, run_cmd
 
 
 class MapRunner(DetectorRunner):
@@ -32,6 +34,8 @@ class MapRunner(DetectorRunner):
     uses_gpu = False                # SPM segmentation is CPU — runs alongside a GPU job (§18)
     supports_harmonization = True
     allowed_harmonization_methods = frozenset({"map_normative"})
+    required_uid_keys = (
+        "study_uid", "t1_series_uid", "seg_series_uid", "probmap_series_uid")
 
     async def compute(self, subject: str, workdir: str,
                       harmonization: ResolvedHarmonization | None = None
@@ -125,6 +129,10 @@ class MapRunner(DetectorRunner):
         if set(summary.get("artifacts", [])) != expected_artifacts:
             raise CompletionValidationError("MAP did not retain the complete reviewable map set")
         relative_root = os.path.join("output", "map", subject)
+        inverse_deformation = os.path.join(
+            wsettings.meld_data, relative_root, "iy_T1.nii")
+        if not os.path.isfile(inverse_deformation) or os.path.getsize(inverse_deformation) == 0:
+            raise CompletionValidationError("MAP inverse deformation iy_T1.nii is missing")
         return {"result": {"report_path": None, "n_clusters": len(clusters),
                            "harmo_code": summary["harmo_code"],
                            "metric_schema": {
@@ -135,5 +143,41 @@ class MapRunner(DetectorRunner):
                 "clusters": clusters,
                 "artifacts": [os.path.join(relative_root, "wc1T1.nii"),
                               os.path.join(relative_root, "wc2T1.nii"),
+                              os.path.join(relative_root, "iy_T1.nii"),
                               *(os.path.join(relative_root, name)
                                 for name in sorted(expected_artifacts))]}
+
+    async def package(self, subject: str, pseudonym: str, workdir: str,
+                      uid_seed: str, study_uid_seed: str,
+                      expected_clusters: int | None = None,
+                      validated_ingest: DetectorCompletion | None = None,
+                      harmonization: ResolvedHarmonization | None = None) -> dict:
+        if expected_clusters is None:
+            raise CompletionValidationError("MAP packaging requires validated candidate count")
+        rc, uids = await pipeline.run_map_package(
+            subject, pseudonym, workdir, uid_seed, study_uid_seed, expected_clusters,
+            harmonization)
+        if rc != 0:
+            raise CompletionValidationError(f"MAP DICOM packaging/STOW failed with rc={rc}")
+        return uids
+
+    def validate_completion(self, ingested: dict, uids: dict) -> DetectorCompletion:
+        completed = super().validate_completion(ingested, uids)
+        roles = {item["role"] for item in completed.uids[
+            "derived_series_manifest"]["series"]}
+        expected = {
+            "map_native_t1_reference", "map_candidate_segmentation",
+            "map_junction_z_parametric_map", "map_extension_z_parametric_map",
+        }
+        try:
+            slices = int(completed.uids.get("n_t1_slices", "0"))
+            sop_count = int(completed.uids.get("dicom_sop_count", "0"))
+            probability_series = completed.uids.get("probmap_series_uids")
+            if (roles != expected or slices < 1 or sop_count != slices + 3
+                    or not isinstance(probability_series, list)
+                    or len(probability_series) != 2):
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise CompletionValidationError(
+                "MAP derived DICOM series contract is incomplete") from exc
+        return completed

@@ -15,10 +15,14 @@
     state_root: "{{ home_dir }}/meld7t-state"
     meld_data_dir: "{{ state_root }}/meld-data"
     dicom_staging_dir: "{{ meld_data_dir }}/staging"
+    case_upload_dir: "{{ state_root }}/case-uploads"
     durable_mount_point: "/var/mnt/meld7t"
     backup_root: "{{ durable_mount_point }}/backups"
     dicom_import_root: "{{ durable_mount_point }}/raw"
     harmonization_root: "{{ release_root }}/current/harmonization"
+    harmonization_upload_dir: "{{ state_root }}/harmonization-uploads"
+    harmonization_build_dir: "{{ state_root }}/harmonization-builds"
+    harmonization_profile_dir: "{{ state_root }}/harmonization-profiles"
     production_secret_dir: "{{ home_dir }}/meld7t-secrets/production"
     svc_config_root: "{{ home_dir }}/.config/meld7t"
     svc_config_dir: "{{ svc_config_root }}/releases/{{ release_id }}"
@@ -47,6 +51,9 @@
       - postgres.env
       - redis.env
       - orthanc.env
+      - harmonization-postgres.env
+      - harmonization-orthanc.env
+      - harmonization-builder.env
       - immudb.env
       - api.env
       - caddy.env
@@ -56,7 +63,6 @@
       - tls.key
       - caddy-users.caddy
       - caddy-roles.caddy
-      - caddy-dicom-access.caddy
       - identity-approval.txt
       - freesurfer.txt
       - meld.txt
@@ -248,6 +254,16 @@
       changed_when: false
       register: release_map_script_sha_cmd
 
+    - name: Read signed harmonization cohort bootstrap authorization
+      ansible.builtin.shell: |
+        set -euo pipefail
+        sed -n 's/^MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED=//p' \
+          {{ (release_receipt_dir + '/release.env') | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: release_harmonization_bootstrap_cmd
+
     - name: Compute signed release manifest digest
       ansible.builtin.command:
         argv: [sha256sum, "{{ release_receipt_dir }}/SHA256SUMS"]
@@ -272,6 +288,8 @@
         os_checksum: "{{ os_checksum_cmd.stdout | trim }}"
         release_git_sha: "{{ release_git_sha_cmd.stdout | trim }}"
         release_map_script_sha: "{{ release_map_script_sha_cmd.stdout | trim }}"
+        harmonization_cohort_bootstrap_allowed: >-
+          {{ release_harmonization_bootstrap_cmd.stdout | trim }}
 
     - name: Assert release identity is safe
       ansible.builtin.assert:
@@ -282,6 +300,7 @@
           - os_checksum == approved_os_checksum
           - release_git_sha is match('^[0-9a-f]{40}$|^[0-9a-f]{64}$')
           - release_map_script_sha is match('^[0-9a-f]{64}$')
+          - harmonization_cohort_bootstrap_allowed in ['true', 'false']
 
     - name: Verify the signed MAP script digest against staged source
       ansible.builtin.command:
@@ -324,17 +343,24 @@
         - { path: "{{ state_root }}", mode: "0700" }
         - { path: "{{ meld_data_dir }}", mode: "0700" }
         - { path: "{{ dicom_staging_dir }}", mode: "0700" }
+        - { path: "{{ case_upload_dir }}", mode: "0700" }
+        - { path: "{{ harmonization_upload_dir }}", mode: "0700" }
+        - { path: "{{ harmonization_build_dir }}", mode: "0700" }
+        - { path: "{{ harmonization_profile_dir }}", mode: "0700" }
         - { path: "{{ svc_config_root }}", mode: "0700" }
         - { path: "{{ svc_config_root }}/releases", mode: "0700" }
         - { path: "{{ svc_config_dir }}", mode: "0700" }
         - { path: "{{ svc_config_dir }}/env", mode: "0700" }
         - { path: "{{ svc_config_dir }}/caddy", mode: "0700" }
         - { path: "{{ svc_config_dir }}/caddy/auth", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/branding", mode: "0700" }
         - { path: "{{ svc_config_dir }}/tls", mode: "0700" }
         - { path: "{{ svc_config_dir }}/licenses", mode: "0700" }
         - { path: "{{ svc_config_dir }}/postgres", mode: "0700" }
         - { path: "{{ svc_config_dir }}/redis", mode: "0700" }
         - { path: "{{ svc_config_dir }}/orthanc", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/harmonization-orthanc", mode: "0700" }
+        - { path: "{{ svc_config_dir }}/harmonization-postgres", mode: "0700" }
         - { path: "{{ svc_config_dir }}/ohif", mode: "0700" }
         - { path: "{{ svc_config_dir }}/trust", mode: "0700" }
         - { path: "{{ svc_config_dir }}/systemd", mode: "0700" }
@@ -342,6 +368,109 @@
         - { path: "{{ state_root }}/audit", mode: "0700" }
         - { path: "{{ quadlet_user_dir }}", mode: "0700" }
         - { path: "{{ worker_unit_dir }}", mode: "0700" }
+
+    - name: Inspect optional deployment branding assets
+      ansible.builtin.stat:
+        path: "{{ production_secret_dir }}/branding"
+      register: branding_assets
+
+    - name: Read optional report branding logo deployment setting
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import sys;
+            values=dict(line.strip().split('=',1) for line in open(sys.argv[1], encoding='utf-8')
+            if line.strip() and not line.lstrip().startswith(('#',';')) and '=' in line);
+            print(values.get('MELD7T_BRANDING_LOGO_PATH','').strip())
+          - "{{ production_secret_dir }}/api.env"
+      changed_when: false
+      register: report_branding_logo_setting
+      no_log: true
+
+    - name: Require the fixed API mount path for an optional report logo
+      ansible.builtin.assert:
+        that:
+          - >-
+            (report_branding_logo_setting.stdout | trim) in
+            ['', '/run/branding/report-logo.png']
+        fail_msg: Report logo must be disabled or use /run/branding/report-logo.png.
+      no_log: true
+
+    - name: Inspect signed default report branding logo
+      ansible.builtin.stat:
+        path: "{{ repo_dir }}/containers/config/branding/report-logo.png"
+        follow: false
+      register: bundled_report_branding_logo
+      when: >-
+        (report_branding_logo_setting.stdout | trim) == '/run/branding/report-logo.png'
+
+    - name: Require a bounded signed default report logo
+      ansible.builtin.assert:
+        that:
+          - bundled_report_branding_logo.stat.exists
+          - bundled_report_branding_logo.stat.isreg
+          - not bundled_report_branding_logo.stat.islnk
+          - bundled_report_branding_logo.stat.size | int > 0
+          - bundled_report_branding_logo.stat.size | int <= 5242880
+        fail_msg: Signed default report logo must be a regular file of at most 5 MiB.
+      when: >-
+        (report_branding_logo_setting.stdout | trim) == '/run/branding/report-logo.png'
+
+    - name: Validate optional deployment branding asset directory
+      ansible.builtin.assert:
+        that:
+          - branding_assets.stat.isdir
+          - not branding_assets.stat.islnk
+          - branding_assets.stat.pw_name == svc_user
+        fail_msg: Optional production branding input must be a service-user-owned directory.
+      when: branding_assets.stat.exists
+
+    - name: Reject links, special files, foreign owners, and writable branding inputs
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |-
+            import os, stat, sys
+            root, expected = sys.argv[1], int(sys.argv[2])
+            pending = [root]
+            root_stat = os.lstat(root)
+            assert stat.S_ISDIR(root_stat.st_mode) and not stat.S_ISLNK(root_stat.st_mode)
+            assert root_stat.st_uid == expected
+            assert not stat.S_IMODE(root_stat.st_mode) & 0o022
+            while pending:
+                directory = pending.pop()
+                for entry in os.scandir(directory):
+                    value = entry.stat(follow_symlinks=False)
+                    mode = stat.S_IMODE(value.st_mode)
+                    assert not stat.S_ISLNK(value.st_mode)
+                    assert value.st_uid == expected and not mode & 0o022
+                    assert (stat.S_ISDIR(value.st_mode) or (
+                        stat.S_ISREG(value.st_mode)
+                        and value.st_nlink == 1 and bool(mode & 0o400)))
+                    if stat.S_ISDIR(value.st_mode):
+                        pending.append(entry.path)
+          - "{{ production_secret_dir }}/branding"
+          - "{{ svc_uid }}"
+      changed_when: false
+      when: branding_assets.stat.exists
+      no_log: true
+
+    - name: Install signed default deployment branding asset
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/containers/config/branding/report-logo.png"
+        dest: "{{ svc_config_dir }}/branding/report-logo.png"
+        mode: "0644"
+
+    - name: Install optional deployment branding overrides outside the signed SPA
+      ansible.builtin.copy:
+        src: "{{ production_secret_dir }}/branding/"
+        dest: "{{ svc_config_dir }}/branding/"
+        mode: preserve
+        directory_mode: "0750"
+      when: branding_assets.stat.exists
 
     - name: Prove active compute state is on local storage
       ansible.builtin.command:
@@ -365,24 +494,25 @@
         executable: /bin/bash
       changed_when: false
 
-    - name: Require the configured worst-case worker scratch reserve
+    - name: Require aggregate routine and harmonization storage reserves
       ansible.builtin.command:
         argv:
           - python3
-          - -c
-          - >-
-            import shutil,sys;
-            values=dict(line.split('=',1) for line in open(sys.argv[1], encoding='utf-8')
-            if line.strip() and not line.lstrip().startswith(('#',';')) and '=' in line);
-            number=lambda key,default:int(values.get(key,default));
-            required=number('MELD7T_STORAGE_MIN_FREE_BYTES',53687091200)+
-            number('MELD7T_WORKER_MAX_JOBS',2)*
-            (number('MELD7T_DICOM_MAX_BYTES_PER_RUN',107374182400)+
-            number('MELD7T_STORAGE_OUTPUT_HEADROOM_BYTES',26843545600));
-            free=shutil.disk_usage(sys.argv[2]).free;
-            assert free>=required, f'compute storage has {free} bytes free; {required} required'
+          - "{{ repo_dir }}/ops/deployment/check-storage-reserve.py"
+          - --api-env
+          - "{{ production_secret_dir }}/api.env"
+          - --worker-env
           - "{{ production_secret_dir }}/worker.env"
+          - --builder-env
+          - "{{ production_secret_dir }}/harmonization-builder.env"
+          - --orthanc-env
+          - "{{ production_secret_dir }}/orthanc.env"
+          - --harmonization-orthanc-env
+          - "{{ production_secret_dir }}/harmonization-orthanc.env"
+          - --state-path
           - "{{ state_root }}"
+          - --podman-path
+          - "{{ home_dir }}/.local/share/containers"
       changed_when: false
 
     - name: Compute durable NFS mount unit name
@@ -475,6 +605,8 @@
         - postgres-data
         - redis-data
         - orthanc-storage
+        - harmonization-postgres-data
+        - harmonization-orthanc-storage
         - immudb-data
         - api-immudb-state
         - caddy-data
@@ -528,7 +660,8 @@
         src: "{{ production_secret_dir }}/{{ item }}.env"
         dest: "{{ svc_config_dir }}/env/{{ item }}.env"
         mode: "0600"
-      loop: [postgres, redis, orthanc, immudb, api, caddy, worker]
+      loop: [postgres, redis, orthanc, harmonization-postgres, harmonization-orthanc,
+        immudb, api, caddy, worker, harmonization-builder]
       no_log: true
 
     - name: Install release-derived runtime image environment
@@ -537,6 +670,21 @@
         dest: "{{ svc_config_dir }}/env/runtime-images.env"
         mode: "0600"
 
+    - name: Read the reviewed harmonization builder adapter digest
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import sys;
+            values=dict(line.strip().split('=',1) for line in open(sys.argv[1], encoding='utf-8')
+            if line.strip() and not line.lstrip().startswith(('#',';')) and '=' in line);
+            print(values.get('MELD7T_HARMONIZATION_BUILDER_ADAPTER_SHA256',''))
+          - "{{ svc_config_dir }}/env/harmonization-builder.env"
+      changed_when: false
+      register: harmonization_builder_adapter_sha256
+      no_log: true
+
     - name: Read the signed expected-active harmonization inventory as compact JSON
       ansible.builtin.command:
         argv:
@@ -544,9 +692,11 @@
           - -c
           - >-
             import json,sys; value=json.load(open(sys.argv[1], encoding='utf-8'));
-            assert isinstance(value,list) and value;
+            assert isinstance(value,list);
+            assert (value == []) == (sys.argv[2] == 'true');
             print(json.dumps(value, separators=(',',':'), sort_keys=True))
           - "{{ repo_dir }}/harmonization/expected-active-profiles.json"
+          - "{{ harmonization_cohort_bootstrap_allowed }}"
       changed_when: false
       register: harmonization_expected_profiles_json
 
@@ -573,6 +723,18 @@
       loop:
         - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
         - { key: MELD7T_HARMONIZATION_EXPECTED_PROFILES, value: "{{ harmonization_expected_profiles_json.stdout }}" }
+        - { key: MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED, value: "{{ harmonization_cohort_bootstrap_allowed }}" }
+      no_log: true
+
+    - name: Bind API build admission to the reviewed builder adapter
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/api.env"
+        regexp: '^MELD7T_HARMONIZATION_BUILDER_ADAPTER_SHA256='
+        line: >-
+          MELD7T_HARMONIZATION_BUILDER_ADAPTER_SHA256={{ harmonization_builder_adapter_sha256.stdout | trim }}
+        state: >-
+          {{ ((harmonization_builder_adapter_sha256.stdout | trim | length) > 0)
+             | ternary('present', 'absent') }}
       no_log: true
 
     - name: Stamp release-derived paths and provenance into worker environment
@@ -585,7 +747,9 @@
         - { key: MELD7T_MELD_DATA, value: "{{ meld_data_dir }}" }
         - { key: MELD7T_DICOM_STAGING, value: "{{ dicom_staging_dir }}" }
         - { key: MELD7T_DICOM_IMPORT_ROOT, value: "{{ dicom_import_root }}" }
+        - { key: MELD7T_CASE_UPLOAD_ROOT, value: "{{ case_upload_dir }}" }
         - { key: MELD7T_HARMONIZATION_ROOT, value: "{{ harmonization_root }}" }
+        - { key: MELD7T_HARMONIZATION_GENERATED_ROOT, value: "{{ harmonization_profile_dir }}" }
         - { key: MELD7T_FS_LICENSE, value: "{{ svc_config_dir }}/licenses/freesurfer.txt" }
         - { key: MELD7T_MELD_LICENSE, value: "{{ svc_config_dir }}/licenses/meld.txt" }
         - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
@@ -596,11 +760,36 @@
         - { key: MELD7T_IMMUDB_PUBLIC_KEY_PATH, value: "{{ svc_config_dir }}/trust/immudb-signing-public.pem" }
       no_log: true
 
-    - name: Stamp release provenance into runtime images environment
+    - name: Map the optional API report logo to the installed host worker path
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/worker.env"
+        regexp: '^MELD7T_BRANDING_LOGO_PATH='
+        line: "MELD7T_BRANDING_LOGO_PATH={{ svc_config_dir }}/branding/report-logo.png"
+        state: >-
+          {{ ((report_branding_logo_setting.stdout | trim)
+              == '/run/branding/report-logo.png') | ternary('present', 'absent') }}
+      no_log: true
+
+    - name: Stamp isolated harmonization builder paths
+      ansible.builtin.lineinfile:
+        path: "{{ svc_config_dir }}/env/harmonization-builder.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: MELD7T_HARMONIZATION_UPLOAD_ROOT, value: "{{ harmonization_upload_dir }}" }
+        - { key: MELD7T_HARMONIZATION_BUILD_ROOT, value: "{{ harmonization_build_dir }}" }
+        - { key: MELD7T_HARMONIZATION_GENERATED_ROOT, value: "{{ harmonization_profile_dir }}" }
+        - { key: MELD7T_IMMUDB_ROOT_STATE_PATH, value: "{{ state_root }}/audit/harmonization-builder.root" }
+      no_log: true
+
+    - name: Stamp release provenance and harmonization authorization into runtime environment
       ansible.builtin.lineinfile:
         path: "{{ svc_config_dir }}/env/runtime-images.env"
-        regexp: '^MELD7T_RELEASE_MANIFEST_DIGEST='
-        line: "MELD7T_RELEASE_MANIFEST_DIGEST={{ release_manifest_digest }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: MELD7T_RELEASE_MANIFEST_DIGEST, value: "{{ release_manifest_digest }}" }
+        - { key: MELD7T_HARMONIZATION_COHORT_BOOTSTRAP_ALLOWED, value: "{{ harmonization_cohort_bootstrap_allowed }}" }
 
     - name: Install private configs, TLS, and licenses
       ansible.builtin.copy:
@@ -615,7 +804,6 @@
         - { src: "{{ production_secret_dir }}/meld.txt", dest: "{{ svc_config_dir }}/licenses/meld.txt", mode: "0600" }
         - { src: "{{ production_secret_dir }}/caddy-users.caddy", dest: "{{ svc_config_dir }}/caddy/auth/users.caddy", mode: "0600" }
         - { src: "{{ production_secret_dir }}/caddy-roles.caddy", dest: "{{ svc_config_dir }}/caddy/auth/roles.caddy", mode: "0600" }
-        - { src: "{{ production_secret_dir }}/caddy-dicom-access.caddy", dest: "{{ svc_config_dir }}/caddy/auth/dicom-access.caddy", mode: "0600" }
         - { src: "{{ production_secret_dir }}/identity-approval.txt", dest: "{{ svc_config_dir }}/caddy/auth/identity-approval.txt", mode: "0600" }
         - { src: "{{ production_secret_dir }}/immudb-signing-public.pem", dest: "{{ svc_config_dir }}/trust/immudb-signing-public.pem", mode: "0644" }
         - { src: "{{ production_secret_dir }}/backup-signing-public.pem", dest: "{{ svc_config_dir }}/trust/backup-signing-public.pem", mode: "0600" }
@@ -630,7 +818,9 @@
       loop:
         - { src: "{{ repo_dir }}/containers/config/caddy/Caddyfile", dest: "{{ svc_config_dir }}/caddy/Caddyfile", mode: "0644" }
         - { src: "{{ repo_dir }}/containers/config/orthanc/orthanc.json", dest: "{{ svc_config_dir }}/orthanc/orthanc.json", mode: "0644" }
+        - { src: "{{ repo_dir }}/containers/config/orthanc/harmonization.json", dest: "{{ svc_config_dir }}/harmonization-orthanc/orthanc.json", mode: "0644" }
         - { src: "{{ repo_dir }}/containers/config/postgres/init-databases.sh", dest: "{{ svc_config_dir }}/postgres/init-databases.sh", mode: "0755" }
+        - { src: "{{ repo_dir }}/containers/config/postgres/init-harmonization-database.sh", dest: "{{ svc_config_dir }}/harmonization-postgres/init-database.sh", mode: "0755" }
         - { src: "{{ repo_dir }}/containers/config/ohif/app-config.js", dest: "{{ svc_config_dir }}/ohif/app-config.js", mode: "0644" }
 
     - name: Validate secret relationships, TLS, paths, and locked worker images
@@ -640,6 +830,7 @@
           - "{{ repo_dir }}/ops/deployment/validate-production-config.py"
           - "{{ svc_config_dir }}"
           - "{{ release_image_lock }}"
+          - "{{ release_receipt_dir }}/release.env"
       changed_when: false
       no_log: true
 
@@ -664,6 +855,7 @@
       ansible.builtin.shell: |
         set -euo pipefail
         root={{ (repo_dir + '/harmonization') | quote }}
+        bootstrap={{ harmonization_cohort_bootstrap_allowed | quote }}
         count=0
         if [[ -d "$root/profiles" ]]; then
           while IFS= read -r -d '' profile; do
@@ -675,7 +867,9 @@
             ((count += 1))
           done < <(find "$root/profiles" -maxdepth 1 -type f -name '*.json' -print0 | sort -z)
         fi
-        ((count > 0)) || { echo "production requires at least one approved profile" >&2; exit 1; }
+        python3 {{ (repo_dir + '/ops/release/harmonization_release_policy.py') | quote }} \
+          --inventory "$root/expected-active-profiles.json" \
+          --profile-count "$count" --bootstrap-allowed "$bootstrap"
         python3 {{ (repo_dir + '/ops/harmonization/manage.py') | quote }} \
           verify-expected-inventory \
           --inventory "$root/expected-active-profiles.json" --profiles "$root/profiles"
@@ -733,6 +927,16 @@
       args:
         creates: "{{ worker_venv_dir }}/.meld7t-requirements.sha256"
 
+    - name: Prove the configured report logo is fully renderable with pinned Pillow
+      ansible.builtin.command:
+        argv:
+          - "{{ worker_venv_dir }}/bin/python"
+          - "{{ repo_dir }}/ops/deployment/verify-report-logo.py"
+          - "{{ svc_config_dir }}/branding/report-logo.png"
+      changed_when: false
+      when: >-
+        (report_branding_logo_setting.stdout | trim) == '/run/branding/report-logo.png'
+
     - name: Render digest-only Quadlets into the release-scoped staging directory
       ansible.builtin.command:
         argv:
@@ -747,6 +951,12 @@
       ansible.builtin.copy:
         src: "{{ repo_dir }}/platform/worker/meld7t-worker.service"
         dest: "{{ svc_config_dir }}/systemd/meld7t-worker.service"
+        mode: "0644"
+
+    - name: Stage isolated harmonization builder service
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/ops/deployment/systemd/meld7t-harmonization-builder.service"
+        dest: "{{ svc_config_dir }}/systemd/meld7t-harmonization-builder.service"
         mode: "0644"
 
     - name: Stage local monitoring service and timer

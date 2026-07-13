@@ -14,6 +14,13 @@ Volume=orthanc-storage.volume:/var/lib/orthanc/db
 Volume=%h/.config/meld7t/current/orthanc/orthanc.json:/etc/orthanc/orthanc.json:ro,z
 PublishPort=127.0.0.1:8042:8042
 EnvironmentFile=%h/.config/meld7t/current/env/orthanc.env
+HealthCmd=python3 -c 'import base64,json,os,urllib.request; u=json.loads(os.environ["ORTHANC__REGISTERED_USERS"]); r=urllib.request.Request("http://127.0.0.1:8042/system",headers={"Authorization":"Basic "+base64.b64encode(("meld-internal:"+u["meld-internal"]).encode()).decode()}); urllib.request.urlopen(r,timeout=3).read()'
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=60s
+HealthRetries=5
+HealthOnFailure=kill
+Notify=healthy
 NoNewPrivileges=true
 PidsLimit=1024
 LogDriver=journald

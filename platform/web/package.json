@@ -1,21 +1,28 @@
 {
   "name": "meld7t-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "MELD 7T platform SPA shell — submit/series/recipe/dashboard/review/MDT (spec §9)",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@noble/hashes": "2.2.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-router-dom": "6.30.4"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
     "@vitejs/plugin-react": "4.3.4",
+    "jsdom": "29.1.1",
+    "vitest": "4.1.10",
     "vite": "6.4.3"
   }
 }

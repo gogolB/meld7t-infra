@@ -1,0 +1,46 @@
+[Unit]
+Description=Orthanc — isolated harmonization control-cohort store
+Wants=harmonization-postgres.service
+After=network-online.target harmonization-postgres.service
+
+[Container]
+# install-quadlets.sh resolves this service through the signed orthanc image-lock role.
+Image=docker.io/orthancteam/orthanc@sha256:57a3d037729897331027ddc00c12695b50f1effbbf805f855396f3d0248d2d5f
+Pull=never
+ContainerName=harmonization-orthanc
+Network=meld-harmonization.network
+Network=meld-harmonization-db.network
+Volume=harmonization-orthanc-storage.volume:/var/lib/orthanc/db
+Volume=%h/.config/meld7t/current/harmonization-orthanc/orthanc.json:/etc/orthanc/orthanc.json:ro,z
+# Loopback is for the host builder only. Browser users and Caddy have no route to this service.
+PublishPort=127.0.0.1:8043:8042
+# Local storescu/filesystem-import tooling can use this without exposing unauthenticated DICOM on
+# the hospital LAN. A site-approved remote sender needs a reviewed firewall-scoped Quadlet drop-in.
+PublishPort=127.0.0.1:4243:4242
+EnvironmentFile=%h/.config/meld7t/current/env/harmonization-orthanc.env
+HealthCmd=python3 -c 'import base64,json,os,urllib.request; u=json.loads(os.environ["ORTHANC__REGISTERED_USERS"]); r=urllib.request.Request("http://127.0.0.1:8042/system",headers={"Authorization":"Basic "+base64.b64encode(("harmonization-builder:"+u["harmonization-builder"]).encode()).decode()}); urllib.request.urlopen(r,timeout=3).read()'
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=60s
+HealthRetries=5
+HealthOnFailure=kill
+Notify=healthy
+NoNewPrivileges=true
+PidsLimit=1024
+LogDriver=journald
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=120
+StartLimitIntervalSec=600
+StartLimitBurst=10
+MemoryHigh=2G
+MemoryMax=4G
+TasksMax=1536
+CPUWeight=75
+IOWeight=200
+
+[Install]
+WantedBy=default.target

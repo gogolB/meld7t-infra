@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import os
-import json
-import re
 import shlex
 import shutil
 from pathlib import Path
@@ -84,7 +82,10 @@ class MeldRunner(DetectorRunner):
                               *frames]}
 
     async def package(self, subject: str, pseudonym: str, workdir: str,
-                      uid_seed: str, expected_clusters: int | None = None) -> dict:
+                      uid_seed: str, study_uid_seed: str,
+                      expected_clusters: int | None = None,
+                      validated_ingest: DetectorCompletion | None = None,
+                      harmonization: ResolvedHarmonization | None = None) -> dict:
         prediction = os.path.join(wsettings.meld_data, "output", "predictions_reports", subject,
                                   "predictions", "prediction.nii.gz")
         if not os.path.isfile(prediction) or os.path.getsize(prediction) == 0:
@@ -92,17 +93,18 @@ class MeldRunner(DetectorRunner):
         if expected_clusters is None:
             raise CompletionValidationError("MELD packaging requires the validated cluster count")
         rc, uids = await pipeline.run_package(
-            subject, pseudonym, workdir, uid_seed, expected_clusters)
+            subject, pseudonym, workdir, uid_seed, study_uid_seed, expected_clusters,
+            harmonization)
         if rc != 0:
             raise CompletionValidationError(f"DICOM packaging/STOW failed with rc={rc}")
         return uids
 
     def validate_completion(self, ingested: dict, uids: dict) -> DetectorCompletion:
         completed = super().validate_completion(ingested, uids)
-        for key in self.required_uid_keys:
-            value = completed.uids[key]
-            if len(value) > 64 or re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", value) is None:
-                raise CompletionValidationError(f"packaging returned invalid DICOM UID for {key}")
+        roles = {item["role"] for item in completed.uids[
+            "derived_series_manifest"]["series"]}
+        if roles != {"meld_native_t1_reference", "meld_fcd_segmentation"}:
+            raise CompletionValidationError("MELD derived-series roles are incomplete")
         try:
             slices = int(completed.uids.get("n_t1_slices", "0"))
             sop_count = int(completed.uids.get("dicom_sop_count", "0"))
@@ -110,24 +112,6 @@ class MeldRunner(DetectorRunner):
                 raise ValueError
         except ValueError as exc:
             raise CompletionValidationError("packaging returned an invalid SOP count") from exc
-        manifest_hash = completed.uids.get("dicom_manifest_sha256", "")
-        if re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None:
-            raise CompletionValidationError("packaging returned an invalid DICOM manifest hash")
-        manifest_relative = completed.uids.get("dicom_manifest_path", "")
-        if (not manifest_relative or os.path.isabs(manifest_relative)
-                or ".." in Path(manifest_relative).parts):
-            raise CompletionValidationError("packaging returned an invalid DICOM manifest path")
-        manifest_path = Path(wsettings.meld_data, manifest_relative)
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            raise CompletionValidationError("DICOM per-SOP manifest is missing/invalid") from exc
-        files = manifest.get("files")
-        if (manifest.get("schema_version") != 1 or manifest.get("manifest_sha256") != manifest_hash
-                or manifest.get("study_instance_uid") != completed.uids["study_uid"]
-                or manifest.get("sop_count") != sop_count or not isinstance(files, list)
-                or len(files) != sop_count):
-            raise CompletionValidationError("DICOM per-SOP manifest contract is inconsistent")
         report = completed.result.get("report_path")
         if not isinstance(report, str) or os.path.isabs(report) or ".." in report.split(os.sep):
             raise CompletionValidationError("MELD report_path must be a safe relative path")
@@ -137,5 +121,5 @@ class MeldRunner(DetectorRunner):
             raise CompletionValidationError("MELD report_path escapes data root or is missing")
         return DetectorCompletion(
             completed.result, completed.clusters, completed.uids,
-            (*completed.artifacts, manifest_relative),
+            completed.artifacts,
         )

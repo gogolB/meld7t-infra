@@ -11,11 +11,11 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 from starlette.requests import Request
 
-from app import audit, auth
+from app import audit, auth, harmonization_routes
 from app.config import LocalAuthToken, Settings
 from app.models import AuditRecord, OutboxEvent, OutboxStatus
 from app.models import Case
-from app.routes import _authorize_case
+from app.routes import _authorize_case, _case_public
 
 
 LONG_USER_TOKEN = "user-token-" + "a" * 48
@@ -27,6 +27,7 @@ SERVER_AUDIT_HMAC_KEY = SecretStr("h" * 40)
 SERVER_IMMUDB_STATE = "/var/lib/meld7t-audit/root.state"
 SERVER_IMMUDB_PUBLIC_KEY = "/run/meld7t/immudb-signing-public.pem"
 SERVER_RELEASE_DIGEST = "a" * 64
+SERVER_HARMONIZATION_ORTHANC_PASSWORD = SecretStr("o" * 40)
 
 
 def _settings(**overrides) -> Settings:
@@ -40,6 +41,7 @@ def _settings(**overrides) -> Settings:
         "audit_hmac_key": SERVER_AUDIT_HMAC_KEY,
         "audit_require_immudb": False,  # documented research degraded-mode override
         "release_manifest_digest": SERVER_RELEASE_DIGEST,
+        "harmonization_orthanc_password": SERVER_HARMONIZATION_ORTHANC_PASSWORD,
         "auth_local_tokens": [_user_credential()],
         **overrides,
     }
@@ -99,18 +101,26 @@ def test_service_intake_can_be_assigned_to_named_submitter():
         auth_method="bearer_token", request_id="assigned-test",
     )
     _authorize_case(assigned, case, mutate=True)
+    assert _case_public(case, assigned)["permissions"] == {"can_mutate": True}
     unassigned = auth.Principal(
         subject="someone-else@example.test", roles=frozenset({auth.Role.submitter}),
         auth_method="bearer_token", request_id="unassigned-test",
     )
     with pytest.raises(HTTPException, match="case access denied"):
         _authorize_case(unassigned, case, mutate=True)
+    assert _case_public(case, unassigned)["permissions"] == {"can_mutate": False}
     intake = auth.Principal(
         subject="different-intake", roles=frozenset({auth.Role.service}),
         auth_method="service_token", request_id="intake-test", service=True,
     )
+    # Every authenticated institutional identity may review; ownership still fences mutations.
+    _authorize_case(intake, case)
+    harmonization_routes._case_access(intake, case)
+    assert _case_public(case, intake)["permissions"] == {"can_mutate": False}
     with pytest.raises(HTTPException, match="case access denied"):
-        _authorize_case(intake, case)
+        _authorize_case(intake, case, mutate=True)
+    with pytest.raises(HTTPException, match="case access denied"):
+        harmonization_routes._case_access(intake, case, mutate=True)
 
 
 def test_bearer_and_service_tokens_create_typed_principals(monkeypatch):
@@ -185,6 +195,17 @@ def test_development_bypass_must_be_deliberate(monkeypatch):
     assert research.harmonization_root == "/data/harmonization"
 
 
+def test_bootstrap_authorization_requires_empty_expected_inventory():
+    with pytest.raises(ValidationError, match="requires an empty"):
+        _settings(
+            harmonization_cohort_bootstrap_allowed=True,
+            harmonization_expected_profiles=[{
+                "code": "HSITE", "version": 1, "detector_id": "meld_fcd",
+                "document_sha256": "f" * 64,
+            }],
+        )
+
+
 def test_production_rejects_placeholder_secrets_and_missing_identity():
     with pytest.raises(ValidationError, match="db_url"):
         Settings(
@@ -240,6 +261,7 @@ def test_production_rejects_placeholder_secrets_and_missing_identity():
             db_url=SERVER_DB,
             redis_url=SERVER_REDIS,
             immudb_password=SERVER_IMMUDB_PASSWORD,
+            harmonization_orthanc_password=SERVER_HARMONIZATION_ORTHANC_PASSWORD,
             audit_hmac_key=SERVER_AUDIT_HMAC_KEY,
             audit_require_immudb=True,
         )
@@ -251,6 +273,7 @@ def test_production_rejects_placeholder_secrets_and_missing_identity():
         db_url=SERVER_DB,
         redis_url=SERVER_REDIS,
         immudb_password=SERVER_IMMUDB_PASSWORD,
+        harmonization_orthanc_password=SERVER_HARMONIZATION_ORTHANC_PASSWORD,
         audit_hmac_key=SERVER_AUDIT_HMAC_KEY,
         audit_require_immudb=True,
         immudb_root_state_path=SERVER_IMMUDB_STATE,
@@ -268,6 +291,7 @@ def test_production_rejects_placeholder_secrets_and_missing_identity():
             db_url=SERVER_DB,
             redis_url=SERVER_REDIS,
             immudb_password=SERVER_IMMUDB_PASSWORD,
+            harmonization_orthanc_password=SERVER_HARMONIZATION_ORTHANC_PASSWORD,
             audit_hmac_key=SERVER_AUDIT_HMAC_KEY,
             audit_require_immudb=False,
             immudb_root_state_path=SERVER_IMMUDB_STATE,
@@ -299,12 +323,54 @@ def test_server_defaults_require_harmonization_and_immudb(monkeypatch):
         db_url=SERVER_DB,
         redis_url=SERVER_REDIS,
         immudb_password=SERVER_IMMUDB_PASSWORD,
+        harmonization_orthanc_password=SERVER_HARMONIZATION_ORTHANC_PASSWORD,
         audit_hmac_key=SERVER_AUDIT_HMAC_KEY,
         release_manifest_digest=SERVER_RELEASE_DIGEST,
         auth_local_tokens=[_user_credential()],
     )
     assert configured.audit_require_immudb is True
     assert configured.harmonization_required is True
+
+
+def test_normal_production_worker_does_not_need_cohort_store_credential():
+    # The normal worker imports app.config for shared queue/audit contracts but is deliberately
+    # denied the separate harmonization Orthanc secret.
+    configured = Settings(
+        _env_file=None,
+        deployment_mode="production",
+        auth_dev_bypass=False,
+        db_url=SERVER_DB,
+        redis_url=SERVER_REDIS,
+        immudb_password=SERVER_IMMUDB_PASSWORD,
+        audit_hmac_key=SERVER_AUDIT_HMAC_KEY,
+        audit_require_immudb=True,
+        immudb_root_state_path=SERVER_IMMUDB_STATE,
+        immudb_public_key_path=SERVER_IMMUDB_PUBLIC_KEY,
+        release_manifest_digest=SERVER_RELEASE_DIGEST,
+        harmonization_required=True,
+        auth_local_tokens=[_service_credential()],
+    )
+    assert configured.harmonization_required is True
+    assert "harmonization_orthanc_password" not in configured.model_fields_set
+    with pytest.raises(ValueError, match="API harmonization Orthanc password"):
+        configured.require_harmonization_orthanc_credentials()
+
+    with pytest.raises(ValidationError, match="harmonization Orthanc password"):
+        Settings(
+            _env_file=None,
+            deployment_mode="production",
+            auth_dev_bypass=False,
+            db_url=SERVER_DB,
+            redis_url=SERVER_REDIS,
+            immudb_password=SERVER_IMMUDB_PASSWORD,
+            harmonization_orthanc_password=SecretStr("change-me"),
+            audit_hmac_key=SERVER_AUDIT_HMAC_KEY,
+            audit_require_immudb=True,
+            immudb_root_state_path=SERVER_IMMUDB_STATE,
+            immudb_public_key_path=SERVER_IMMUDB_PUBLIC_KEY,
+            release_manifest_digest=SERVER_RELEASE_DIGEST,
+            auth_local_tokens=[_service_credential()],
+        )
 
 
 @pytest.fixture

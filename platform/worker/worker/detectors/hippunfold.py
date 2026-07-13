@@ -13,16 +13,18 @@ from typing import Optional
 
 from app.models import RunStatus
 
+from .. import pipeline
 from ..config import wsettings
 from ..harmonization import ResolvedHarmonization
 from ..process import run_process
-from .base import CompletionValidationError, DetectorRunner, run_cmd
+from .base import CompletionValidationError, DetectorCompletion, DetectorRunner, run_cmd
 
 
 class HippUnfoldRunner(DetectorRunner):
     detector_id = "hippunfold"
     needs_t2 = True                 # segment on the high-res T2 SPACE
     uses_gpu = False                # CPU-only nnU-Net (bundled torch lacks sm_86) — no GPU mutex
+    required_uid_keys = ("study_uid", "t1_series_uid", "seg_series_uid")
 
     async def compute(self, subject: str, workdir: str,
                       harmonization: ResolvedHarmonization | None = None
@@ -113,7 +115,7 @@ class HippUnfoldRunner(DetectorRunner):
         detector_summary = {
             key: summary[key] for key in (
                 "volumes_mm3", "subfields_mm3", "dseg_space", "asymmetry_index_pct", "flagged",
-                "ai_threshold_pct",
+                "ai_threshold_pct", "dseg_sources",
             ) if key in summary
         }
         return {"result": {"report_path": None, "n_clusters": len(clusters),
@@ -124,3 +126,54 @@ class HippUnfoldRunner(DetectorRunner):
                                "comparable_across_detectors": False,
                            }},
                 "clusters": clusters, "artifacts": sources}
+
+    async def package(self, subject: str, pseudonym: str, workdir: str,
+                      uid_seed: str, study_uid_seed: str,
+                      expected_clusters: int | None = None,
+                      validated_ingest: DetectorCompletion | None = None,
+                      harmonization: ResolvedHarmonization | None = None) -> dict:
+        if expected_clusters is None or validated_ingest is None:
+            raise CompletionValidationError(
+                "HippUnfold packaging requires validated subfields and finding count")
+        summary = validated_ingest.result.get("detector_summary")
+        sources = summary.get("dseg_sources") if isinstance(summary, dict) else None
+        if not isinstance(sources, dict) or set(sources) != {"L", "R"}:
+            raise CompletionValidationError("HippUnfold packaging lacks bilateral dseg sources")
+        relative = {}
+        root = os.path.join("output", "hippunfold-runs", subject)
+        for hemi, path in sources.items():
+            if (not isinstance(path, str) or not path or os.path.isabs(path)
+                    or ".." in path.split(os.sep)):
+                raise CompletionValidationError("HippUnfold dseg source path is unsafe")
+            relative[hemi] = os.path.join(root, path)
+        flagged = bool(summary.get("flagged"))
+        if flagged:
+            if len(validated_ingest.clusters) != 1 or validated_ingest.clusters[0].get(
+                    "hemi") not in {"left", "right"}:
+                raise CompletionValidationError("HippUnfold flagged side is inconsistent")
+            flagged_side = validated_ingest.clusters[0]["hemi"]
+        else:
+            flagged_side = "none"
+        rc, uids = await pipeline.run_hippunfold_package(
+            subject, pseudonym, workdir, uid_seed, study_uid_seed, expected_clusters,
+            relative["L"], relative["R"], flagged_side, harmonization,
+        )
+        if rc != 0:
+            raise CompletionValidationError(
+                f"HippUnfold DICOM packaging/STOW failed with rc={rc}")
+        return uids
+
+    def validate_completion(self, ingested: dict, uids: dict) -> DetectorCompletion:
+        completed = super().validate_completion(ingested, uids)
+        roles = {item["role"] for item in completed.uids[
+            "derived_series_manifest"]["series"]}
+        try:
+            slices = int(completed.uids.get("n_t1_slices", "0"))
+            sop_count = int(completed.uids.get("dicom_sop_count", "0"))
+            if (roles != {"hs_native_t2_reference", "hs_subfields_and_atrophy_segmentation"}
+                    or slices < 1 or sop_count != slices + 1):
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise CompletionValidationError(
+                "HippUnfold derived DICOM series contract is incomplete") from exc
+        return completed

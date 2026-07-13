@@ -33,6 +33,9 @@ from app.routes import (  # noqa: E402
 
 
 def setup_module(_m):
+    # Other API modules may have used the shared test engine before this workflow module resets
+    # its database. Dispose pooled SQLite handles before unlinking the file.
+    engine.dispose()
     if os.path.exists("test_meld.db"):
         os.remove("test_meld.db")
     SQLModel.metadata.create_all(engine)

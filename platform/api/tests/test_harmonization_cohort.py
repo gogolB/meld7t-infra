@@ -121,6 +121,18 @@ def test_expected_inventory_binds_exact_profile_document(tmp_path):
     }]
 
 
+def test_empty_expected_inventory_requires_explicit_bootstrap_flag(tmp_path):
+    blocked = tmp_path / "blocked.json"
+    with pytest.raises(ValueError, match="at least one"):
+        manage.build_expected_inventory(SimpleNamespace(
+            profile=None, output=blocked, allow_empty_bootstrap=False))
+    allowed = tmp_path / "bootstrap.json"
+    assert manage.build_expected_inventory(SimpleNamespace(
+        profile=None, output=allowed, allow_empty_bootstrap=True)) == 0
+    assert json.loads(allowed.read_text()) == []
+    assert manage._read_inventory(allowed) == []
+
+
 def test_profile_build_images_must_equal_release_image_lock(tmp_path):
     meld = "example/meld@sha256:" + "a" * 64
     profile = tmp_path / "profile.json"

@@ -23,7 +23,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for volume in orthanc-storage immudb-data api-immudb-state redis-data caddy-data hippunfold-cache; do
+volumes=(orthanc-storage immudb-data api-immudb-state redis-data caddy-data hippunfold-cache)
+[[ -f $backup/harmonization-orthanc-storage.tar.cms ]] \
+  && volumes+=(harmonization-orthanc-storage)
+for volume in "${volumes[@]}"; do
   target="$prefix-$volume"
   if podman volume exists "$target"; then
     printf 'refusing to replace existing drill volume: %s\n' "$target" >&2

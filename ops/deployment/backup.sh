@@ -10,16 +10,22 @@ release_source=${4:-$HOME/.local/lib/meld7t/current}
 config_root=${MELD7T_CONFIG_ROOT:-$HOME/.config/meld7t/current}
 meld_data=${MELD7T_MELD_DATA:-$HOME/meld7t-state/meld-data}
 audit_state=${MELD7T_AUDIT_STATE:-$HOME/meld7t-state/audit}
+harmonization_uploads=${MELD7T_HARMONIZATION_UPLOAD_ROOT:-$HOME/meld7t-state/harmonization-uploads}
+harmonization_builds=${MELD7T_HARMONIZATION_BUILD_ROOT:-$HOME/meld7t-state/harmonization-builds}
+harmonization_profiles=${MELD7T_HARMONIZATION_GENERATED_ROOT:-$HOME/meld7t-state/harmonization-profiles}
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 dest="$dest_parent/meld7t-backup-$timestamp"
-readonly -a quiesce_units=(caddy.service api.service meld7t-worker.service orthanc.service redis.service immudb.service)
+readonly -a quiesce_units=(caddy.service api.service meld7t-worker.service \
+  meld7t-harmonization-builder.service orthanc.service harmonization-orthanc.service \
+  redis.service immudb.service)
 declare -a restart_units=()
 
 die() { printf 'backup: %s\n' "$*" >&2; exit 1; }
 for file in "$recipient_cert" "$signing_key"; do [[ -f $file ]] || die "missing key material: $file"; done
 config_real=$(readlink -f "$config_root" 2>/dev/null || true)
-[[ -d $config_real && -d $meld_data && -d $audit_state ]] \
-  || die "config, MELD data, or audit state directory is absent"
+[[ -d $config_real && -d $meld_data && -d $audit_state && -d $harmonization_uploads \
+   && -d $harmonization_builds && -d $harmonization_profiles ]] \
+  || die "config, MELD data, audit, or harmonization state directory is absent"
 [[ ! -e $dest ]] || die "backup destination already exists: $dest"
 mkdir -p "$dest"
 
@@ -34,8 +40,11 @@ for unit in "${quiesce_units[@]}"; do
   if systemctl --user is-active --quiet "$unit"; then restart_units+=("$unit"); fi
 done
 if ((${#restart_units[@]})); then systemctl --user stop "${restart_units[@]}"; fi
-systemctl --user start postgres.service
-systemctl --user is-active --quiet postgres.service || die "Postgres did not become ready"
+systemctl --user start postgres.service harmonization-postgres.service
+systemctl --user is-active --quiet postgres.service \
+  || die "application Postgres did not become ready"
+systemctl --user is-active --quiet harmonization-postgres.service \
+  || die "harmonization Postgres did not become ready"
 
 encrypt() {
   local output=$1
@@ -49,8 +58,13 @@ podman exec postgres pg_dump --format=custom --compress=9 --no-owner -U postgres
   | encrypt meld.pgdump.cms
 podman exec postgres pg_dump --format=custom --compress=9 --no-owner -U postgres -d orthanc \
   | encrypt orthanc-index.pgdump.cms
+podman exec harmonization-postgres pg_dumpall --globals-only --no-role-passwords -U postgres \
+  | encrypt harmonization-postgres-globals.sql.cms
+podman exec harmonization-postgres pg_dump --format=custom --compress=9 --no-owner \
+  -U postgres -d harmonization_orthanc | encrypt harmonization-orthanc-index.pgdump.cms
 
-for volume in orthanc-storage immudb-data api-immudb-state redis-data caddy-data hippunfold-cache; do
+for volume in orthanc-storage harmonization-orthanc-storage immudb-data api-immudb-state \
+  redis-data caddy-data hippunfold-cache; do
   podman volume exists "$volume" || die "required volume is absent: $volume"
   podman volume export "$volume" | encrypt "$volume.tar.cms"
 done
@@ -58,6 +72,11 @@ tar -C "$(dirname "$meld_data")" --one-file-system -cf - "$(basename "$meld_data
   | encrypt meld-data.tar.cms
 tar -C "$(dirname "$audit_state")" --one-file-system -cf - "$(basename "$audit_state")" \
   | encrypt audit-state.tar.cms
+tar --one-file-system -cf - \
+  -C "$(dirname "$harmonization_uploads")" "$(basename "$harmonization_uploads")" \
+  -C "$(dirname "$harmonization_builds")" "$(basename "$harmonization_builds")" \
+  -C "$(dirname "$harmonization_profiles")" "$(basename "$harmonization_profiles")" \
+  | encrypt harmonization-state.tar.cms
 tar -C "$(dirname "$config_real")" --one-file-system -cf - "$(basename "$config_real")" \
   | encrypt configuration.tar.cms
 
@@ -67,7 +86,7 @@ release_target=$(readlink -f "$release_source" 2>/dev/null || printf unknown)
 cp "$release_target/release-receipt/images.lock" "$dest/images.lock"
 recipient_sha256=$(openssl x509 -in "$recipient_cert" -outform DER | sha256sum | awk '{print $1}')
 cat >"$dest/backup.env" <<EOF
-MELD7T_BACKUP_FORMAT=2
+MELD7T_BACKUP_FORMAT=3
 MELD7T_BACKUP_TIMESTAMP=$timestamp
 MELD7T_BACKUP_HOST=$(hostname -f 2>/dev/null || hostname)
 MELD7T_BACKUP_RELEASE=$release_target

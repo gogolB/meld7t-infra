@@ -160,6 +160,22 @@ services-logs unit="caddy":
 
 # --- Signed offline production release + disaster recovery ---
 
+# Validate one stable SemVer against API, worker, web, and lock metadata and scan tracked paths
+# that would enter the public source archive.
+developer-release-check version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="{{version}}"
+    if [[ -z "$version" ]]; then
+      version=$({{repo}}/ops/release/developer_release.py current-version)
+    fi
+    {{repo}}/ops/release/developer_release.py check --version "$version" --tracked
+
+# Build the research developer source/Python/web package set from a clean committed revision.
+# This is intentionally not the complete signed air-gap production bundle.
+developer-release-kit version output:
+    {{repo}}/ops/release/build-github-release.sh {{version}} {{output}}
+
 # Validate the machine-readable image lock (blocks on REQUIRED_* placeholders).
 release-lock-check scope="runtime":
     {{repo}}/ops/release/image-lock.sh validate {{scope}}

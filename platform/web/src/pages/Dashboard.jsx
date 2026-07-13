@@ -36,7 +36,8 @@ export default function Dashboard() {
             <tbody>
               {q.data.active.map((r) => (
                 <tr key={r.run_id}>
-                  <td className="detector">{r.detector}</td>
+                  <td className="detector">{r.detector}{r.warnings?.length > 0 && <div>
+                    <span className="badge b-unharmonized">unharmonized</span></div>}</td>
                   <td>{r.source_role || "–"}</td>
                   <td><Badge status={r.status} /></td>
                   <td className="muted">{r.run_id.slice(0, 8)}

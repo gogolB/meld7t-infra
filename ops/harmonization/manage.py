@@ -213,7 +213,7 @@ def build_expected_inventory(args: argparse.Namespace) -> int:
         raise ValueError("expected-profile inventory already exists; write a new release input")
     inventory = []
     seen_codes: set[str] = set()
-    for path in args.profile:
+    for path in args.profile or []:
         profile = _json(path)
         code = str(profile.get("code", ""))
         version = profile.get("version")
@@ -233,7 +233,7 @@ def build_expected_inventory(args: argparse.Namespace) -> int:
             "detector_id": detector,
             "document_sha256": profile_document_sha256(profile),
         })
-    if not inventory:
+    if not inventory and not getattr(args, "allow_empty_bootstrap", False):
         raise ValueError("expected-profile inventory needs at least one profile")
     inventory.sort(key=lambda item: (item["code"], item["version"]))
     _write_json(args.output, inventory)
@@ -243,8 +243,8 @@ def build_expected_inventory(args: argparse.Namespace) -> int:
 
 def _read_inventory(path: Path) -> list[dict[str, Any]]:
     value = json.loads(path.read_text())
-    if not isinstance(value, list) or not value:
-        raise ValueError("expected-profile inventory must be a non-empty JSON array")
+    if not isinstance(value, list):
+        raise ValueError("expected-profile inventory must be a JSON array")
     required = {"code", "version", "detector_id", "document_sha256"}
     seen_codes: set[str] = set()
     for item in value:
@@ -582,7 +582,28 @@ def verify(args: argparse.Namespace) -> int:
     profile = _json(args.profile)
     root = args.harmonization_root.resolve(strict=True)
     failures = []
-    files = profile.get("artifact_manifest", {}).get("files", [])
+    artifact_manifest = profile.get("artifact_manifest", {})
+    parameters = profile.get("parameters", {})
+    if not isinstance(parameters, dict):
+        parameters = {}
+    report = parameters.get("scientific_validation", {})
+    if not isinstance(artifact_manifest, dict):
+        artifact_manifest = {}
+    if not isinstance(report, dict):
+        report = {}
+    adapter_bound = profile.get("detector_id") == "meld_fcd" and (
+        parameters.get("storage_scope") == "generated"
+        or "builder_adapter_sha256" in parameters
+        or "builder_adapter_sha256" in artifact_manifest
+        or "builder_adapter_sha256" in report
+    )
+    if adapter_bound:
+        adapter_sha256 = parameters.get("builder_adapter_sha256")
+        if (re.fullmatch(r"[0-9a-f]{64}", str(adapter_sha256 or "")) is None
+                or artifact_manifest.get("builder_adapter_sha256") != adapter_sha256
+                or report.get("builder_adapter_sha256") != adapter_sha256):
+            failures.append("builder adapter SHA-256 binding is missing or inconsistent")
+    files = artifact_manifest.get("files", [])
     if not isinstance(files, list) or not files:
         print(json.dumps({"ok": False, "failures": ["profile has no artifacts"]}, indent=2))
         return 1
@@ -667,7 +688,11 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--harmonization-root", required=True, type=Path)
     check.set_defaults(func=verify)
     inventory = sub.add_parser("expected-inventory")
-    inventory.add_argument("--profile", required=True, action="append", type=Path)
+    inventory.add_argument("--profile", action="append", type=Path)
+    inventory.add_argument(
+        "--allow-empty-bootstrap", action="store_true",
+        help="sign an empty inventory for a gated first-site cohort bootstrap",
+    )
     inventory.add_argument("--output", required=True, type=Path)
     inventory.set_defaults(func=build_expected_inventory)
     inventory_check = sub.add_parser("verify-expected-inventory")

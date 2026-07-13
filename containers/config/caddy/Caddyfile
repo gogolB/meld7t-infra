@@ -7,8 +7,8 @@
 
 (authenticated) {
 	# Stock Caddy basic authentication is the closed-network adapter. The installed file must contain
-	# unique per-person institutional accounts before activation; the three-account example is only a
-	# bring-up fallback and is rejected by the production configuration validator.
+	# unique per-person institutional accounts before activation; shared accounts are rejected by the
+	# production configuration validator.
 	basic_auth {
 		import /etc/caddy/auth/users.caddy
 	}
@@ -16,10 +16,6 @@
 	map {http.auth.user.id} {meld_roles} {
 		import /etc/caddy/auth/roles.caddy
 	}
-	map {http.auth.user.id} {dicom_access} {
-		import /etc/caddy/auth/dicom-access.caddy
-	}
-
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
@@ -58,12 +54,11 @@ https://{$SITE_ADDRESS}:9443 {
 	handle @dicom_write {
 		respond "Browser DICOMweb is read-only" 405
 	}
-	@dicom_allowed {
+	@dicom_read {
 		path /dicom-web/*
 		method GET HEAD OPTIONS
-		expression {dicom_access} == "allow"
 	}
-	handle @dicom_allowed {
+	handle @dicom_read {
 		header {
 			Cache-Control "private, no-store, max-age=0"
 			Pragma "no-cache"
@@ -75,11 +70,15 @@ https://{$SITE_ADDRESS}:9443 {
 			header_up Authorization "Basic {$MELD7T_ORTHANC_BASIC_AUTH_B64}"
 		}
 	}
-	@dicom_forbidden path /dicom-web/*
-	handle @dicom_forbidden {
-		respond "DICOMweb requires reviewer or admin role" 403
-	}
 
+	# Deployment-owned white-label assets are mounted independently of the signed SPA release.
+	# Authentication is inherited from this site block and missing assets fail as 404s rather than
+	# falling through to the SPA shell.
+	handle_path /branding/* {
+		root * /srv/branding
+		header Cache-Control "private, no-store, max-age=0"
+		file_server
+	}
 	# Strip every caller-provided identity header and assert the Caddy-authenticated account.
 	handle /api/* {
 		reverse_proxy api:8000 {
@@ -121,29 +120,21 @@ https://{$SITE_ADDRESS}:9444 {
 		respond "Browser DICOMweb is read-only" 405
 	}
 
-	@viewer_allowed {
-		expression {dicom_access} == "allow"
+	@viewer_dicom_read {
+		path /dicom-web/*
+		method GET HEAD OPTIONS
 	}
-	handle @viewer_allowed {
-		@viewer_dicom_read {
-			path /dicom-web/*
-			method GET HEAD OPTIONS
-		}
-		handle @viewer_dicom_read {
-			reverse_proxy orthanc:8042 {
-				header_up -Authorization
-				header_up -Cookie
-				header_up Authorization "Basic {$MELD7T_ORTHANC_BASIC_AUTH_B64}"
-			}
-		}
-		handle {
-			reverse_proxy ohif:80 {
-				header_up -Authorization
-				header_up -Cookie
-			}
+	handle @viewer_dicom_read {
+		reverse_proxy orthanc:8042 {
+			header_up -Authorization
+			header_up -Cookie
+			header_up Authorization "Basic {$MELD7T_ORTHANC_BASIC_AUTH_B64}"
 		}
 	}
 	handle {
-		respond "OHIF requires reviewer or admin role" 403
+		reverse_proxy ohif:80 {
+			header_up -Authorization
+			header_up -Cookie
+		}
 	}
 }

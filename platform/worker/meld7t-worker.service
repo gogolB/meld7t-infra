@@ -32,6 +32,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 SystemCallArchitectures=native
 ReadWritePaths=%h/meld7t-state %h/.local/share/containers -%t/containers -%t/libpod -%t/netns
+ReadOnlyPaths=%h/meld7t-state/harmonization-profiles
 IPAddressDeny=any
 IPAddressAllow=localhost
 IPAddressAllow=10.89.30.0/24

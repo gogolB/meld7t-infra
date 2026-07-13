@@ -1,142 +1,273 @@
-import React, { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import React, { useEffect, useMemo, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api.js";
 import { Badge, useAsync, ErrorBox } from "../components.jsx";
 
-// OHIF runs on its own origin (dedicated viewer port); deep-link the packaged study.
 const VIEWER_PORT = import.meta.env.VITE_VIEWER_PORT || "9444";
 const viewerUrl = (studyUid) =>
-  `${window.location.protocol}//${window.location.hostname}:${VIEWER_PORT}/viewer?StudyInstanceUIDs=${studyUid}`;
+  `${window.location.protocol}//${window.location.hostname}:${VIEWER_PORT}` +
+  `/viewer?StudyInstanceUIDs=${encodeURIComponent(studyUid)}`;
+
+const detectorLabel = (value) => ({
+  meld_fcd: "MELD FCD",
+  map: "MAP",
+  hippunfold: "HippUnfold HS",
+}[value] || value || "Detector");
+
+function HarmonizationStatus({ run }) {
+  const harmonization = run?.harmonization;
+  if (!harmonization) return null;
+  if (harmonization.mode === "harmonized") {
+    const profile = harmonization.profile || {};
+    return <span className="ok-chip">Harmonized · {profile.code} v{profile.version}</span>;
+  }
+  if (harmonization.mode === "not_applicable") {
+    return <span className="pill">Harmonization not applicable</span>;
+  }
+  return <span className="badge b-unharmonized">Unharmonized</span>;
+}
+
+function AdjudicationPanel({ row, canReview, reload }) {
+  const run = row?.run;
+  const history = row?.adjudications || [];
+  const latest = history.length ? history[history.length - 1] : null;
+  const [form, setForm] = useState({ agree: true, confidence: 3, ground_truth: "", notes: "" });
+  const [correcting, setCorrecting] = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    setCorrecting(null); setSaved(false); setError(null);
+  }, [run?.id]);
+
+  if (!run) return null;
+  if (!row?.result) {
+    return <div className="panel muted">This processing-plan slot was not run, so there is no
+      detector result to adjudicate.</div>;
+  }
+  if (!["review_ready", "adjudicated"].includes(run.status)) {
+    return <div className="panel muted">Adjudication becomes available after a validated detector
+      result reaches review.</div>;
+  }
+  if (!canReview) {
+    return <div className="panel muted">Review history is visible to all authenticated users.
+      Recording an adjudication requires the reviewer role.</div>;
+  }
+
+  async function save(event) {
+    event.preventDefault(); setError(null);
+    try {
+      await api.adjudicate(run.id, {
+        ...form,
+        ...(correcting ? { supersedes: correcting } : {}),
+      });
+      setSaved(true); setCorrecting(null); reload();
+    } catch (err) { setError(err.message); }
+  }
+
+  return (
+    <form className="panel" onSubmit={save}>
+      <ErrorBox error={error} />
+      {saved && <div className="notice">Review recorded in the immutable audit trail.</div>}
+      {history.length > 0 && <p className="muted">{history.length} review record(s). Corrections
+        append a linked record and do not overwrite history.</p>}
+      <label>Assessment</label>
+      <select value={String(form.agree)} onChange={(event) => setForm({
+        ...form, agree: event.target.value === "true",
+      })}>
+        <option value="true">Agree with detector</option>
+        <option value="false">Disagree</option>
+      </select>
+      <label>Confidence (1–5)</label>
+      <input type="number" min="1" max="5" value={form.confidence}
+        onChange={(event) => setForm({ ...form, confidence: Number(event.target.value) })} />
+      <label>Ground-truth mark (optional)</label>
+      <input value={form.ground_truth}
+        onChange={(event) => setForm({ ...form, ground_truth: event.target.value })} />
+      <label>Notes</label>
+      <textarea rows="4" value={form.notes}
+        onChange={(event) => setForm({ ...form, notes: event.target.value })} />
+      <div className="button-row">
+        <button className="btn" disabled={saved || (latest && !correcting)}>
+          {correcting ? "Record correction" : "Record research review"}
+        </button>
+        {latest && !correcting && <button type="button" className="btn ghost"
+          onClick={() => { setCorrecting(latest.id); setSaved(false); }}>
+          Correct latest review
+        </button>}
+      </div>
+    </form>
+  );
+}
 
 export default function Review() {
-  const { runId } = useParams();
-  const r = useAsync(() => api.getRun(runId), [runId]);
+  const { id } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const review = useAsync(() => api.reviewStudy(id), [id], 15000);
   const me = useAsync(() => api.me(), []);
-  const [adj, setAdj] = useState({ agree: true, confidence: 3, ground_truth: "", notes: "" });
-  const [saved, setSaved] = useState(false);
-  const [correcting, setCorrecting] = useState(null);
-  const [err, setErr] = useState(null);
+  const data = review.data;
+  const requestedRun = searchParams.get("run");
+  const [studyUid, setStudyUid] = useState("");
+  const [runId, setRunId] = useState(requestedRun || "");
+  const [reportBusy, setReportBusy] = useState("");
+  const [reportError, setReportError] = useState(null);
 
-  const run = r.data?.run, result = r.data?.result, clusters = r.data?.clusters || [];
-  const metrics = result?.metric_schema || {};
-  const frames = r.data?.frames || [];
-  const adjudications = r.data?.adjudications || [];
-  const latestAdjudication = adjudications.length ? adjudications[adjudications.length - 1] : null;
-  // MELD's own MRI overlay (cluster drawn on the T1) + the inflated-surface view — the clearest look.
-  const overlayFrame = frames.find((f) => f.startsWith("mri_"));
-  const surfaceFrame = frames.find((f) => f.startsWith("inflatbrain"));
-
-  async function save(e) {
-    e.preventDefault(); setErr(null);
-    try {
-      await api.adjudicate(runId, { ...adj, ...(correcting ? { supersedes: correcting } : {}) });
-      setSaved(true); setCorrecting(null); r.reload();
+  useEffect(() => {
+    if (!studyUid && data?.viewer_studies?.length) {
+      setStudyUid(data.viewer_studies[0].study_uid);
     }
-    catch (e) { setErr(e.message); }
+    if (!runId && data?.runs?.length) setRunId(data.runs[0].run.id);
+  }, [data, studyUid, runId]);
+
+  const selected = useMemo(() => (data?.runs || []).find((row) => row.run.id === runId)
+    || data?.runs?.[0], [data, runId]);
+  const canReview = me.data?.roles?.some((role) => role === "reviewer" || role === "admin");
+
+  function selectRun(next) {
+    setRunId(next);
+    const params = new URLSearchParams(searchParams);
+    params.set("run", next); setSearchParams(params, { replace: true });
+    const row = (data?.runs || []).find((item) => item.run.id === next);
+    if (row?.result?.orthanc_study_uid) setStudyUid(row.result.orthanc_study_uid);
+  }
+
+  const metrics = selected?.result?.metric_schema || {};
+
+  async function generateReport(kind) {
+    setReportBusy(kind); setReportError(null);
+    try { await api.requestCaseReport(id, kind); review.reload(); }
+    catch (error) { setReportError(error.message); }
+    finally { setReportBusy(""); }
   }
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-        <h1>Review — {run?.detector_id} <Badge status={run?.status || "review_ready"} /></h1>
-        {run && <Link to={`/cases/${run.case_id}/mdt`} className="muted" style={{ marginLeft: "auto" }}>MDT summary →</Link>}
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Review study</p>
+          <h1>{data?.case?.pseudonym || "Study"}</h1>
+          <p className="muted">All uploaded scans and current MAP, MELD, and HS outputs in one workspace.</p>
+        </div>
+        <div className="button-row">
+          <Link className="btn ghost" to={`/cases/${id}`}>Processing plan</Link>
+          <Link className="btn ghost" to={`/cases/${id}/mdt`}>Research summary</Link>
+        </div>
       </div>
-      <p className="muted">
-        {run && <>source: {run.source_role || "–"} · {run.detector_version} · </>}
-        <Link to={run ? `/cases/${run.case_id}` : "#"}>back to case</Link>
-      </p>
-      <ErrorBox error={r.error} />
+      <ErrorBox error={review.error} />
 
-      {/* Interactive DICOM viewer — full width */}
-      <h2>DICOM viewer <span className="muted">(OHIF · T1 + segmentation)</span></h2>
-      {result?.orthanc_study_uid ? (
-        <>
-          <div className="muted" style={{ marginBottom: 6, fontSize: 13 }}>
-            To overlay MELD's flagged cluster: in the left <b>Studies</b> panel click the <b>SEG</b>
-            &nbsp;series to load it, then scroll to the cluster level (or use the segmentation panel's
-            jump-to-segment). The T1 loads immediately below.
-          </div>
-          <iframe className="viewer" style={{ height: "76vh" }} title="OHIF"
-                  src={viewerUrl(result.orthanc_study_uid)} />
-        </>
-      ) : (
-        <div className="panel muted">No packaged study yet (Orthanc UID missing).</div>
-      )}
+      {(data?.warnings || []).map((warning) => <div className="warning warning-prominent"
+        key={warning}><strong>Unharmonized result</strong><br />{warning}</div>)}
 
-      {/* MELD's own results + clusters + adjudication */}
-      <div className="row" style={{ marginTop: 16, alignItems: "flex-start" }}>
-        <div className="grow">
-          <h2>Detector findings</h2>
-          <div className="panel">
-            {clusters.length ? clusters.map((c) => (
-              <div key={c.id} style={{ borderBottom: "1px solid var(--line)", padding: "6px 0" }}>
-                <b>Cluster #{c.index}</b> — {c.hemi} {c.location}<br />
-                <span className="muted">
-                  {metrics.size?.label || "detector-specific size"}: {c.size}{metrics.size?.unit ? ` ${metrics.size.unit}` : ""}
-                  {" · "}{metrics.confidence?.label || "detector-specific score"}: {c.confidence}
-                  {metrics.confidence?.unit ? ` ${metrics.confidence.unit}` : ""}
-                </span>
-              </div>
-            )) : <span className="muted">No clusters above operating point (a first-class result, §21).</span>}
-            {clusters.length > 0 && <p className="muted">
-              Metrics are detector-specific and must not be compared numerically across detectors.
-            </p>}
-            {overlayFrame && (
-              <img src={api.frameUrl(runId, overlayFrame)} alt="MELD cluster on T1"
-                   style={{ width: "100%", borderRadius: 6, marginTop: 10, border: "1px solid var(--line)" }} />
-            )}
-            {surfaceFrame && (
-              <img src={api.frameUrl(runId, surfaceFrame)} alt="MELD inflated surface"
-                   style={{ width: "100%", borderRadius: 6, marginTop: 8, border: "1px solid var(--line)" }} />
-            )}
-            {result?.has_report && (
-              <a className="btn ghost" href={`/api/runs/${runId}/report`} target="_blank" rel="noreferrer"
-                 style={{ marginTop: 10, display: "inline-block" }}>MELD PDF report ↗</a>
-            )}
-          </div>
+      <section>
+        <div className="section-heading">
+          <div><h2>Combined reports</h2><p className="muted">White-labeled, immutable versions
+            combining MAP, MELD, and HS results. Preliminary reports capture automated analysis;
+            final reports capture completed adjudications.</p></div>
+          {canReview && <div className="button-row">
+            <button type="button" className="btn ghost" disabled={Boolean(reportBusy)}
+              onClick={() => generateReport("preliminary")}>Generate preliminary</button>
+            <button type="button" className="btn" disabled={Boolean(reportBusy)}
+              onClick={() => generateReport("final")}>Generate final</button>
+          </div>}
+        </div>
+        <ErrorBox error={reportError} />
+        <div className="report-list">
+          {(data?.reports || []).map((report) => <div className="report-card" key={report.id}>
+            <div><strong>{report.kind === "final" ? "Final" : "Preliminary"} report</strong>
+              <div className="muted">Version {report.version} · {report.snapshot_sha256?.slice(0, 12)}</div></div>
+            <Badge status={report.status} />
+            {report.has_error && <span className="err">Generation failed; a reviewer can retry.</span>}
+            {report.download_url && <a className="btn ghost" href={report.download_url}
+              target="_blank" rel="noreferrer">Open PDF ↗</a>}
+          </div>)}
+          {data?.reports && !data.reports.length && <div className="panel empty-state">
+            The preliminary report is queued automatically when all runnable analyses finish.</div>}
+        </div>
+      </section>
+
+      <section>
+        <div className="section-heading">
+          <div><h2>Imaging workspace</h2><p className="muted">The source study remains immutable;
+            derived studies are grouped here without rewriting uploaded DICOM identifiers.</p></div>
+        </div>
+        <div className="study-tabs" role="tablist" aria-label="Available imaging studies">
+          {(data?.viewer_studies || []).map((study) => <button type="button"
+            role="tab" aria-selected={study.study_uid === studyUid}
+            className={`study-tab ${study.study_uid === studyUid ? "active" : ""}`}
+            key={study.study_uid} onClick={() => setStudyUid(study.study_uid)}>
+            <span>{study.label}</span>
+            <small>{study.kind === "source" ? `${data?.source_series?.length || 0} uploaded series`
+              : (study.detector_ids || []).map(detectorLabel).join(" · ")}</small>
+          </button>)}
+        </div>
+        {studyUid ? <iframe className="viewer" title="DICOM review viewer"
+          src={viewerUrl(studyUid)} /> : <div className="panel empty-state">
+          Imaging is still being imported or packaged.</div>}
+      </section>
+
+      <section>
+        <h2>Uploaded scans</h2>
+        <div className="panel table-scroll">
+          <table>
+            <thead><tr><th>Series</th><th>Modality</th><th>Images</th><th>Availability</th>
+              <th>Confirmed use</th></tr></thead>
+            <tbody>{(data?.source_series || []).map((series) => <tr key={series.id}>
+              <td>{series.series_description || series.orthanc_series_uid}</td>
+              <td>{series.modality || "–"}</td><td>{series.instance_count ?? "–"}</td>
+              <td>{series.active === false ? <span className="badge b-blocked">
+                No longer present</span> : <span className="ok-chip">Present</span>}</td>
+              <td><span className="pill">{series.confirmed_role || series.proposed_role}</span></td>
+            </tr>)}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>Combined detector results</h2>
+        <div className="detector-tabs" role="tablist" aria-label="Detector results">
+          {(data?.runs || []).map((row) => <button type="button" role="tab"
+            aria-selected={row.run.id === selected?.run?.id}
+            className={`detector-tab ${row.run.id === selected?.run?.id ? "active" : ""}`}
+            key={row.run.id} onClick={() => selectRun(row.run.id)}>
+            <span>{detectorLabel(row.run.detector_id)}</span>
+            <Badge status={row.run.status} />
+          </button>)}
         </div>
 
-        <div style={{ width: 340 }}>
-          <h2>Adjudication <span className="muted">(append-only, §24)</span></h2>
-          <form className="panel" onSubmit={save}>
-            <ErrorBox error={err} />
-            {saved && <div className="ok-chip">Saved — the auditor can verify its ledger record.</div>}
-            {adjudications.length > 0 && (
-              <div className="muted" style={{ marginBottom: 10 }}>
-                {adjudications.length} immutable review record(s). Corrections append and link to
-                the prior record; they never overwrite it.
+        {selected ? <div className="review-grid">
+          <div>
+            {selected.result && selected.run.warnings?.map((warning) => <div className="warning" key={warning}>
+              <strong>Unharmonized output</strong><br />{warning}</div>)}
+            {selected.result?.derived_series_integrity === "failed" && <div className="err">
+              Derived DICOM publication metadata failed integrity verification. Viewer links are
+              hidden until the output is repaired or rerun.</div>}
+            <div className="panel">
+              <div className="result-heading">
+                <div><h3>{detectorLabel(selected.run.detector_id)}</h3>
+                  <span className="muted">{selected.run.source_role || "No source role"}</span></div>
+                {selected.result && <HarmonizationStatus run={selected.run} />}
               </div>
-            )}
-            <label>Reviewer</label>
-            <div className="pill">{me.data?.subject || "authenticated identity"}</div>
-            <label>Assessment</label>
-            <select value={String(adj.agree)}
-              onChange={(e) => setAdj({ ...adj, agree: e.target.value === "true" })}>
-              <option value="true">Agree with detector</option>
-              <option value="false">Disagree</option>
-            </select>
-            <label>Confidence (1–5)</label>
-            <input type="number" min="1" max="5" value={adj.confidence}
-              onChange={(e) => setAdj({ ...adj, confidence: Number(e.target.value) })} />
-            <label>Ground-truth mark (optional)</label>
-            <input value={adj.ground_truth}
-              onChange={(e) => setAdj({ ...adj, ground_truth: e.target.value })} />
-            <label>Notes</label>
-            <input value={adj.notes} onChange={(e) => setAdj({ ...adj, notes: e.target.value })} />
-            <div style={{ marginTop: 12 }}>
-              <button className="btn" disabled={saved || (latestAdjudication && !correcting)}>
-                {correcting ? "Record correction" : "Record research review"}
-              </button>
-              {latestAdjudication && !correcting && (
-                <button type="button" className="btn ghost" style={{ marginLeft: 8 }}
-                  onClick={() => { setCorrecting(latestAdjudication.id); setSaved(false); }}>
-                  Correct latest review
-                </button>
-              )}
+              {!selected.result ? <div className="notice">This detector was declared in the
+                processing plan but was not run. No negative result is asserted.</div> :
+                selected.clusters?.length ? selected.clusters.map((cluster) => <div
+                className="finding" key={cluster.id}>
+                <strong>Finding #{cluster.index}</strong> · {cluster.hemi || ""} {cluster.location || ""}
+                <div className="muted">{metrics.size?.label || "Detector size"}: {cluster.size ?? "–"}
+                  {metrics.size?.unit ? ` ${metrics.size.unit}` : ""} · {metrics.confidence?.label ||
+                    "Detector score"}: {cluster.confidence ?? "–"}{metrics.confidence?.unit
+                    ? ` ${metrics.confidence.unit}` : ""}</div>
+              </div>) : <p className="muted">No findings above this detector’s operating point.</p>}
+              {selected.frames?.length > 0 && <div className="report-frames">
+                {selected.frames.map((frame) => <img key={frame}
+                  src={api.frameUrl(selected.run.id, frame)} alt={`${detectorLabel(
+                    selected.run.detector_id)} ${frame}`} />)}
+              </div>}
             </div>
-          </form>
-        </div>
-      </div>
+          </div>
+          <div><h3>Adjudication</h3><AdjudicationPanel row={selected} canReview={canReview}
+            reload={review.reload} /></div>
+        </div> : <div className="panel empty-state">No detector runs have been created.</div>}
+      </section>
     </div>
   );
 }

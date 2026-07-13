@@ -684,14 +684,16 @@ wheels = [
 
 [[package]]
 name = "meld7t-worker"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "arq" },
     { name = "dicomweb-client" },
     { name = "immudb-py" },
+    { name = "pillow" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-settings" },
+    { name = "pydicom" },
     { name = "redis" },
     { name = "requests" },
     { name = "sqlmodel" },
@@ -707,8 +709,10 @@ requires-dist = [
     { name = "arq", specifier = "==0.26.3" },
     { name = "dicomweb-client", specifier = "==0.59.3" },
     { name = "immudb-py", specifier = "==1.5.0" },
+    { name = "pillow", specifier = "==12.3.0" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.2.3" },
     { name = "pydantic-settings", specifier = "==2.7.1" },
+    { name = "pydicom", specifier = "==3.0.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.1.1" },
     { name = "redis", specifier = "==5.2.1" },
     { name = "requests", specifier = "==2.34.2" },

@@ -1,0 +1,298 @@
+name: Developer release packages
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: developer-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.11.28"
+
+jobs:
+  build:
+    if: github.event_name != 'push' || github.event.deleted == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact_name: ${{ steps.release.outputs.artifact_name }}
+      release_event: ${{ steps.release.outputs.is_release }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: platform/web/package-lock.json
+
+      - name: Install pinned uv
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "uv==$UV_VERSION"
+
+      - name: Validate release input or prepare a local preflight tag
+        id: release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          head_commit=$(git rev-parse HEAD^{commit})
+          [[ $head_commit == "$GITHUB_SHA" ]]
+          is_release=false
+
+          if [[ $GITHUB_REF_TYPE == tag ]]; then
+            tag=$GITHUB_REF_NAME
+            if [[ ! $tag =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "release tags must be stable SemVer: vMAJOR.MINOR.PATCH" >&2
+              exit 1
+            fi
+            git show-ref --verify --quiet "refs/tags/$tag"
+            tag_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+            [[ $tag_commit == "$head_commit" ]]
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            git merge-base --is-ancestor "$head_commit" origin/main || {
+              echo "release commit is not reachable from origin/main" >&2
+              exit 1
+            }
+            version=${tag#v}
+            is_release=true
+          else
+            version=$(python ops/release/developer_release.py current-version)
+            tag=v$version
+            # A local-only tag lets the exact release packager run during PR/main preflight.
+            # Checkout credentials are not persisted, and this tag is never pushed.
+            git tag --force "$tag" "$head_commit"
+          fi
+
+          short_sha=$(git rev-parse --short=12 "$head_commit")
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
+          printf 'is_release=%s\n' "$is_release" >>"$GITHUB_OUTPUT"
+          printf 'artifact_name=developer-release-%s-%s\n' "$version" "$short_sha" \
+            >>"$GITHUB_OUTPUT"
+
+      - name: Validate component versions and tracked release paths
+        shell: bash
+        run: >-
+          python ops/release/developer_release.py check
+          --version "${{ steps.release.outputs.version }}" --tracked
+
+      - name: Test API
+        working-directory: platform/api
+        shell: bash
+        run: |
+          uv sync --locked --python 3.13 --extra dev
+          uv run --locked pytest
+
+      - name: Test worker
+        working-directory: platform/worker
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/platform/api:${{ github.workspace }}/platform/worker
+        run: |
+          uv sync --locked --python 3.13 --extra dev
+          uv run --locked pytest
+
+      - name: Test and build web application
+        working-directory: platform/web
+        shell: bash
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+          npm run build
+
+      - name: Test release and deployment tooling
+        shell: bash
+        run: |
+          python -m unittest discover -s ops/release/tests -v
+          uv run --isolated --no-project --with pillow==12.3.0 \
+            python -m unittest discover -s ops/deployment/tests -v
+
+      - name: Test DICOM packaging tools
+        shell: bash
+        run: >-
+          uv run --isolated --no-project
+          --with nibabel==5.4.2
+          --with numpy==2.5.1
+          --with scipy==1.18.0
+          --with highdicom==0.24.0
+          python -m unittest discover -s containers/pkg/tests -v
+
+      - name: Build release assets
+        shell: bash
+        run: >-
+          ops/release/build-github-release.sh
+          "${{ steps.release.outputs.version }}" release
+
+      - name: Upload immutable build result
+        if: steps.release.outputs.is_release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.release.outputs.artifact_name }}
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  attest:
+    needs: build
+    if: needs.build.outputs.release_event == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download the immutable build result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release
+
+      - name: Verify checksums
+        shell: bash
+        working-directory: release
+        run: sha256sum --check SHA256SUMS
+
+      - name: Attest release assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ github.workspace }}/release/*
+
+  publish:
+    needs: [build, attest]
+    if: needs.build.outputs.release_event == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: developer-release
+    permissions:
+      contents: write
+    steps:
+      - name: Download the immutable build result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release
+
+      - name: Verify checksums
+        shell: bash
+        working-directory: release
+        run: sha256sum --check SHA256SUMS
+
+      - name: Create, verify, and publish immutable prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          export LC_ALL=C
+
+          resolve_tag_commit() {
+            local object_type object_sha
+            read -r object_type object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+                --jq '.object.type + " " + .object.sha'
+            )
+            for _ in 1 2 3 4 5; do
+              if [[ $object_type == commit ]]; then
+                printf '%s\n' "$object_sha"
+                return 0
+              fi
+              [[ $object_type == tag ]] || {
+                echo "tag resolves to unsupported object type: $object_type" >&2
+                return 1
+              }
+              read -r object_type object_sha < <(
+                gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                  --jq '.object.type + " " + .object.sha'
+              )
+            done
+            echo "release tag indirection exceeds the supported depth" >&2
+            return 1
+          }
+
+          require_event_commit() {
+            local resolved
+            resolved=$(resolve_tag_commit)
+            [[ $resolved == "$GITHUB_SHA" ]] || {
+              echo "release tag moved after the build began" >&2
+              return 1
+            }
+          }
+
+          require_event_commit
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "a GitHub release or draft already exists for $RELEASE_TAG; refusing replacement" >&2
+            echo "inspect any failed-run draft manually before deleting and rerunning" >&2
+            exit 1
+          fi
+
+          # Keep the release private until every uploaded byte matches the locally verified set.
+          gh release create "$RELEASE_TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --title "MELD7T $RELEASE_VERSION research developer packages" \
+            --notes-file release/RELEASE-NOTES.md
+
+          (
+            cd release
+            for asset in *; do
+              [[ -f $asset ]] || continue
+              digest=$(sha256sum "$asset" | cut -d' ' -f1)
+              printf 'sha256:%s  %s\n' "$digest" "$asset"
+            done
+          ) | sort >"$RUNNER_TEMP/expected-release-assets"
+
+          verified=false
+          for _ in 1 2 3 4 5; do
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+              --jq '.assets[] | select(.state == "uploaded") | "\(.digest)  \(.name)"' \
+              | sort >"$RUNNER_TEMP/uploaded-release-assets"
+            if cmp -s "$RUNNER_TEMP/expected-release-assets" \
+                "$RUNNER_TEMP/uploaded-release-assets"; then
+              verified=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ $verified != true ]]; then
+            diff -u "$RUNNER_TEMP/expected-release-assets" \
+              "$RUNNER_TEMP/uploaded-release-assets" || true
+            echo "draft release asset digest verification failed" >&2
+            exit 1
+          fi
+
+          require_event_commit
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --draft=false

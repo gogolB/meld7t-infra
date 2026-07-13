@@ -7,17 +7,57 @@ config_root=${MELD7T_CONFIG_ROOT:-$HOME/.config/meld7t}
 backup_root=${MELD7T_BACKUP_ROOT:-}
 backup_verify_key=${MELD7T_BACKUP_VERIFY_KEY:-}
 max_backup_age_hours=${MELD7T_MAX_BACKUP_AGE_HOURS:-26}
+orthanc_max_used_percent=${MELD7T_ORTHANC_MAX_USED_PERCENT:-85}
+harmonization_orthanc_max_used_percent=${MELD7T_HARMONIZATION_ORTHANC_MAX_USED_PERCENT:-85}
 failures=()
-readonly -a units=(postgres redis immudb orthanc api ohif caddy meld7t-worker)
+readonly -a units=(postgres redis immudb orthanc harmonization-postgres harmonization-orthanc \
+  api ohif caddy meld7t-worker meld7t-harmonization-builder)
 
 for unit in "${units[@]}"; do
   systemctl --user is-active --quiet "$unit.service" || failures+=("unit:$unit")
 done
 
-for container in postgres redis api caddy; do
+for container in postgres redis orthanc harmonization-postgres harmonization-orthanc api caddy; do
   status=$(podman inspect "$container" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' 2>/dev/null || true)
   [[ $status == healthy ]] || failures+=("health:$container:$status")
 done
+
+# Orthanc's configured caps are independent of filesystem capacity. Alert before fail-closed
+# Reject mode refuses routine studies or controls, even when the Podman filesystem has free space.
+check_orthanc_quota() {
+  local container=$1 principal=$2 threshold=$3 quota_status=
+  if [[ ! $threshold =~ ^[0-9]+$ ]] || ((threshold < 1 || threshold > 99)); then
+    failures+=("config:${container}-max-used-percent")
+    return
+  fi
+  if ! quota_status=$(podman exec "$container" python3 -c '
+import base64, json, os, sys, urllib.request
+
+threshold = int(sys.argv[1])
+principal = sys.argv[2]
+cap_mib = int(os.environ["ORTHANC__MAXIMUM_STORAGE_SIZE"])
+users = json.loads(os.environ["ORTHANC__REGISTERED_USERS"])
+password = users[principal]
+token = base64.b64encode((principal + ":" + password).encode()).decode()
+request = urllib.request.Request(
+    "http://127.0.0.1:8042/statistics",
+    headers={"Authorization": "Basic " + token},
+)
+with urllib.request.urlopen(request, timeout=5) as response:
+    statistics = json.load(response)
+used_mib = int(float(statistics["TotalDiskSizeMB"]))
+if cap_mib <= 0 or used_mib < 0:
+    raise ValueError("invalid Orthanc storage statistics")
+used_percent = min(100, (used_mib * 100) // cap_mib)
+print(f"used-{used_percent}-percent-of-cap")
+raise SystemExit(2 if used_mib * 100 >= cap_mib * threshold else 0)
+' "$threshold" "$principal" 2>/dev/null); then
+    failures+=("storage:${container}:${quota_status:-unavailable}")
+  fi
+}
+check_orthanc_quota orthanc meld-internal "$orthanc_max_used_percent"
+check_orthanc_quota harmonization-orthanc harmonization-builder \
+  "$harmonization_orthanc_max_used_percent"
 
 podman exec api python -c \
   'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=10).read()' \
