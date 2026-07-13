@@ -127,7 +127,8 @@ jobs:
         shell: bash
         run: |
           python -m unittest discover -s ops/release/tests -v
-          python -m unittest discover -s ops/deployment/tests -v
+          uv run --isolated --no-project --with pillow==12.3.0 \
+            python -m unittest discover -s ops/deployment/tests -v
 
       - name: Test DICOM packaging tools
         shell: bash
